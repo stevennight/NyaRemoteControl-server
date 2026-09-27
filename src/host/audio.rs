@@ -48,8 +48,18 @@ pub fn thread(rx: Receiver<bool>, sink: Sink) {
         }
 
         if capture.is_none() && Instant::now() >= retry_at {
-            match LoopbackCapture::new() {
-                Ok(c) => {
+            // Leave out our own playback (the microphone we feed into
+            // VB-Cable) so the client never hears itself; older Windows falls
+            // back to the plain loopback of the default device.
+            let opened = LoopbackCapture::excluding_process(std::process::id())
+                .map(|c| (c, false))
+                .or_else(|e| {
+                    tracing::info!("process loopback unavailable ({e:#}); using device loopback");
+                    LoopbackCapture::new().map(|c| (c, true))
+                });
+            match opened {
+                Ok((c, plain)) => {
+                    super::mic::PLAIN_LOOPBACK.store(plain, std::sync::atomic::Ordering::Relaxed);
                     capture = Some(c);
                     warned = false;
                 }

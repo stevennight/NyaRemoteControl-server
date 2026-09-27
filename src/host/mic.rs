@@ -19,6 +19,15 @@ pub fn cable_device_name() -> Option<String> {
 
 const SAMPLES_PER_MS: usize = 48 * 2;
 
+/// The audio thread captures the default device's plain loopback (no
+/// process exclusion). If that device is the cable itself, playing the
+/// microphone into it would send it straight back to the client as echo.
+pub static PLAIN_LOOPBACK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn would_echo() -> bool {
+    PLAIN_LOOPBACK.load(std::sync::atomic::Ordering::Relaxed) && CABLE_NAMES.iter().any(|n| nya_win::audio::default_render_is(n))
+}
+
 pub fn thread(rx: Receiver<Vec<u8>>) {
     nya_win::com_init();
     nya_win::mmcss_boost("Pro Audio");
@@ -59,6 +68,10 @@ pub fn thread(rx: Receiver<Vec<u8>>) {
         if buf.len() > 120 * SAMPLES_PER_MS {
             let excess = buf.len() - 40 * SAMPLES_PER_MS;
             buf.drain(..excess - excess % 2);
+        }
+        if renderer.is_none() && Instant::now() >= retry_at && would_echo() {
+            tracing::warn!("default playback device is the virtual cable: microphone muted to avoid echo; set the speakers as default playback device");
+            retry_at = Instant::now() + Duration::from_secs(10);
         }
         if renderer.is_none() && Instant::now() >= retry_at {
             let dev = super::mic::CABLE_NAMES.iter().find_map(|n| find_render_device(n));

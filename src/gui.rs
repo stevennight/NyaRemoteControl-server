@@ -69,7 +69,13 @@ fn detect_components() -> Vec<Component> {
             name: "VB-Cable 虚拟声卡",
             purpose: "接收客户端麦克风：客户端工具条打开“麦克风”，被控端软件选择“CABLE Output”作为麦克风",
             installed: cable.is_some(),
-            status: cable,
+            status: cable.map(|n| {
+                if crate::host::mic_cable_name().is_some() && nya_win::audio::default_render_is("CABLE") {
+                    format!("{n}（注意：它现在是默认播放设备，本机会听不到声音，建议在声音设置里把默认播放设备改回扬声器）")
+                } else {
+                    n
+                }
+            }),
             ready: true,
             url: "https://vb-audio.com/Cable/",
             note: "捐赠软件（安装即表示同意 VB-Audio 许可），需联网从官网下载；安装后需要重启一次",
