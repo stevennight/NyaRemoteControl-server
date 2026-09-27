@@ -20,8 +20,15 @@ message HostCommand {
     Shutdown shutdown = 10;
     SetAudio set_audio = 11;
     SetBitrate set_bitrate = 12;
+    ClipboardImage clipboard_image = 13;
+    ClipboardFiles clipboard_files = 14;
   }
 }
+
+// CF_DIB bytes.
+message ClipboardImage { bytes dib = 1; }
+// Absolute paths (host side) for CF_HDROP.
+message ClipboardFiles { repeated string paths = 1; }
 
 // Adaptive bitrate decided by the network side.
 message SetBitrate { uint32 kbps = 1; }
@@ -43,6 +50,8 @@ message HostEvent {
     nya.v1.ClipboardText clipboard = 7;
     nya.v1.ServerStats stats = 8;
     nya.v1.DisplayChanged display_changed = 9;
+    ClipboardImage clipboard_image = 10;
+    ClipboardFiles clipboard_files = 11;
   }
 }
 

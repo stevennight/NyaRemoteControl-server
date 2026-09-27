@@ -210,3 +210,22 @@ pub fn wait_or_kill(process: &Handle, ms: u32) {
         }
     }
 }
+
+/// Token of the user logged on at the console (service mode). `None` in
+/// standalone mode (no privilege) or when nobody is logged on.
+pub fn console_user_token() -> Option<Handle> {
+    use windows::Win32::System::RemoteDesktop::WTSQueryUserToken;
+    let session = active_console_session()?;
+    let mut token = HANDLE::default();
+    unsafe { WTSQueryUserToken(session, &mut token).ok()? };
+    Some(Handle(token))
+}
+
+/// Folder for files received from the client: the console user's
+/// `Downloads\NyaRemoteControl` (or the current user's in standalone mode).
+pub fn receive_dir() -> std::path::PathBuf {
+    let token = console_user_token();
+    nya_win::shell::receive_dir(token.as_ref().map(|t| t.0))
+        .or_else(|| nya_win::shell::receive_dir(None))
+        .unwrap_or_else(|| std::env::temp_dir().join("NyaRemoteControl"))
+}

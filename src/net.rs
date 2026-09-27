@@ -220,7 +220,15 @@ async fn run_session(
         }
     });
     let cursor_task = tokio::spawn(cursor_writer(conn.clone(), cursor_rx));
-    let input_task = tokio::spawn(input_reader(conn.clone(), hub.clone()));
+    let files_on = neg.has(Feature::FileTransfer);
+    let images_on = neg.has(Feature::ClipboardImage);
+    let input_task = tokio::spawn(client_streams(
+        conn.clone(),
+        hub.clone(),
+        FileCtx { ctl_tx: ctl_tx.clone(), files_on, images_on, batches: Default::default() },
+    ));
+    // Files copied on the host and offered to the client: offer id -> paths.
+    let mut offers: std::collections::VecDeque<(u64, Vec<std::path::PathBuf>)> = Default::default();
 
     let mut replay = Replay::default();
     let mut generation = hub.generation.subscribe();
@@ -285,6 +293,21 @@ async fn run_session(
                         hub.send(Cmd::SetMode(m));
                     }
                     Some(Msg::RequestKeyframe(k)) => hub.send(Cmd::RequestKeyframe(k)),
+                    Some(Msg::FileRequest(req)) if files_on => {
+                        match offers.iter().find(|(id, _)| *id == req.transfer_id) {
+                            Some((id, paths)) => {
+                                tokio::spawn(send_offered(conn.clone(), *id, paths.clone(), ctl_tx.clone()));
+                            }
+                            None => {
+                                let _ = ctl_tx.try_send(ctl(Msg::FileResult(pb::FileResult {
+                                    transfer_id: req.transfer_id,
+                                    ok: false,
+                                    message: "这批文件已过期，请在被控端重新复制".into(),
+                                    saved_to: String::new(),
+                                })));
+                            }
+                        }
+                    }
                     Some(Msg::Ping(p)) => {
                         let _ = ctl_tx.try_send(ctl(Msg::Pong(pb::Pong { t_us: p.t_us, server_t_us: nya_proto::now_us() })));
                     }
@@ -330,6 +353,48 @@ async fn run_session(
                     Some(Ev::StreamError(e)) => { let _ = ctl_tx.send(ctl(Msg::StreamError(e))).await; }
                     Some(Ev::DisplayChanged(d)) => { let _ = ctl_tx.send(ctl(Msg::DisplayChanged(d))).await; }
                     Some(Ev::Stats(s)) => { let _ = ctl_tx.try_send(ctl(Msg::ServerStats(s))); }
+                    Some(Ev::ClipboardFiles(f)) if files_on => {
+                        let mut entries = Vec::new();
+                        let mut paths = Vec::new();
+                        for p in f.paths.iter().map(std::path::PathBuf::from) {
+                            match std::fs::metadata(&p) {
+                                Ok(m) if m.is_file() => {
+                                    entries.push(pb::FileEntry {
+                                        name: p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                                        size: m.len(),
+                                    });
+                                    paths.push(p);
+                                }
+                                // Folders are not supported yet.
+                                _ => tracing::info!("not offering {} (folder or unreadable)", p.display()),
+                            }
+                        }
+                        if !entries.is_empty() {
+                            let id = rand::random::<u64>();
+                            offers.push_back((id, paths));
+                            if offers.len() > 8 {
+                                offers.pop_front();
+                            }
+                            let _ = ctl_tx.send(ctl(Msg::FileOffer(pb::FileOffer { transfer_id: id, files: entries }))).await;
+                        }
+                    }
+                    Some(Ev::ClipboardImage(img)) if images_on => {
+                        let conn = conn.clone();
+                        tokio::spawn(async move {
+                            let h = pb::FileHeader {
+                                transfer_id: rand::random(),
+                                name: "clipboard.dib".into(),
+                                size: img.dib.len() as u64,
+                                purpose: pb::FilePurpose::ClipboardImage as i32,
+                                index: 0,
+                                count: 1,
+                            };
+                            if let Err(e) = nya_transport::files::send_bytes(&conn, h, &img.dib).await {
+                                tracing::debug!("clipboard image: {e:#}");
+                            }
+                        });
+                    }
+                    Some(Ev::ClipboardFiles(_)) | Some(Ev::ClipboardImage(_)) => {}
                     Some(Ev::Clipboard(c)) => {
                         if clipboard_on {
                             let _ = ctl_tx.send(ctl(Msg::ClipboardText(c))).await;
@@ -417,12 +482,110 @@ async fn cursor_writer(conn: Connection, mut rx: mpsc::Receiver<pb::CursorMsg>) 
 }
 
 /// Accept client uni streams; the input stream feeds the host.
-async fn input_reader(conn: Connection, hub: Arc<Hub>) -> Result<()> {
+/// Send files the client asked for (from a FileOffer).
+async fn send_offered(conn: Connection, id: u64, paths: Vec<std::path::PathBuf>, ctl_tx: mpsc::Sender<pb::ControlMsg>) {
+    let count = paths.len() as u32;
+    for (i, p) in paths.iter().enumerate() {
+        let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        let h = pb::FileHeader {
+            transfer_id: id,
+            name: p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            size,
+            purpose: pb::FilePurpose::Save as i32,
+            index: i as u32,
+            count,
+        };
+        if let Err(e) = nya_transport::files::send_file(&conn, h, p, |_| {}).await {
+            tracing::warn!("sending {}: {e:#}", p.display());
+            let _ = ctl_tx
+                .send(ctl(Msg::FileResult(pb::FileResult {
+                    transfer_id: id,
+                    ok: false,
+                    message: format!("发送 {} 失败：{e:#}", p.display()),
+                    saved_to: String::new(),
+                })))
+                .await;
+            return;
+        }
+    }
+    tracing::info!("sent {count} offered file(s) to client");
+}
+
+struct FileCtx {
+    ctl_tx: mpsc::Sender<pb::ControlMsg>,
+    files_on: bool,
+    images_on: bool,
+    /// transfer id -> files received so far
+    batches: Arc<std::sync::Mutex<std::collections::HashMap<u64, Vec<String>>>>,
+}
+
+/// A FILE stream from the client: save an upload, or apply a clipboard image.
+async fn receive_file(mut r: RecvStream, hub: Arc<Hub>, ctx: Arc<FileCtx>) -> Result<()> {
+    use nya_transport::files;
+    let h = files::read_header(&mut r).await?;
+    match pb::FilePurpose::try_from(h.purpose).unwrap_or(pb::FilePurpose::Unspecified) {
+        pb::FilePurpose::Save if ctx.files_on => {
+            let dir = tokio::task::spawn_blocking(crate::winutil::receive_dir).await?;
+            let result = files::receive_to_dir(&mut r, &h, &dir, |_| {}).await;
+            let done_batch = {
+                let mut b = ctx.batches.lock().unwrap();
+                if let Ok(p) = &result {
+                    b.entry(h.transfer_id).or_default().push(p.to_string_lossy().into_owned());
+                }
+                if h.index + 1 >= h.count || result.is_err() {
+                    b.remove(&h.transfer_id)
+                } else {
+                    None
+                }
+            };
+            let msg = match &result {
+                Ok(_) => done_batch.map(|paths| {
+                    tracing::info!("received {} file(s) into {}", paths.len(), dir.display());
+                    let n = paths.len();
+                    hub.send(Cmd::ClipboardFiles(crate::ipc_pb::ClipboardFiles { paths }));
+                    pb::FileResult {
+                        transfer_id: h.transfer_id,
+                        ok: true,
+                        message: format!("已保存 {n} 个文件（已放入被控端剪贴板）"),
+                        saved_to: dir.to_string_lossy().into_owned(),
+                    }
+                }),
+                Err(e) => Some(pb::FileResult {
+                    transfer_id: h.transfer_id,
+                    ok: false,
+                    message: format!("接收 {} 失败：{e:#}", h.name),
+                    saved_to: String::new(),
+                }),
+            };
+            if let Some(m) = msg {
+                let _ = ctx.ctl_tx.send(ctl(Msg::FileResult(m))).await;
+            }
+        }
+        pb::FilePurpose::ClipboardImage if ctx.images_on => {
+            let dib = files::receive_to_vec(&mut r, &h, files::MAX_IMAGE_BYTES).await?;
+            hub.send(Cmd::ClipboardImage(crate::ipc_pb::ClipboardImage { dib }));
+        }
+        _ => {
+            let _ = r.stop(0u32.into());
+        }
+    }
+    Ok(())
+}
+
+/// Accept client uni streams: input events and file transfers.
+async fn client_streams(conn: Connection, hub: Arc<Hub>, ctx: FileCtx) -> Result<()> {
+    let ctx = Arc::new(ctx);
     loop {
         let mut r = conn.accept_uni().await?;
         let hub = hub.clone();
+        let ctx = ctx.clone();
         tokio::spawn(async move {
             match read_varint(&mut r).await {
+                Ok(Some(stream_type::FILE)) => {
+                    if let Err(e) = receive_file(r, hub, ctx).await {
+                        tracing::warn!("file stream: {e:#}");
+                    }
+                }
                 Ok(Some(stream_type::INPUT)) => loop {
                     match read_msg::<pb::InputMsg, _>(&mut r, MAX_MESSAGE_LEN).await {
                         Ok(Some(m)) => hub.send(Cmd::Input(m)),
