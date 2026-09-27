@@ -41,6 +41,7 @@ struct State {
 
 pub fn session_info(topo: &Topology, probes: &[EncoderProbe], cfg: &HostConfig) -> pb::SessionInfo {
     pb::SessionInfo {
+        mic_device: super::mic::cable_device_name().unwrap_or_default(),
         host_name: cfg.name.clone(),
         displays: display_infos(topo),
         gpus: topo

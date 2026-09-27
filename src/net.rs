@@ -220,6 +220,17 @@ async fn run_session(
         }
     });
     let cursor_task = tokio::spawn(cursor_writer(conn.clone(), cursor_rx));
+    let mic_on = neg.has(Feature::Microphone);
+    let mic_task = tokio::spawn({
+        let (conn, hub) = (conn.clone(), hub.clone());
+        async move {
+            while let Ok(d) = conn.read_datagram().await {
+                if mic_on && d.first() == Some(&nya_proto::frame::datagram_type::MIC) {
+                    hub.send(Cmd::MicAudio(crate::ipc_pb::MicAudio { datagram: d.to_vec() }));
+                }
+            }
+        }
+    });
     let files_on = neg.has(Feature::FileTransfer);
     let images_on = neg.has(Feature::ClipboardImage);
     let input_task = tokio::spawn(client_streams(
@@ -434,6 +445,7 @@ async fn run_session(
 
     drop(ctl_tx);
     video_task.abort();
+    mic_task.abort();
     cursor_task.abort();
     input_task.abort();
     let _ = timeout(Duration::from_millis(200), writer).await;

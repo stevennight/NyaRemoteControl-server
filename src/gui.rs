@@ -31,7 +31,76 @@ enum Tab {
     Settings,
     Clients,
     Diagnostics,
+    Components,
     Logs,
+}
+
+/// An optional third-party component: never installed automatically.
+struct Component {
+    name: &'static str,
+    purpose: &'static str,
+    status: Option<String>,
+    installed: bool,
+    ready: bool,
+    url: &'static str,
+    note: &'static str,
+}
+
+fn service_exists(name: &str) -> bool {
+    ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .and_then(|m| m.open_service(name, ServiceAccess::QUERY_STATUS))
+        .is_ok()
+}
+
+/// Detect optional components (COM is initialised on the calling thread).
+fn detect_components() -> Vec<Component> {
+    nya_win::com_init();
+    let cable = crate::host::mic_cable_name();
+    let vdd = nya_win::topology::Topology::enumerate()
+        .ok()
+        .and_then(|t| t.adapters.iter().find(|a| a.name.to_lowercase().contains("virtual display")).map(|a| a.name.clone()));
+    let usbip = [r"C:\Program Files\USBip\usbip.exe", r"C:\Program Files\usbip-win2\usbip.exe"]
+        .iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .map(|p| p.to_string());
+    vec![
+        Component {
+            name: "VB-Cable 虚拟声卡",
+            purpose: "接收客户端麦克风：客户端工具条打开“麦克风”，被控端软件选择“CABLE Output”作为麦克风",
+            installed: cable.is_some(),
+            status: cable,
+            ready: true,
+            url: "https://vb-audio.com/Cable/",
+            note: "免费，安装后需要重启一次",
+        },
+        Component {
+            name: "usbip-win2",
+            purpose: "USB 设备透传（U 盾、加密狗等）：被控端虚拟 USB 控制器",
+            installed: usbip.is_some(),
+            status: usbip,
+            ready: false,
+            url: "https://github.com/vadimgrn/usbip-win2/releases",
+            note: "开发中；客户端另需 usbipd-win",
+        },
+        Component {
+            name: "ViGEmBus",
+            purpose: "手柄：把客户端的手柄模拟成被控端的 Xbox 手柄",
+            installed: service_exists("ViGEmBus"),
+            status: None,
+            ready: false,
+            url: "https://github.com/nefarius/ViGEmBus/releases",
+            note: "开发中；作者已停止维护，但仍可用",
+        },
+        Component {
+            name: "Virtual Display Driver",
+            purpose: "虚拟显示器：不接显示器也能用，分辨率 / 刷新率可自定义",
+            installed: vdd.is_some(),
+            status: vdd,
+            ready: false,
+            url: "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases",
+            note: "开发中",
+        },
+    ]
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -70,6 +139,8 @@ struct Model {
     diag_text: String,
     log_text: String,
     log_name: &'static str,
+    components: Option<Vec<Component>>,
+    components_rx: Option<mpsc::Receiver<Vec<Component>>>,
     confirm_reset: bool,
     confirm_uninstall: bool,
 }
@@ -137,6 +208,8 @@ impl Model {
             diag_text: String::new(),
             log_text: String::new(),
             log_name: "service",
+            components: None,
+            components_rx: None,
             confirm_reset: false,
             confirm_uninstall: false,
         };
@@ -215,6 +288,7 @@ impl Model {
                     (Tab::Settings, "设置"),
                     (Tab::Clients, "已配对客户端"),
                     (Tab::Diagnostics, "诊断"),
+                    (Tab::Components, "可选组件"),
                     (Tab::Logs, "日志"),
                 ] {
                     ui.selectable_value(&mut self.tab, t, name);
@@ -261,6 +335,7 @@ impl Model {
                     Tab::Settings => self.settings(ui),
                     Tab::Clients => self.clients_tab(ui),
                     Tab::Diagnostics => self.diagnostics(ui),
+                    Tab::Components => self.components(ui),
                     Tab::Logs => self.logs(ui),
                 });
             });
@@ -510,6 +585,59 @@ impl Model {
         egui::ScrollArea::both().id_salt("diag").show(ui, |ui| {
             ui.label(RichText::new(&self.diag_text).monospace().small());
         });
+    }
+
+    fn components(&mut self, ui: &mut egui::Ui) {
+        if let Some(rx) = &self.components_rx {
+            if let Ok(c) = rx.try_recv() {
+                self.components = Some(c);
+                self.components_rx = None;
+            }
+        }
+        if self.components.is_none() && self.components_rx.is_none() {
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(detect_components());
+            });
+            self.components_rx = Some(rx);
+        }
+        ui.label(RichText::new("以下组件都是可选的，不装不影响其他功能。安装由你决定：点“官网下载”手动安装后，回到这里点“重新检测”。").weak());
+        ui.horizontal(|ui| {
+            if ui.button("重新检测").clicked() {
+                self.components = None;
+            }
+            if ui.button("打开声音设置").on_hover_text("把 CABLE Output 设为默认麦克风").clicked() {
+                let _ = std::process::Command::new("explorer").arg("ms-settings:sound").spawn();
+            }
+        });
+        ui.add_space(8.0);
+        let Some(list) = &self.components else {
+            ui.spinner();
+            return;
+        };
+        for c in list {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(c.name).strong().size(16.0));
+                    let (t, col) = if c.installed { ("已安装", Color32::LIGHT_GREEN) } else { ("未安装", Color32::GRAY) };
+                    ui.label(RichText::new(t).color(col));
+                    if !c.ready {
+                        ui.label(RichText::new("（配套功能开发中）").weak());
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("官网下载").clicked() {
+                            let _ = std::process::Command::new("explorer").arg(c.url).spawn();
+                        }
+                    });
+                });
+                ui.label(c.purpose);
+                if let Some(s) = &c.status {
+                    ui.label(RichText::new(format!("检测到：{s}")).weak().small());
+                }
+                ui.label(RichText::new(c.note).weak().small());
+            });
+        }
     }
 
     fn logs(&mut self, ui: &mut egui::Ui) {

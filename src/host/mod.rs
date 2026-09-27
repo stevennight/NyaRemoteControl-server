@@ -7,6 +7,12 @@ mod audio;
 mod clipboard;
 mod cursor;
 mod input;
+mod mic;
+
+/// VB-Cable playback device name, if installed (for the GUI).
+pub fn mic_cable_name() -> Option<String> {
+    mic::cable_device_name()
+}
 mod pipeline;
 pub mod select;
 mod video;
@@ -64,6 +70,7 @@ pub fn run(mut commands: mpsc::UnboundedReceiver<HostCommand>, events: mpsc::Sen
     let (video_tx, video_rx) = crossbeam_channel::unbounded();
     let (audio_tx, audio_rx) = crossbeam_channel::unbounded();
     let (clip_tx, clip_rx) = crossbeam_channel::unbounded();
+    let (mic_tx, mic_rx) = crossbeam_channel::bounded(256);
 
     let threads = vec![
         spawn("nya-video", {
@@ -75,6 +82,7 @@ pub fn run(mut commands: mpsc::UnboundedReceiver<HostCommand>, events: mpsc::Sen
             let sink = sink.clone();
             move || audio::thread(audio_rx, sink)
         }),
+        spawn("nya-mic", move || mic::thread(mic_rx)),
         spawn("nya-clipboard", {
             let sink = sink.clone();
             move || clipboard::thread(clip_rx, sink)
@@ -107,6 +115,9 @@ pub fn run(mut commands: mpsc::UnboundedReceiver<HostCommand>, events: mpsc::Sen
             Cmd::ClipboardFiles(f) => {
                 let _ = clip_tx.send(clipboard::ClipCmd::SetFiles(f.paths));
             }
+            Cmd::MicAudio(m) => {
+                let _ = mic_tx.try_send(m.datagram);
+            }
             Cmd::SetBitrate(b) => {
                 let _ = video_tx.send(video::VideoCmd::SetBitrate(b.kbps));
             }
@@ -138,6 +149,7 @@ pub fn run(mut commands: mpsc::UnboundedReceiver<HostCommand>, events: mpsc::Sen
     let _ = audio_tx.send(false);
     drop(audio_tx);
     drop(clip_tx);
+    drop(mic_tx);
     for t in threads {
         let _ = t.join();
     }

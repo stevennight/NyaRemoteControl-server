@@ -22,8 +22,12 @@ message HostCommand {
     SetBitrate set_bitrate = 12;
     ClipboardImage clipboard_image = 13;
     ClipboardFiles clipboard_files = 14;
+    MicAudio mic_audio = 15;
   }
 }
+
+// One MIC datagram from the client, unchanged.
+message MicAudio { bytes datagram = 1; }
 
 // CF_DIB bytes.
 message ClipboardImage { bytes dib = 1; }
