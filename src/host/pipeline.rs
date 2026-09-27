@@ -108,6 +108,8 @@ pub struct Pipeline {
     last_keyframe: Instant,
     cursor: CursorTracker,
     stats: Stats,
+    built_at: Instant,
+    warned_no_image: bool,
 }
 
 fn even(v: u32) -> u32 {
@@ -305,6 +307,8 @@ impl Pipeline {
             last_keyframe: now - Duration::from_secs(1),
             cursor: CursorTracker::default(),
             stats: Stats::default(),
+            built_at: now,
+            warned_no_image: false,
         })
     }
 
@@ -416,6 +420,13 @@ impl Pipeline {
         }
 
         let now = Instant::now();
+        if !self.have_image && !self.warned_no_image && now - self.built_at > Duration::from_secs(3) {
+            self.warned_no_image = true;
+            tracing::warn!(
+                "no desktop image after 3 s (display off / asleep, or nothing drawn yet); desktop {}",
+                desktop.name()
+            );
+        }
         if self.inflight >= MAX_INFLIGHT && now - self.last_frame_sent > Duration::from_secs(3) {
             tracing::warn!("no FrameSent for 3 s; resetting flow control");
             self.inflight = 0;
