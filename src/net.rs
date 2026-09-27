@@ -256,9 +256,12 @@ async fn run_session(
                         now: std::time::Instant::now(),
                         rtt: st.path.rtt,
                         lost_packets: st.path.lost_packets,
+                        sent_packets: st.path.sent_packets,
+                        sent_bytes: st.udp_tx.bytes,
                         backlog_bytes: backlog as u64,
                     };
                     if let Some(k) = a.update(sample) {
+                        tracing::info!("adaptive bitrate -> {k} kbps ({}; rtt {} ms)", a.note, st.path.rtt.as_millis());
                         hub.send(Cmd::SetBitrate(crate::ipc_pb::SetBitrate { kbps: k }));
                     }
                 }
@@ -347,12 +350,22 @@ async fn run_session(
                     Some(Ev::SessionInfo(i)) => { let _ = ctl_tx.send(ctl(Msg::SessionInfo(i))).await; }
                     Some(Ev::StreamStarted(s)) => {
                         let max = s.config.as_ref().map(|c| c.bitrate_kbps).unwrap_or(0);
-                        abr = (max > 0).then(|| crate::abr::Abr::new(max, std::time::Instant::now()));
+                        let requested = replay.start.as_ref().and_then(|r| r.config.as_ref()).map(|c| c.bitrate_policy).unwrap_or(0);
+                        let mode = s.config.as_ref().map(|c| c.mode).unwrap_or(0);
+                        let policy = crate::abr::resolve(requested, mode);
+                        abr = if max > 0 { crate::abr::Abr::new(max, policy, std::time::Instant::now()) } else { None };
+                        tracing::info!("bitrate policy: {} (max {max} kbps)", crate::abr::policy_name(policy));
                         let _ = ctl_tx.send(ctl(Msg::StreamStarted(s))).await;
                     }
                     Some(Ev::StreamError(e)) => { let _ = ctl_tx.send(ctl(Msg::StreamError(e))).await; }
                     Some(Ev::DisplayChanged(d)) => { let _ = ctl_tx.send(ctl(Msg::DisplayChanged(d))).await; }
-                    Some(Ev::Stats(s)) => { let _ = ctl_tx.try_send(ctl(Msg::ServerStats(s))); }
+                    Some(Ev::Stats(mut s)) => {
+                        s.bitrate_note = match &abr {
+                            Some(a) => a.note.clone(),
+                            None => "固定码率".into(),
+                        };
+                        let _ = ctl_tx.try_send(ctl(Msg::ServerStats(s)));
+                    }
                     Some(Ev::ClipboardFiles(f)) if files_on => {
                         let mut entries = Vec::new();
                         let mut paths = Vec::new();

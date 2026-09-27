@@ -1,52 +1,136 @@
-//! Adaptive bitrate: back off quickly when the path shows congestion, creep
-//! back up slowly while it is clear (design doc §6.2, phase 2).
+//! Adaptive bitrate, driven by what the network actually delivers.
 //!
-//! Signals, sampled every 250 ms by the network session:
-//! * backlog – video bytes handed to QUIC but not yet sent (queueing in our buffers)
-//! * queueing delay – RTT above the lowest RTT seen on this connection
-//! * packet loss – newly lost packets since the previous sample
+//! The primary signal is **backlog**: encoded video that QUIC has accepted but
+//! not yet put on the wire. A growing backlog means we produce more than the
+//! path carries, and the measured send rate then tells how much it does carry,
+//! so the new target is set from that rate instead of blind multiplicative
+//! cuts. RTT growth and loss are noisy on relayed / proxied paths (reordering
+//! looks like loss), so only the more aggressive policies use them.
+//!
+//! Policies (chosen by the client, see `BitratePolicy`):
+//!
+//! | policy   | reacts to                         | sustained | floor |
+//! |----------|-----------------------------------|-----------|-------|
+//! | quality  | backlog > 1 s                     | 2 s       | 60 %  |
+//! | balanced | backlog > 400 ms, queueing delay  | 0.75 s    | 35 %  |
+//! | smooth   | backlog > 200 ms, delay, loss     | 0.5 s     | 15 %  |
+//! | fixed    | nothing                           | –         | 100 % |
 
 use std::time::{Duration, Instant};
+
+use nya_proto::pb::{BitratePolicy, StreamMode};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Sample {
     pub now: Instant,
     pub rtt: Duration,
     pub lost_packets: u64,
+    pub sent_packets: u64,
+    /// Total bytes QUIC has put on the wire (for the send rate).
+    pub sent_bytes: u64,
     pub backlog_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Params {
+    backlog_ms: u64,
+    /// Queueing-delay trigger: max(fixed, factor × min RTT); None = ignored.
+    queue: Option<(Duration, f64)>,
+    /// Loss-rate trigger; None = ignored.
+    loss: Option<f64>,
+    sustained: u32,
+    floor: f64,
+}
+
+pub fn resolve(policy: i32, mode: i32) -> BitratePolicy {
+    match BitratePolicy::try_from(policy).unwrap_or(BitratePolicy::Unspecified) {
+        BitratePolicy::Unspecified if mode == StreamMode::Game as i32 => BitratePolicy::Balanced,
+        BitratePolicy::Unspecified => BitratePolicy::Quality,
+        p => p,
+    }
+}
+
+pub fn policy_name(p: BitratePolicy) -> &'static str {
+    match p {
+        BitratePolicy::Quality => "清晰优先",
+        BitratePolicy::Balanced => "均衡",
+        BitratePolicy::Smooth => "流畅优先",
+        BitratePolicy::Fixed => "固定码率",
+        BitratePolicy::Unspecified => "自动",
+    }
+}
+
+fn params(p: BitratePolicy) -> Params {
+    match p {
+        BitratePolicy::Smooth => Params {
+            backlog_ms: 200,
+            queue: Some((Duration::from_millis(80), 1.0)),
+            loss: Some(0.05),
+            sustained: 2,
+            floor: 0.15,
+        },
+        BitratePolicy::Balanced => Params {
+            backlog_ms: 400,
+            queue: Some((Duration::from_millis(150), 1.5)),
+            loss: None,
+            sustained: 3,
+            floor: 0.35,
+        },
+        _ => Params { backlog_ms: 1000, queue: None, loss: None, sustained: 8, floor: 0.6 },
+    }
 }
 
 #[derive(Debug)]
 pub struct Abr {
+    policy: BitratePolicy,
+    p: Params,
     max: u32,
     min: u32,
     target: u32,
     reported: u32,
     min_rtt: Option<Duration>,
-    last_lost: Option<u64>,
+    min_rtt_at: Instant,
+    prev: Option<Sample>,
+    /// Smoothed send rate (kbit/s).
+    rate_kbps: f64,
+    bad_streak: u32,
+    last_bad: Instant,
     last_decrease: Instant,
     last_increase: Instant,
+    pub note: String,
 }
 
-const DECREASE: f64 = 0.8;
-const INCREASE: f64 = 1.08;
-const DECREASE_GAP: Duration = Duration::from_millis(500);
-const CLEAR_BEFORE_INCREASE: Duration = Duration::from_secs(3);
-const INCREASE_GAP: Duration = Duration::from_secs(1);
+const DECREASE_GAP: Duration = Duration::from_secs(1);
+const CLEAR_BEFORE_INCREASE: Duration = Duration::from_millis(1500);
+const INCREASE_GAP: Duration = Duration::from_millis(500);
+const INCREASE: f64 = 1.2;
+const MIN_RTT_WINDOW: Duration = Duration::from_secs(30);
 
 impl Abr {
-    pub fn new(max_kbps: u32, now: Instant) -> Self {
+    /// `None` for the fixed policy.
+    pub fn new(max_kbps: u32, policy: BitratePolicy, now: Instant) -> Option<Self> {
+        if policy == BitratePolicy::Fixed {
+            return None;
+        }
+        let p = params(policy);
         let max = max_kbps.max(500);
-        Self {
+        Some(Self {
+            policy,
+            p,
             max,
-            min: (max / 10).max(800).min(max),
+            min: ((max as f64 * p.floor) as u32).max(500).min(max),
             target: max,
             reported: max,
             min_rtt: None,
-            last_lost: None,
-            last_decrease: now - Duration::from_secs(10),
+            min_rtt_at: now,
+            prev: None,
+            rate_kbps: 0.0,
+            bad_streak: 0,
+            last_bad: now - Duration::from_secs(60),
+            last_decrease: now - Duration::from_secs(60),
             last_increase: now,
-        }
+            note: format!("{}，目标 {:.1} Mbps", policy_name(policy), max as f64 / 1000.0),
+        })
     }
 
     #[cfg(test)]
@@ -54,32 +138,73 @@ impl Abr {
         self.target
     }
 
-    /// Is the path congested according to this sample?
-    fn congested(&mut self, s: &Sample) -> bool {
-        let min_rtt = *self.min_rtt.get_or_insert(s.rtt);
-        if s.rtt < min_rtt {
+    fn congestion(&mut self, s: &Sample) -> Option<String> {
+        if self.min_rtt.is_none_or(|m| s.rtt < m) || s.now - self.min_rtt_at > MIN_RTT_WINDOW {
             self.min_rtt = Some(s.rtt);
+            self.min_rtt_at = s.now;
         }
         let min_rtt = self.min_rtt.unwrap();
-        let queue_delay = s.rtt.saturating_sub(min_rtt);
-        let lost = s.lost_packets.saturating_sub(self.last_lost.unwrap_or(s.lost_packets));
-        self.last_lost = Some(s.lost_packets);
-        // bytes * 8 / kbit/s = ms
+        let prev = self.prev.replace(*s);
+        if let Some(prev) = prev {
+            let dt = (s.now - prev.now).as_secs_f64();
+            if dt > 0.0 {
+                let kbps = s.sent_bytes.saturating_sub(prev.sent_bytes) as f64 * 8.0 / 1000.0 / dt;
+                self.rate_kbps = if self.rate_kbps == 0.0 { kbps } else { self.rate_kbps * 0.7 + kbps * 0.3 };
+            }
+        }
         let backlog_ms = s.backlog_bytes * 8 / self.target.max(1) as u64;
-        backlog_ms > 200 || queue_delay > Duration::from_millis(80) + min_rtt / 2 || lost > 3
+        if backlog_ms > self.p.backlog_ms {
+            return Some(format!("发送积压 {backlog_ms} ms"));
+        }
+        if let Some((fixed, factor)) = self.p.queue {
+            let queue = s.rtt.saturating_sub(min_rtt);
+            if queue > fixed.max(min_rtt.mul_f64(factor)) {
+                return Some(format!("排队延迟 {} ms", queue.as_millis()));
+            }
+        }
+        if let (Some(limit), Some(prev)) = (self.p.loss, prev) {
+            let lost = s.lost_packets.saturating_sub(prev.lost_packets);
+            let sent = s.sent_packets.saturating_sub(prev.sent_packets).max(1);
+            let rate = lost as f64 / sent as f64;
+            if lost >= 5 && rate > limit {
+                return Some(format!("丢包 {:.0}%", rate * 100.0));
+            }
+        }
+        None
     }
 
     /// Feed one sample; returns the new target when it moved by 5 % or more.
     pub fn update(&mut self, s: Sample) -> Option<u32> {
-        let congested = self.congested(&s);
-        if congested {
-            if s.now - self.last_decrease >= DECREASE_GAP {
-                self.target = ((self.target as f64 * DECREASE) as u32).max(self.min);
-                self.last_decrease = s.now;
+        match self.congestion(&s) {
+            Some(why) => {
+                self.bad_streak += 1;
+                self.last_bad = s.now;
+                if self.bad_streak >= self.p.sustained && s.now - self.last_decrease >= DECREASE_GAP {
+                    // What the path actually carried, a little under; at most a 30 % step.
+                    let measured = if self.rate_kbps > 0.0 { self.rate_kbps * 0.9 } else { self.target as f64 * 0.85 };
+                    let next = measured.min(self.target as f64 * 0.95).max(self.target as f64 * 0.7);
+                    self.target = (next as u32).clamp(self.min, self.max);
+                    self.last_decrease = s.now;
+                    self.bad_streak = 0;
+                    self.note = format!(
+                        "{}：{why}，实际 {:.1} Mbps → 目标 {:.1} Mbps",
+                        policy_name(self.policy),
+                        self.rate_kbps / 1000.0,
+                        self.target as f64 / 1000.0
+                    );
+                }
             }
-        } else if s.now - self.last_decrease >= CLEAR_BEFORE_INCREASE && s.now - self.last_increase >= INCREASE_GAP {
-            self.target = ((self.target as f64 * INCREASE) as u32).min(self.max);
-            self.last_increase = s.now;
+            None => {
+                self.bad_streak = 0;
+                if self.target < self.max
+                    && s.now - self.last_bad >= CLEAR_BEFORE_INCREASE
+                    && s.now - self.last_increase >= INCREASE_GAP
+                {
+                    self.target = ((self.target as f64 * INCREASE) as u32).min(self.max);
+                    self.last_increase = s.now;
+                    self.note = format!("{}：网络恢复，目标 {:.1} Mbps", policy_name(self.policy), self.target as f64 / 1000.0);
+                }
+            }
         }
         let diff = (self.target as i64 - self.reported as i64).unsigned_abs() as f64;
         if diff >= self.reported as f64 * 0.05 || (self.target == self.max && self.reported != self.max) {
@@ -95,66 +220,111 @@ impl Abr {
 mod tests {
     use super::*;
 
-    fn sample(now: Instant, rtt_ms: u64, lost: u64, backlog: u64) -> Sample {
-        Sample { now, rtt: Duration::from_millis(rtt_ms), lost_packets: lost, backlog_bytes: backlog }
+    struct Sim {
+        t0: Instant,
+        ms: u64,
+        sent_bytes: u64,
+        sent_pk: u64,
+        lost: u64,
     }
 
-    #[test]
-    fn stays_at_max_when_clear() {
-        let t0 = Instant::now();
-        let mut a = Abr::new(10_000, t0);
-        for i in 0..40 {
-            assert_eq!(a.update(sample(t0 + Duration::from_millis(250 * i), 20, 0, 0)), None);
+    impl Sim {
+        fn new() -> Self {
+            Self { t0: Instant::now(), ms: 0, sent_bytes: 0, sent_pk: 0, lost: 0 }
         }
-        assert_eq!(a.target(), 10_000);
+        /// One 250 ms step at `kbps` actually sent.
+        fn step(&mut self, a: &mut Abr, kbps: u64, rtt: u64, lost: u64, backlog: u64) -> Option<u32> {
+            self.ms += 250;
+            self.sent_bytes += kbps * 1000 / 8 / 4;
+            self.sent_pk += 100;
+            self.lost += lost;
+            a.update(Sample {
+                now: self.t0 + Duration::from_millis(self.ms),
+                rtt: Duration::from_millis(rtt),
+                lost_packets: self.lost,
+                sent_packets: self.sent_pk,
+                sent_bytes: self.sent_bytes,
+                backlog_bytes: backlog,
+            })
+        }
     }
 
     #[test]
-    fn backs_off_on_backlog_then_recovers() {
-        let t0 = Instant::now();
-        let mut a = Abr::new(10_000, t0);
-        a.update(sample(t0, 20, 0, 0));
-        // 1 MB backlog at 10 Mbit/s = 800 ms of queue.
-        let r = a.update(sample(t0 + Duration::from_millis(250), 20, 0, 1_000_000));
-        assert_eq!(r, Some(8_000));
-        // Not again within 500 ms.
-        assert_eq!(a.update(sample(t0 + Duration::from_millis(500), 20, 0, 1_000_000)), None);
-        let r = a.update(sample(t0 + Duration::from_millis(800), 20, 0, 1_000_000));
-        assert_eq!(r, Some(6_400));
-        // Clear path: nothing for 3 s, then slow growth back to the max.
-        let mut t = t0 + Duration::from_millis(800);
-        let mut last = 6_400;
-        for _ in 0..200 {
-            t += Duration::from_millis(250);
-            if let Some(v) = a.update(sample(t, 20, 0, 0)) {
-                assert!(v > last && v <= 10_000);
-                assert!(t - (t0 + Duration::from_millis(800)) >= CLEAR_BEFORE_INCREASE);
-                last = v;
+    fn fixed_policy_has_no_controller() {
+        assert!(Abr::new(10_000, BitratePolicy::Fixed, Instant::now()).is_none());
+    }
+
+    #[test]
+    fn automatic_policy_follows_mode() {
+        assert_eq!(resolve(0, StreamMode::Office as i32), BitratePolicy::Quality);
+        assert_eq!(resolve(0, StreamMode::Game as i32), BitratePolicy::Balanced);
+        assert_eq!(resolve(BitratePolicy::Smooth as i32, StreamMode::Office as i32), BitratePolicy::Smooth);
+    }
+
+    #[test]
+    fn loss_and_jitter_do_not_touch_quality_or_balanced() {
+        for policy in [BitratePolicy::Quality, BitratePolicy::Balanced] {
+            let mut sim = Sim::new();
+            let mut a = Abr::new(10_000, policy, sim.t0).unwrap();
+            for i in 0..80 {
+                // 20 % "loss" (reordering on a proxy) and RTT spikes, no backlog.
+                let rtt = if i % 4 == 0 { 120 } else { 40 };
+                assert!(sim.step(&mut a, 8_000, rtt, 20, 0).is_none(), "{policy:?} step {i}");
+            }
+            assert_eq!(a.target(), 10_000);
+        }
+    }
+
+    #[test]
+    fn quality_needs_long_heavy_backlog_and_keeps_60_percent() {
+        let mut sim = Sim::new();
+        let mut a = Abr::new(10_000, BitratePolicy::Quality, sim.t0).unwrap();
+        // 800 ms backlog is tolerated.
+        for _ in 0..20 {
+            assert!(sim.step(&mut a, 9_000, 30, 0, 1_000_000).is_none());
+        }
+        // 2 s of >1 s backlog while only 3 Mbit/s get through.
+        let mut last = None;
+        for _ in 0..60 {
+            if let Some(v) = sim.step(&mut a, 3_000, 30, 0, 2_000_000) {
+                last = Some(v);
             }
         }
+        assert_eq!(last, Some(6_000), "floor 60 %");
+        assert!(a.note.contains("积压"));
+    }
+
+    #[test]
+    fn balanced_sets_target_from_measured_rate_and_recovers() {
+        let mut sim = Sim::new();
+        let mut a = Abr::new(10_000, BitratePolicy::Balanced, sim.t0).unwrap();
+        for _ in 0..4 {
+            sim.step(&mut a, 7_500, 30, 0, 0);
+        }
+        // Path carries ~7.5 Mbit/s, backlog of 500 ms builds up.
+        let mut v = None;
+        for _ in 0..3 {
+            v = v.or(sim.step(&mut a, 7_500, 30, 0, 700_000));
+        }
+        let v = v.expect("reacts after 0.75 s");
+        assert!((6_500..=7_100).contains(&v), "about 0.9 × measured, got {v}");
+        // Clear again: back to 10 Mbit/s within a few seconds.
+        for _ in 0..24 {
+            sim.step(&mut a, 7_000, 30, 0, 0);
+        }
         assert_eq!(a.target(), 10_000);
     }
 
     #[test]
-    fn rtt_growth_and_loss_count_as_congestion() {
-        let t0 = Instant::now();
-        let mut a = Abr::new(20_000, t0);
-        a.update(sample(t0, 10, 0, 0));
-        assert!(a.update(sample(t0 + Duration::from_millis(250), 200, 0, 0)).is_some(), "queueing delay");
-        let mut b = Abr::new(20_000, t0);
-        b.update(sample(t0, 10, 100, 0));
-        assert!(b.update(sample(t0 + Duration::from_millis(250), 10, 110, 0)).is_some(), "loss");
-    }
-
-    #[test]
-    fn never_below_floor() {
-        let t0 = Instant::now();
-        let mut a = Abr::new(10_000, t0);
-        let mut t = t0;
-        for _ in 0..100 {
-            t += Duration::from_millis(600);
-            a.update(sample(t, 20, 0, 10_000_000));
+    fn smooth_reacts_to_sustained_loss() {
+        let mut sim = Sim::new();
+        let mut a = Abr::new(10_000, BitratePolicy::Smooth, sim.t0).unwrap();
+        sim.step(&mut a, 9_000, 30, 0, 0);
+        let mut r = None;
+        for _ in 0..2 {
+            r = r.or(sim.step(&mut a, 9_000, 30, 20, 0));
         }
-        assert_eq!(a.target(), 1_000);
+        assert!(r.is_some());
+        assert!(a.note.contains("丢包"));
     }
 }

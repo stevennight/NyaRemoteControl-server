@@ -264,6 +264,7 @@ impl Pipeline {
                 fps,
                 bitrate_kbps: bitrate,
                 mode: if game { pb::StreamMode::Game } else { pb::StreamMode::Office } as i32,
+                bitrate_policy: sc.bitrate_policy,
             }),
             stream_id,
             encoder_name: encoder.name().to_owned(),
@@ -664,6 +665,7 @@ impl Pipeline {
             fps: (s.frames as f32 / secs).round() as u32,
             bitrate_kbps: (s.bytes as f32 * 8.0 / 1000.0 / secs) as u32,
             target_kbps: self.encoder.config().bitrate_kbps,
+            bitrate_note: String::new(),
         }));
         self.stats.since = Some(Instant::now());
     }
