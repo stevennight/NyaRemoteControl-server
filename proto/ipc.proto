@@ -1,0 +1,52 @@
+// service <-> helper messages over the named pipe. Both ends are the same
+// executable, so this is not a compatibility surface.
+syntax = "proto3";
+package nya.ipc;
+
+import "nya.proto";
+
+// service -> helper (also used in-process in standalone mode)
+message HostCommand {
+  oneof cmd {
+    nya.v1.StartStream start_stream = 1;
+    nya.v1.StopStream stop_stream = 2;
+    nya.v1.RequestKeyframe request_keyframe = 3;
+    nya.v1.SetMode set_mode = 4;
+    nya.v1.InputMsg input = 5;
+    nya.v1.ClipboardText clipboard = 6;
+    nya.v1.ClientCaps client_caps = 7;
+    FrameSent frame_sent = 8;
+    ClientGone client_gone = 9;
+    Shutdown shutdown = 10;
+    SetAudio set_audio = 11;
+  }
+}
+
+message FrameSent { uint64 frame_id = 1; }
+message ClientGone {}
+message Shutdown {}
+message SetAudio { bool enabled = 1; }
+
+// helper -> service
+message HostEvent {
+  oneof ev {
+    VideoFrame video = 1;
+    nya.v1.CursorMsg cursor = 2;
+    AudioDatagram audio = 3;
+    nya.v1.SessionInfo session_info = 4;
+    nya.v1.StreamStarted stream_started = 5;
+    nya.v1.StreamError stream_error = 6;
+    nya.v1.ClipboardText clipboard = 7;
+    nya.v1.ServerStats stats = 8;
+    nya.v1.DisplayChanged display_changed = 9;
+  }
+}
+
+message VideoFrame {
+  uint64 stream_id = 1;
+  uint64 frame_id = 2;
+  bytes header = 3;   // encoded VideoFrameHeader
+  bytes data = 4;
+}
+
+message AudioDatagram { bytes datagram = 1; }
