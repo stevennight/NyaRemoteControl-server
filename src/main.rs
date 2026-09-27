@@ -22,6 +22,7 @@ mod logging;
 mod net;
 mod paths;
 mod service;
+mod usb;
 mod winutil;
 
 pub mod ipc_pb {

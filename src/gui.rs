@@ -59,10 +59,7 @@ fn detect_components() -> Vec<Component> {
     let vdd = nya_win::topology::Topology::enumerate()
         .ok()
         .and_then(|t| t.adapters.iter().find(|a| a.name.to_lowercase().contains("virtual display")).map(|a| a.name.clone()));
-    let usbip = [r"C:\Program Files\USBip\usbip.exe", r"C:\Program Files\usbip-win2\usbip.exe"]
-        .iter()
-        .find(|p| std::path::Path::new(p).exists())
-        .map(|p| p.to_string());
+    let usbip = crate::usb::usbip_exe().map(|p| p.display().to_string());
     vec![
         Component {
             name: "VB-Cable 虚拟声卡",

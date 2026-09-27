@@ -231,6 +231,8 @@ async fn run_session(
             }
         }
     });
+    let usb_on = neg.has(Feature::UsbRedirect);
+    let usb = Arc::new(tokio::sync::Mutex::new(crate::usb::UsbHost::new(conn.clone())));
     let files_on = neg.has(Feature::FileTransfer);
     let images_on = neg.has(Feature::ClipboardImage);
     let input_task = tokio::spawn(client_streams(
@@ -307,6 +309,27 @@ async fn run_session(
                         hub.send(Cmd::SetMode(m));
                     }
                     Some(Msg::RequestKeyframe(k)) => hub.send(Cmd::RequestKeyframe(k)),
+                    Some(Msg::UsbAttach(a)) if usb_on => {
+                        let (usb, tx) = (usb.clone(), ctl_tx.clone());
+                        tokio::spawn(async move {
+                            let r = usb.lock().await.attach(&a.busid).await;
+                            let (attached, message) = match r {
+                                Ok(m) => (true, m),
+                                Err(e) => (false, format!("{e:#}")),
+                            };
+                            let _ = tx.send(ctl(Msg::UsbStatus(pb::UsbStatus { busid: a.busid, attached, message }))).await;
+                        });
+                    }
+                    Some(Msg::UsbDetach(d)) if usb_on => {
+                        let (usb, tx) = (usb.clone(), ctl_tx.clone());
+                        tokio::spawn(async move {
+                            let message = match usb.lock().await.detach(&d.busid).await {
+                                Ok(m) => m,
+                                Err(e) => format!("{e:#}"),
+                            };
+                            let _ = tx.send(ctl(Msg::UsbStatus(pb::UsbStatus { busid: d.busid, attached: false, message }))).await;
+                        });
+                    }
                     Some(Msg::FileRequest(req)) if files_on => {
                         match offers.iter().find(|(id, _)| *id == req.transfer_id) {
                             Some((id, paths)) => {
@@ -443,6 +466,8 @@ async fn run_session(
         }
     };
 
+    // Give attached USB devices back to the client.
+    let _ = timeout(Duration::from_secs(8), async { usb.lock().await.detach_all().await }).await;
     drop(ctl_tx);
     video_task.abort();
     mic_task.abort();
