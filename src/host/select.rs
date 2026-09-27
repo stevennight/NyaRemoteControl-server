@@ -139,7 +139,8 @@ pub fn plans(
     .collect();
 
     // Chroma wish: explicit request, else 4:4:4 in office mode if the client decodes it in hardware.
-    let want444 = match pb::Chroma::try_from(cfg.chroma).unwrap_or(pb::Chroma::Unspecified) {
+    let requested = pb::Chroma::try_from(cfg.chroma).unwrap_or(pb::Chroma::Unspecified);
+    let want444 = match requested {
         pb::Chroma::Yuv444 => true,
         pb::Chroma::Yuv420 => false,
         pb::Chroma::Unspecified => {
@@ -156,7 +157,9 @@ pub fn plans(
 
     let mut out = Vec::new();
     if pref_backend != Some(Backend::Software) {
-        let chroma_order: &[bool] = if want444 { &[true, false] } else { &[false] };
+        // Without a 4:4:4 wish, 4:4:4 hardware plans still rank above the
+        // software encoder (the client can decode 4:4:4 in software).
+        let chroma_order: &[bool] = if want444 || requested != pb::Chroma::Yuv420 { if want444 { &[true, false] } else { &[false, true] } } else { &[false] };
         for &yuv444 in chroma_order {
             for p in &gpus {
                 for &codec in &codecs {
@@ -274,6 +277,21 @@ mod tests {
     fn no_444_when_client_only_decodes_in_software() {
         let p = plans(&laptop(true), 0, &office(), Some(&hevc_caps(false)), "auto");
         assert!(!p[0].yuv444);
+    }
+
+    /// GPUs whose drivers only allow 4:4:4 (BGRA) input: prefer hardware 4:4:4
+    /// with client-side software decoding over the software encoder.
+    #[test]
+    fn hardware_444_before_software_encoder() {
+        let probes = vec![probe(0, Backend::Nvenc, &[(H264, true), (Hevc, true)])];
+        let p = plans(&probes, 0, &office(), Some(&hevc_caps(false)), "auto");
+        assert_eq!(p[0], Plan { capture_adapter: 0, encode_adapter: Some(0), backend: Backend::Nvenc, codec: Hevc, yuv444: true });
+        assert_eq!(p.last().unwrap().backend, Backend::Software);
+        // Explicit 4:2:0 request never gets 4:4:4.
+        let mut req = office();
+        req.config.as_mut().unwrap().chroma = pb::Chroma::Yuv420 as i32;
+        let p = plans(&probes, 0, &req, Some(&hevc_caps(false)), "auto");
+        assert!(p.iter().all(|x| !x.yuv444));
     }
 
     #[test]

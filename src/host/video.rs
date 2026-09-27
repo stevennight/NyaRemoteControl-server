@@ -259,6 +259,7 @@ fn build(st: &mut State, cfg: &HostConfig, desktop: &mut DesktopTracker) -> Resu
         .or_else(|| st.topo.outputs.first())
         .ok_or_else(|| "没有可用的显示器".to_string())?
         .clone();
+    check_capture(&st.topo, &output, desktop)?;
     let plans = select::plans(&st.probes, output.adapter_index, &req, st.caps.as_ref(), &cfg.encoder);
     let mut errors = Vec::new();
     for plan in plans {
@@ -291,4 +292,23 @@ fn build(st: &mut State, cfg: &HostConfig, desktop: &mut DesktopTracker) -> Resu
         }
     }
     Err(if errors.is_empty() { "客户端不支持任何可用的编码格式".into() } else { errors.join("; ") })
+}
+
+/// Capture problems are independent of the encoder plan: report them clearly
+/// instead of letting every plan fail with the same error.
+fn check_capture(topo: &Topology, output: &nya_win::topology::OutputInfo, desktop: &mut DesktopTracker) -> Result<(), String> {
+    use nya_win::d3d::D3dDevice;
+    use nya_win::duplication::{DupError, Duplicator};
+    let _ = desktop.sync();
+    let adapter = topo.adapter(output.adapter_index).ok_or("显示器所在的显卡不存在")?;
+    let dev = D3dDevice::for_adapter(&adapter.adapter).map_err(|e| format!("无法创建 D3D11 设备：{e:#}"))?;
+    match Duplicator::new(&dev, &output.output) {
+        Ok(_) => Ok(()),
+        Err(DupError::Other(e)) if e.code().0 as u32 == 0x8007_0005 => Err(format!(
+            "无法截取屏幕（拒绝访问）：被控端当前处于锁屏、登录界面、UAC 安全桌面，或会话已断开/最小化（桌面 {}）。\
+             开发模式截不到这些界面，请解锁被控端，或改用服务模式（nya-server install）",
+            desktop.name()
+        )),
+        Err(e) => Err(format!("无法截取屏幕：{e}")),
+    }
 }

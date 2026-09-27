@@ -25,7 +25,6 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11ShaderResourceView, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
     D3D11_TEXTURE2D_DESC,
 };
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_NV12;
 use windows::Win32::Graphics::Dxgi::IDXGIOutput;
 
 use super::cursor::CursorTracker;
@@ -88,6 +87,9 @@ pub struct Pipeline {
     xcopy: Option<CrossGpuCopy>,
     readback: Option<Readback>,
     cpu_buf: Vec<u8>,
+    /// Software path reads back BGRA and converts to NV12 on the CPU.
+    cpu_bgra: bool,
+    nv12_buf: Vec<u8>,
     encoder: VideoEncoder,
     width: u32,
     height: u32,
@@ -187,14 +189,33 @@ impl Pipeline {
         };
         let raw = encode_dev.as_ref().map(|d| d.device_raw_owned()).unwrap_or(std::ptr::null_mut());
         let mut encoder = VideoEncoder::open(&enc_cfg, raw).with_context(|| format!("open {:?}", plan))?;
-        let target = match encoder.input_format() {
+        let mut target = match encoder.input_format() {
             InputFormat::Nv12 | InputFormat::CpuNv12 => TargetFormat::Nv12,
             InputFormat::Bgra => TargetFormat::Bgra,
             InputFormat::Ayuv => TargetFormat::Ayuv,
         };
         let cpu = encoder.input_format() == InputFormat::CpuNv12;
-        let intermediate = if cross || cpu {
-            Some(capture.texture(&tex_desc(w, h, target.dxgi(), D3D11_BIND_RENDER_TARGET))?)
+        let mut converter = Converter::new(&capture)?;
+        // Intermediate texture on the capture GPU (cross-GPU and software paths).
+        let make_intermediate = |converter: &mut Converter, t: TargetFormat| -> Result<ID3D11Texture2D> {
+            let tex = capture.texture(&tex_desc(w, h, t.dxgi(), D3D11_BIND_RENDER_TARGET))?;
+            converter.prepare_target(&tex, 0, t)?;
+            Ok(tex)
+        };
+        let mut cpu_bgra = false;
+        let intermediate = if cpu {
+            match make_intermediate(&mut converter, TargetFormat::Nv12) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    // No NV12 render targets on this GPU: read back BGRA and convert on the CPU.
+                    tracing::info!("NV12 render target unavailable ({e:#}); converting on CPU");
+                    target = TargetFormat::Bgra;
+                    cpu_bgra = true;
+                    Some(make_intermediate(&mut converter, TargetFormat::Bgra)?)
+                }
+            }
+        } else if cross {
+            Some(make_intermediate(&mut converter, target).context("intermediate texture")?)
         } else {
             None
         };
@@ -202,8 +223,7 @@ impl Pipeline {
             (Some(dst), true) => Some(CrossGpuCopy::new(&capture, dst, target.dxgi(), w, h)?),
             _ => None,
         };
-        let readback = if cpu { Some(Readback::new(&capture, DXGI_FORMAT_NV12, w, h)?) } else { None };
-        let mut converter = Converter::new(&capture)?;
+        let readback = if cpu { Some(Readback::new(&capture, target.dxgi(), w, h)?) } else { None };
         if !cross && !cpu {
             // Make sure we can render into the encoder's pool textures.
             let surf = encoder.surface().context("encoder surface")?;
@@ -265,6 +285,8 @@ impl Pipeline {
             xcopy,
             readback,
             cpu_buf: Vec::new(),
+            cpu_bgra,
+            nv12_buf: Vec::new(),
             encoder,
             width: w,
             height: h,
@@ -421,9 +443,13 @@ impl Pipeline {
         match self.encoder.input_format() {
             InputFormat::CpuNv12 => {
                 let inter = self.intermediate.as_ref().unwrap();
-                self.converter.convert(&srv, inter, 0, TargetFormat::Nv12, w, h)?;
+                self.converter.convert(&srv, inter, 0, self.target, w, h)?;
                 let t = Instant::now();
                 self.readback.as_mut().unwrap().read(inter, &mut self.cpu_buf)?;
+                if self.cpu_bgra {
+                    bgra_to_nv12(&self.cpu_buf, w as usize, h as usize, &mut self.nv12_buf);
+                    std::mem::swap(&mut self.cpu_buf, &mut self.nv12_buf);
+                }
                 transfer_ms = t.elapsed().as_secs_f32() * 1000.0;
                 self.encoder.encode_nv12_cpu(&self.cpu_buf, key, &mut packets)?;
             }
@@ -507,5 +533,55 @@ impl Pipeline {
             bitrate_kbps: (s.bytes as f32 * 8.0 / 1000.0 / secs) as u32,
         }));
         self.stats.since = Some(Instant::now());
+    }
+}
+
+/// BGRA → NV12, BT.709 limited range (software-encoder fallback only).
+fn bgra_to_nv12(bgra: &[u8], w: usize, h: usize, out: &mut Vec<u8>) {
+    out.clear();
+    out.resize(w * h * 3 / 2, 0);
+    let (y_plane, uv_plane) = out.split_at_mut(w * h);
+    let px = |x: usize, y: usize| {
+        let o = (y * w + x) * 4;
+        (bgra[o + 2] as f32, bgra[o + 1] as f32, bgra[o] as f32)
+    };
+    for y in 0..h {
+        for x in 0..w {
+            let (r, g, b) = px(x, y);
+            y_plane[y * w + x] = (16.0 + (0.2126 * r + 0.7152 * g + 0.0722 * b) * 219.0 / 255.0).round() as u8;
+        }
+    }
+    for y in 0..h / 2 {
+        for x in 0..w / 2 {
+            let (mut r, mut g, mut b) = (0.0, 0.0, 0.0);
+            for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                let p = px(2 * x + dx, 2 * y + dy);
+                r += p.0 / 4.0;
+                g += p.1 / 4.0;
+                b += p.2 / 4.0;
+            }
+            let u = 128.0 + (-0.114572 * r - 0.385428 * g + 0.5 * b) * 224.0 / 255.0;
+            let v = 128.0 + (0.5 * r - 0.454153 * g - 0.045847 * b) * 224.0 / 255.0;
+            uv_plane[y * w + 2 * x] = u.round().clamp(0.0, 255.0) as u8;
+            uv_plane[y * w + 2 * x + 1] = v.round().clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bgra_to_nv12_levels() {
+        let (w, h) = (4, 2);
+        let white = vec![255u8; w * h * 4];
+        let mut out = Vec::new();
+        bgra_to_nv12(&white, w, h, &mut out);
+        assert!(out[..w * h].iter().all(|&y| y == 235));
+        assert!(out[w * h..].iter().all(|&c| c == 128));
+        let black: Vec<u8> = (0..w * h).flat_map(|_| [0, 0, 0, 255]).collect();
+        bgra_to_nv12(&black, w, h, &mut out);
+        assert!(out[..w * h].iter().all(|&y| y == 16));
     }
 }

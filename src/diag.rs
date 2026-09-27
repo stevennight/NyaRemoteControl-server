@@ -82,6 +82,14 @@ pub fn run(path: Option<PathBuf>) -> Result<()> {
         );
     }
 
+    out!(r, "\n-- 纹理格式支持（渲染目标）--");
+    for a in topo.hardware_adapters() {
+        match D3dDevice::for_adapter(&a.adapter) {
+            Ok(dev) => out!(r, "[{}] {}", a.index, format_support(&dev)),
+            Err(e) => out!(r, "[{}] !! {e:#}", a.index),
+        }
+    }
+
     out!(r, "\n-- 编码器探测（1280x720）--");
     let probes = select::probe_all(&topo);
     for p in &probes {
@@ -107,7 +115,9 @@ pub fn run(path: Option<PathBuf>) -> Result<()> {
                 game_mode: false,
             };
             match encode_benchmark(&dev, &cfg) {
-                Ok(ms) => out!(r, "[{}] {:?} {:?} 444={yuv444}: {ms:.2} ms/帧", p.adapter_index, p.backend, codec),
+                Ok((ms, input)) => {
+                    out!(r, "[{}] {:?} {:?} 444={yuv444}: {ms:.2} ms/帧（输入 {input:?}）", p.adapter_index, p.backend, codec)
+                }
                 Err(e) => out!(r, "[{}] {:?} {:?} 444={yuv444}: !! {e:#}", p.adapter_index, p.backend, codec),
             }
         }
@@ -179,8 +189,42 @@ fn Command(cmd: &str, args: &[&str]) -> String {
         .unwrap_or_default()
 }
 
-fn encode_benchmark(dev: &D3dDevice, cfg: &EncoderConfig) -> Result<f64> {
+fn format_support(dev: &D3dDevice) -> String {
+    use windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_AYUV, DXGI_SAMPLE_DESC};
+    const RT: u32 = 0x4000; // D3D11_FORMAT_SUPPORT_RENDER_TARGET
+    let mut parts = Vec::new();
+    for (name, fmt) in [("NV12", DXGI_FORMAT_NV12), ("AYUV", DXGI_FORMAT_AYUV)] {
+        let flags = unsafe { dev.device.CheckFormatSupport(fmt) }.unwrap_or(0);
+        let try_create = |array: u32| {
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: 1920,
+                Height: 1080,
+                MipLevels: 1,
+                ArraySize: array,
+                Format: fmt,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+                ..Default::default()
+            };
+            match dev.texture(&desc) {
+                Ok(_) => "OK".to_string(),
+                Err(e) => format!("失败({e})"),
+            }
+        };
+        parts.push(format!(
+            "{name}: 渲染目标={} 单张={} 数组={}",
+            if flags & RT != 0 { "支持" } else { "不支持" },
+            try_create(1),
+            try_create(6)
+        ));
+    }
+    parts.join("  ")
+}
+
+fn encode_benchmark(dev: &D3dDevice, cfg: &EncoderConfig) -> Result<(f64, nya_media::encoder::InputFormat)> {
     let mut enc = VideoEncoder::open(cfg, dev.device_raw_owned())?;
+    let input = enc.input_format();
     let mut packets = Vec::new();
     let mut total = 0.0;
     for i in 0..35 {
@@ -192,7 +236,7 @@ fn encode_benchmark(dev: &D3dDevice, cfg: &EncoderConfig) -> Result<f64> {
         }
         packets.clear();
     }
-    Ok(total / 30.0)
+    Ok((total / 30.0, input))
 }
 
 fn cross_benchmark(
