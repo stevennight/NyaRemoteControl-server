@@ -110,6 +110,22 @@ pub struct Pipeline {
     stats: Stats,
     built_at: Instant,
     warned_no_image: bool,
+    diag: CaptureCounters,
+    /// Consecutive access-lost errors without an image; switches API after 5.
+    lost_streak: u32,
+    legacy_dup: bool,
+}
+
+/// Capture counters, logged every 5 s while the stream isn't producing frames.
+#[derive(Default)]
+struct CaptureCounters {
+    since: Option<Instant>,
+    acquired: u32,
+    images: u32,
+    timeouts: u32,
+    access_lost: u32,
+    dup_failures: u32,
+    encoded: u32,
 }
 
 fn even(v: u32) -> u32 {
@@ -309,6 +325,9 @@ impl Pipeline {
             stats: Stats::default(),
             built_at: now,
             warned_no_image: false,
+            diag: CaptureCounters::default(),
+            lost_streak: 0,
+            legacy_dup: false,
         })
     }
 
@@ -347,6 +366,12 @@ impl Pipeline {
 
     pub fn step(&mut self, sink: &Sink, desktop: &mut DesktopTracker) -> Step {
         let now = Instant::now();
+        // Before any early return, so a capture loop that never gets an image is visible.
+        self.log_capture_status(desktop);
+        if !self.have_image && !self.warned_no_image && now - self.built_at > Duration::from_secs(3) {
+            self.warned_no_image = true;
+            tracing::warn!("no desktop image after 3 s; desktop {}", desktop.name());
+        }
         let interval = Duration::from_secs_f64(1.0 / self.fps as f64);
         let next_due = self.last_encode + interval;
 
@@ -356,7 +381,12 @@ impl Pipeline {
                 return Step::Ok;
             }
             let _ = desktop.sync();
-            match Duplicator::new(&self.capture, &self.output) {
+            let created = if self.legacy_dup {
+                Duplicator::new_legacy(&self.capture, &self.output)
+            } else {
+                Duplicator::new(&self.capture, &self.output)
+            };
+            match created {
                 Ok(d) => {
                     if (d.width, d.height) != self.native {
                         return Step::Rebuild(format!("resolution changed to {}x{}", d.width, d.height));
@@ -367,6 +397,7 @@ impl Pipeline {
                 }
                 Err(DupError::DeviceLost) => return Step::Rebuild("GPU device lost".into()),
                 Err(e) => {
+                    self.diag.dup_failures += 1;
                     self.dup_failures += 1;
                     if self.dup_failures == 1 || self.dup_failures % 50 == 0 {
                         tracing::warn!("DuplicateOutput failed ({}x): {e}", self.dup_failures);
@@ -384,6 +415,11 @@ impl Pipeline {
         let dup = self.dup.as_mut().unwrap();
         match dup.acquire(wait_ms) {
             Ok(Some(frame)) => {
+                self.diag.acquired += 1;
+                if frame.image.is_some() {
+                    self.diag.images += 1;
+                    self.lost_streak = 0;
+                }
                 if let Some(img) = &frame.image {
                     if let Err(e) = self.copy_desktop(img) {
                         tracing::warn!("copy desktop: {e:#}");
@@ -403,10 +439,24 @@ impl Pipeline {
                     sink.send(Ev::Cursor(m));
                 }
             }
-            Ok(None) => {}
+            Ok(None) => self.diag.timeouts += 1,
             Err(DupError::AccessLost) => {
                 // Desktop switch (lock screen, UAC), mode change or fullscreen transition.
-                tracing::debug!("duplication access lost");
+                self.diag.access_lost += 1;
+                if self.diag.access_lost <= 3 {
+                    tracing::info!("duplication access lost (desktop {})", desktop.name());
+                }
+                self.lost_streak += 1;
+                if self.lost_streak >= 5 {
+                    self.lost_streak = 0;
+                    self.legacy_dup = !self.legacy_dup;
+                    tracing::warn!(
+                        "duplication keeps losing access; switching to {} API",
+                        if self.legacy_dup { "legacy DuplicateOutput" } else { "DuplicateOutput1" }
+                    );
+                }
+                // Don't spin: give the desktop switch a moment.
+                self.next_dup_retry = Instant::now() + Duration::from_millis(50);
                 self.dup = None;
                 return Step::Ok;
             }
@@ -420,13 +470,6 @@ impl Pipeline {
         }
 
         let now = Instant::now();
-        if !self.have_image && !self.warned_no_image && now - self.built_at > Duration::from_secs(3) {
-            self.warned_no_image = true;
-            tracing::warn!(
-                "no desktop image after 3 s (display off / asleep, or nothing drawn yet); desktop {}",
-                desktop.name()
-            );
-        }
         if self.inflight >= MAX_INFLIGHT && now - self.last_frame_sent > Duration::from_secs(3) {
             tracing::warn!("no FrameSent for 3 s; resetting flow control");
             self.inflight = 0;
@@ -514,6 +557,7 @@ impl Pipeline {
             tracing::debug!("keyframe requested but encoder produced none yet");
         }
         self.stats.frames += 1;
+        self.diag.encoded += 1;
         self.stats.encode_ms.push(t0.elapsed().as_secs_f32() * 1000.0 - transfer_ms);
         if self.xcopy.is_some() || self.readback.is_some() {
             self.stats.transfer_ms.push(transfer_ms);
@@ -524,6 +568,30 @@ impl Pipeline {
         }
         self.dirty = false;
         Ok(())
+    }
+
+    /// While frames aren't flowing, say why every 5 s.
+    fn log_capture_status(&mut self, desktop: &DesktopTracker) {
+        let since = *self.diag.since.get_or_insert_with(Instant::now);
+        if since.elapsed() < Duration::from_secs(5) {
+            return;
+        }
+        let d = std::mem::take(&mut self.diag);
+        if d.encoded < 5 {
+            tracing::warn!(
+                "capture status (5 s): acquired={} images={} timeouts={} access_lost={} dup_failures={} encoded={} inflight={} have_image={} desktop={}",
+                d.acquired,
+                d.images,
+                d.timeouts,
+                d.access_lost,
+                d.dup_failures,
+                d.encoded,
+                self.inflight,
+                self.have_image,
+                desktop.name()
+            );
+        }
+        self.diag.since = Some(Instant::now());
     }
 
     fn report_stats(&mut self, sink: &Sink) {
