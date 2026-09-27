@@ -22,6 +22,7 @@ pub enum VideoCmd {
     SetMode(pb::StreamMode),
     Caps(pb::ClientCaps),
     FrameSent(u64),
+    SetBitrate(u32),
     Shutdown,
 }
 
@@ -175,6 +176,11 @@ pub fn thread(rx: Receiver<VideoCmd>, sink: Sink, input_tx: Sender<InputCmd>, cf
                     }
                 }
                 VideoCmd::Caps(c) => st.caps = Some(c),
+                VideoCmd::SetBitrate(k) => {
+                    if let Some(p) = st.pipe.as_mut() {
+                        p.set_bitrate(k);
+                    }
+                }
                 VideoCmd::FrameSent(id) => {
                     if let Some(p) = st.pipe.as_mut() {
                         p.frame_sent(id);

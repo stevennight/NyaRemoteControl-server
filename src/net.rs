@@ -210,10 +210,11 @@ async fn run_session(
     // Video / cursor writer tasks.
     let (video_tx, video_rx) = mpsc::channel::<crate::ipc_pb::VideoFrame>(4);
     let (cursor_tx, cursor_rx) = mpsc::channel::<pb::CursorMsg>(256);
+    let written = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let video_task = tokio::spawn({
-        let (conn, hub) = (conn.clone(), hub.clone());
+        let (conn, hub, written) = (conn.clone(), hub.clone(), written.clone());
         async move {
-            if let Err(e) = video_writer(conn, video_rx, hub).await {
+            if let Err(e) = video_writer(conn, video_rx, hub, written).await {
                 tracing::warn!("video writer: {e:#}");
             }
         }
@@ -227,8 +228,33 @@ async fn run_session(
     let audio_on = neg.has(Feature::Audio);
     let clipboard_on = neg.has(Feature::ClipboardText);
 
+    let mut abr: Option<crate::abr::Abr> = None;
+    let mut abr_tick = tokio::time::interval(Duration::from_millis(250));
+    // udp_tx bytes not caused by video (handshake, control, audio, overhead)
+    let mut baseline: i64 = conn.stats().udp_tx.bytes as i64;
+
     let outcome: Result<()> = loop {
         tokio::select! {
+            _ = abr_tick.tick() => {
+                if let Some(a) = abr.as_mut() {
+                    let st = conn.stats();
+                    let app = written.load(std::sync::atomic::Ordering::Relaxed) as i64;
+                    let mut backlog = app - (st.udp_tx.bytes as i64 - baseline);
+                    if backlog < 0 {
+                        baseline += backlog; // re-anchor: overhead makes the estimate drift low
+                        backlog = 0;
+                    }
+                    let sample = crate::abr::Sample {
+                        now: std::time::Instant::now(),
+                        rtt: st.path.rtt,
+                        lost_packets: st.path.lost_packets,
+                        backlog_bytes: backlog as u64,
+                    };
+                    if let Some(k) = a.update(sample) {
+                        hub.send(Cmd::SetBitrate(crate::ipc_pb::SetBitrate { kbps: k }));
+                    }
+                }
+            }
             m = read_msg::<pb::ControlMsg, _>(&mut recv, MAX_MESSAGE_LEN) => {
                 let m = match m {
                     Ok(Some(m)) => m,
@@ -296,7 +322,11 @@ async fn run_session(
                         }
                     }
                     Some(Ev::SessionInfo(i)) => { let _ = ctl_tx.send(ctl(Msg::SessionInfo(i))).await; }
-                    Some(Ev::StreamStarted(s)) => { let _ = ctl_tx.send(ctl(Msg::StreamStarted(s))).await; }
+                    Some(Ev::StreamStarted(s)) => {
+                        let max = s.config.as_ref().map(|c| c.bitrate_kbps).unwrap_or(0);
+                        abr = (max > 0).then(|| crate::abr::Abr::new(max, std::time::Instant::now()));
+                        let _ = ctl_tx.send(ctl(Msg::StreamStarted(s))).await;
+                    }
                     Some(Ev::StreamError(e)) => { let _ = ctl_tx.send(ctl(Msg::StreamError(e))).await; }
                     Some(Ev::DisplayChanged(d)) => { let _ = ctl_tx.send(ctl(Msg::DisplayChanged(d))).await; }
                     Some(Ev::Stats(s)) => { let _ = ctl_tx.try_send(ctl(Msg::ServerStats(s))); }
@@ -334,7 +364,12 @@ async fn run_session(
 
 /// Writes frames on one uni stream per video stream id; acknowledges each
 /// frame to the host once quinn accepted it (flow control, §6.2).
-async fn video_writer(conn: Connection, mut rx: mpsc::Receiver<crate::ipc_pb::VideoFrame>, hub: Arc<Hub>) -> Result<()> {
+async fn video_writer(
+    conn: Connection,
+    mut rx: mpsc::Receiver<crate::ipc_pb::VideoFrame>,
+    hub: Arc<Hub>,
+    written: Arc<std::sync::atomic::AtomicU64>,
+) -> Result<()> {
     let mut current: Option<(u64, SendStream)> = None;
     let (mut frames, mut bytes, mut since) = (0u64, 0u64, std::time::Instant::now());
     while let Some(f) = rx.recv().await {
@@ -357,6 +392,7 @@ async fn video_writer(conn: Connection, mut rx: mpsc::Receiver<crate::ipc_pb::Vi
         s.write_all(&f.header).await?;
         s.write_all(&f.data).await?;
         hub.send(Cmd::FrameSent(FrameSent { frame_id: f.frame_id }));
+        written.fetch_add(len as u64 + 4, std::sync::atomic::Ordering::Relaxed);
         frames += 1;
         bytes += len as u64;
         if since.elapsed() >= Duration::from_secs(5) {

@@ -19,8 +19,12 @@ message HostCommand {
     ClientGone client_gone = 9;
     Shutdown shutdown = 10;
     SetAudio set_audio = 11;
+    SetBitrate set_bitrate = 12;
   }
 }
+
+// Adaptive bitrate decided by the network side.
+message SetBitrate { uint32 kbps = 1; }
 
 message FrameSent { uint64 frame_id = 1; }
 message ClientGone {}

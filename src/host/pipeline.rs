@@ -337,6 +337,15 @@ impl Pipeline {
         self.encoder.config().backend
     }
 
+    /// Adaptive bitrate from the network side, capped at the stream's configured rate.
+    pub fn set_bitrate(&mut self, kbps: u32) {
+        let max = self.started.config.as_ref().map(|c| c.bitrate_kbps).unwrap_or(kbps);
+        let k = kbps.clamp(500, max.max(500));
+        if self.encoder.set_bitrate(k) {
+            tracing::info!("bitrate -> {k} kbps");
+        }
+    }
+
     pub fn request_keyframe(&mut self) {
         self.keyframe_pending = true;
     }
@@ -654,6 +663,7 @@ impl Pipeline {
             transfer_ms_p50: median(&mut xfer),
             fps: (s.frames as f32 / secs).round() as u32,
             bitrate_kbps: (s.bytes as f32 * 8.0 / 1000.0 / secs) as u32,
+            target_kbps: self.encoder.config().bitrate_kbps,
         }));
         self.stats.since = Some(Instant::now());
     }

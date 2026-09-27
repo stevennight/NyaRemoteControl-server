@@ -101,6 +101,9 @@ pub fn run(mut commands: mpsc::UnboundedReceiver<HostCommand>, events: mpsc::Sen
                 let _ = clip_tx.send(clipboard::ClipCmd::Enable(true));
                 let _ = video_tx.send(video::VideoCmd::Caps(c));
             }
+            Cmd::SetBitrate(b) => {
+                let _ = video_tx.send(video::VideoCmd::SetBitrate(b.kbps));
+            }
             Cmd::FrameSent(f) => {
                 let _ = video_tx.send(video::VideoCmd::FrameSent(f.frame_id));
             }

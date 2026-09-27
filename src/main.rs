@@ -9,6 +9,7 @@
 
 #![windows_subsystem = "windows"]
 
+mod abr;
 mod auth;
 mod config;
 mod diag;
