@@ -96,6 +96,7 @@ fn main() -> Result<()> {
             let _log = logging::init(&dir, "standalone", true);
             nya_win::dpi::set_per_monitor_aware();
             nya_media::check_runtime_versions()?;
+            nya_media::init_log_level();
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(service::run_standalone(dir, port))
         }

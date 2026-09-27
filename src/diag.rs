@@ -27,6 +27,7 @@ macro_rules! out {
 
 pub fn run(path: Option<PathBuf>) -> Result<()> {
     nya_win::com_init();
+    nya_media::init_log_level();
     let mut r = String::new();
     out!(r, "== NyaRemoteControl 诊断 ==");
     out!(r, "版本 {} / 协议 {}.{}", env!("CARGO_PKG_VERSION"), nya_proto::PROTO_MAJOR, nya_proto::PROTO_MINOR);

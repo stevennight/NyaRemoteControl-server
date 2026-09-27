@@ -57,7 +57,7 @@ log_level = "info"
 
 ## 日志
 
-保存在数据目录下的 `logs\`（`service.*.log`、`helper.*.log`、`standalone.*.log`），保留 7 天。排查问题时请连同 `nya-diag.txt` 一起提供。
+保存在数据目录下的 `logs\`（`service.*.log`、`helper.*.log`、`standalone.*.log`），保留 7 天。FFmpeg 自身的输出默认关闭（探测和降级时的报错是正常现象）；排查编码问题时可设置环境变量 `NYA_FFMPEG_LOG=warning`（或 `verbose`）后再运行。排查问题时请连同 `nya-diag.txt` 一起提供。
 
 ## 编码器选择（多显卡 / 笔记本）
 

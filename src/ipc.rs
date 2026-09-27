@@ -73,6 +73,7 @@ pub async fn run_helper(pipe: &str) -> Result<()> {
     tracing::info!("helper started in session {:?}", crate::winutil::active_console_session());
     let cfg = crate::config::ServerConfig::load_or_create(&crate::paths::service_dir())?;
     nya_media::check_runtime_versions()?;
+    nya_media::init_log_level();
 
     let (mut rd, mut wr) = tokio::io::split(client);
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
