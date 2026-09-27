@@ -1490,6 +1490,7 @@ name = "nya-win"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "sha2",
  "thiserror 2.0.21",
  "tracing",
  "windows",

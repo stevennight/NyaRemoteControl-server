@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
@@ -23,7 +23,7 @@ use winit::window::{Window, WindowId};
 use crate::auth::{load_or_create_key, AuthStore, PairedClient};
 use crate::config::ServerConfig;
 use crate::service::SERVICE_NAME;
-use crate::{install, paths, winutil};
+use crate::{components, install, paths, winutil};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -35,8 +35,9 @@ enum Tab {
     Logs,
 }
 
-/// An optional third-party component: never installed automatically.
+/// An optional third-party component: installed only when the user asks.
 struct Component {
+    id: components::Id,
     name: &'static str,
     purpose: &'static str,
     status: Option<String>,
@@ -56,21 +57,25 @@ fn service_exists(name: &str) -> bool {
 fn detect_components() -> Vec<Component> {
     nya_win::com_init();
     let cable = crate::host::mic_cable_name();
-    let vdd = nya_win::topology::Topology::enumerate()
+    let vdd_active = nya_win::topology::Topology::enumerate()
         .ok()
         .and_then(|t| t.adapters.iter().find(|a| a.name.to_lowercase().contains("virtual display")).map(|a| a.name.clone()));
+    let vdd_installed = vdd_active.is_some() || nya_win::devnode::exists(components::VDD_HWID);
+    let vdd = vdd_active.or_else(|| vdd_installed.then(|| "已安装（未启用）".to_owned()));
     let usbip = crate::usb::usbip_exe().map(|p| p.display().to_string());
     vec![
         Component {
+            id: components::Id::Cable,
             name: "VB-Cable 虚拟声卡",
             purpose: "接收客户端麦克风：客户端工具条打开“麦克风”，被控端软件选择“CABLE Output”作为麦克风",
             installed: cable.is_some(),
             status: cable,
             ready: true,
             url: "https://vb-audio.com/Cable/",
-            note: "免费，安装后需要重启一次",
+            note: "捐赠软件（安装即表示同意 VB-Audio 许可），需联网从官网下载；安装后需要重启一次",
         },
         Component {
+            id: components::Id::Usbip,
             name: "usbip-win2",
             purpose: "USB 设备透传（U 盾、加密狗等）：被控端虚拟 USB 控制器",
             installed: usbip.is_some(),
@@ -80,6 +85,7 @@ fn detect_components() -> Vec<Component> {
             note: "开发中；客户端另需 usbipd-win",
         },
         Component {
+            id: components::Id::Vigem,
             name: "ViGEmBus",
             purpose: "手柄：把客户端的手柄模拟成被控端的 Xbox 手柄",
             installed: service_exists("ViGEmBus"),
@@ -89,9 +95,10 @@ fn detect_components() -> Vec<Component> {
             note: "免费；作者已停止维护，但仍可用。客户端插上 Xbox/XInput 手柄即自动使用",
         },
         Component {
+            id: components::Id::Vdd,
             name: "Virtual Display Driver",
             purpose: "虚拟显示器：不接显示器也能用，分辨率 / 刷新率可自定义",
-            installed: vdd.is_some(),
+            installed: vdd_installed,
             status: vdd,
             ready: false,
             url: "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases",
@@ -138,6 +145,7 @@ struct Model {
     log_name: &'static str,
     components: Option<Vec<Component>>,
     components_rx: Option<mpsc::Receiver<Vec<Component>>>,
+    install_job: Option<Arc<Mutex<InstallJob>>>,
     confirm_reset: bool,
     confirm_uninstall: bool,
 }
@@ -207,6 +215,7 @@ impl Model {
             log_name: "service",
             components: None,
             components_rx: None,
+            install_job: None,
             confirm_reset: false,
             confirm_uninstall: false,
         };
@@ -337,7 +346,7 @@ impl Model {
                 });
             });
 
-        if self.busy.is_some() {
+        if self.busy.is_some() || self.install_job.as_ref().is_some_and(|j| !j.lock().unwrap().done) {
             ctx.request_repaint_after(Duration::from_millis(200));
         } else {
             ctx.request_repaint_after(Duration::from_secs(2));
@@ -598,20 +607,62 @@ impl Model {
             });
             self.components_rx = Some(rx);
         }
-        ui.label(RichText::new("以下组件都是可选的，不装不影响其他功能。安装由你决定：点“官网下载”手动安装后，回到这里点“重新检测”。").weak());
-        ui.horizontal(|ui| {
-            if ui.button("重新检测").clicked() {
+        ui.label(RichText::new("以下组件都是可选的，不装不影响其他功能，装不装由你决定。“一键安装”会自动下载固定版本并校验 SHA-256 后静默安装（程序目录下 drivers 文件夹里有离线安装包时优先使用）。").weak());
+        let running = self.install_job.as_ref().is_some_and(|j| !j.lock().unwrap().done);
+        if let Some(job) = &self.install_job {
+            let mut j = job.lock().unwrap();
+            if j.done && !j.redetected {
+                j.redetected = true;
                 self.components = None;
+            }
+        }
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!running, egui::Button::new("重新检测")).clicked() {
+                self.components = None;
+            }
+            let missing: Vec<(components::Id, &'static str)> = self
+                .components
+                .iter()
+                .flatten()
+                .filter(|c| !c.installed)
+                .map(|c| (c.id, c.name))
+                .collect();
+            if !missing.is_empty()
+                && ui
+                    .add_enabled(!running, egui::Button::new("全部一键安装"))
+                    .on_hover_text(missing.iter().map(|m| m.1).collect::<Vec<_>>().join("、"))
+                    .clicked()
+            {
+                self.install_job = Some(start_install(missing));
             }
             if ui.button("打开声音设置").on_hover_text("把 CABLE Output 设为默认麦克风").clicked() {
                 let _ = std::process::Command::new("explorer").arg("ms-settings:sound").spawn();
             }
         });
+        if let Some(job) = &self.install_job {
+            let j = job.lock().unwrap();
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                for (err, line) in &j.log {
+                    let col = if *err { Color32::from_rgb(255, 120, 110) } else { Color32::LIGHT_GREEN };
+                    ui.label(RichText::new(line).color(col));
+                }
+                if let Some(cur) = j.current {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(format!("{cur}：{}", j.status));
+                    });
+                } else if j.done && j.reboot {
+                    ui.label(RichText::new("部分组件需要重启电脑后才能生效。").color(Color32::YELLOW));
+                }
+            });
+        }
         ui.add_space(8.0);
         let Some(list) = &self.components else {
             ui.spinner();
             return;
         };
+        let mut install = None;
         for c in list {
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -623,8 +674,11 @@ impl Model {
                         ui.label(RichText::new("（配套功能开发中）").weak());
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("官网下载").clicked() {
+                        if ui.button("官网").clicked() {
                             let _ = std::process::Command::new("explorer").arg(c.url).spawn();
+                        }
+                        if !c.installed && ui.add_enabled(!running, egui::Button::new("一键安装")).clicked() {
+                            install = Some((c.id, c.name));
                         }
                     });
                 });
@@ -634,6 +688,9 @@ impl Model {
                 }
                 ui.label(RichText::new(c.note).weak().small());
             });
+        }
+        if let Some(one) = install {
+            self.install_job = Some(start_install(vec![one]));
         }
     }
 
@@ -782,4 +839,51 @@ pub fn run() -> Result<()> {
     let mut app = App { model: Model::new(), window: None, surface: None, gui: None };
     el.run_app(&mut app)?;
     Ok(())
+}
+
+#[derive(Default)]
+struct InstallJob {
+    current: Option<&'static str>,
+    status: String,
+    /// (is error, message)
+    log: Vec<(bool, String)>,
+    reboot: bool,
+    done: bool,
+    redetected: bool,
+}
+
+/// Install components one after another on a worker thread.
+fn start_install(list: Vec<(components::Id, &'static str)>) -> Arc<Mutex<InstallJob>> {
+    let job = Arc::new(Mutex::new(InstallJob::default()));
+    let j = job.clone();
+    std::thread::spawn(move || {
+        for (id, name) in list {
+            {
+                let mut g = j.lock().unwrap();
+                g.current = Some(name);
+                g.status.clear();
+            }
+            let r = components::install(id, &mut |s| j.lock().unwrap().status = s);
+            let mut g = j.lock().unwrap();
+            match r {
+                Ok(i) => {
+                    g.reboot |= i.reboot;
+                    let mut line = format!("{name} 安装完成");
+                    if i.reboot {
+                        line.push_str("（需要重启）");
+                    }
+                    if !i.note.is_empty() {
+                        line.push_str("。");
+                        line.push_str(&i.note);
+                    }
+                    g.log.push((false, line));
+                }
+                Err(e) => g.log.push((true, format!("{name} 安装失败：{e:#}"))),
+            }
+        }
+        let mut g = j.lock().unwrap();
+        g.current = None;
+        g.done = true;
+    });
+    job
 }

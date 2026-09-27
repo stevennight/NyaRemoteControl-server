@@ -11,6 +11,7 @@
 
 mod abr;
 mod auth;
+mod components;
 mod config;
 mod diag;
 mod gui;
