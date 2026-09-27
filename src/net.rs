@@ -210,7 +210,14 @@ async fn run_session(
     // Video / cursor writer tasks.
     let (video_tx, video_rx) = mpsc::channel::<crate::ipc_pb::VideoFrame>(4);
     let (cursor_tx, cursor_rx) = mpsc::channel::<pb::CursorMsg>(256);
-    let video_task = tokio::spawn(video_writer(conn.clone(), video_rx, hub.clone()));
+    let video_task = tokio::spawn({
+        let (conn, hub) = (conn.clone(), hub.clone());
+        async move {
+            if let Err(e) = video_writer(conn, video_rx, hub).await {
+                tracing::warn!("video writer: {e:#}");
+            }
+        }
+    });
     let cursor_task = tokio::spawn(cursor_writer(conn.clone(), cursor_rx));
     let input_task = tokio::spawn(input_reader(conn.clone(), hub.clone()));
 
@@ -329,8 +336,10 @@ async fn run_session(
 /// frame to the host once quinn accepted it (flow control, §6.2).
 async fn video_writer(conn: Connection, mut rx: mpsc::Receiver<crate::ipc_pb::VideoFrame>, hub: Arc<Hub>) -> Result<()> {
     let mut current: Option<(u64, SendStream)> = None;
+    let (mut frames, mut bytes, mut since) = (0u64, 0u64, std::time::Instant::now());
     while let Some(f) = rx.recv().await {
         if current.as_ref().map(|c| c.0) != Some(f.stream_id) {
+            tracing::info!("opening video stream {} to client (first frame {} bytes)", f.stream_id, f.data.len());
             if let Some((_, mut old)) = current.take() {
                 let _ = old.finish();
             }
@@ -348,6 +357,12 @@ async fn video_writer(conn: Connection, mut rx: mpsc::Receiver<crate::ipc_pb::Vi
         s.write_all(&f.header).await?;
         s.write_all(&f.data).await?;
         hub.send(Cmd::FrameSent(FrameSent { frame_id: f.frame_id }));
+        frames += 1;
+        bytes += len as u64;
+        if since.elapsed() >= Duration::from_secs(5) {
+            tracing::info!("video sent (5 s): {frames} frames, {} KB", bytes / 1024);
+            (frames, bytes, since) = (0, 0, std::time::Instant::now());
+        }
     }
     Ok(())
 }
