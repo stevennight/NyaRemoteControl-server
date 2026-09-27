@@ -27,7 +27,19 @@ pub fn thread(rx: Receiver<InputCmd>) {
     let mut inj = Injector::new();
     let mut desktop = DesktopTracker::new();
     let mut last_sync = Instant::now() - Duration::from_secs(1);
+    let (mut events, mut since) = (0u64, Instant::now());
     for cmd in rx {
+        if matches!(cmd, InputCmd::Event(_)) {
+            events += 1;
+        }
+        if events > 0 && since.elapsed() >= Duration::from_secs(5) {
+            tracing::info!(
+                "input (5 s): {events} events, desktop {}, SendInput failures so far {}",
+                desktop.name(),
+                nya_win::input::send_failures()
+            );
+            (events, since) = (0, Instant::now());
+        }
         // Follow the input desktop so injection reaches the lock screen / UAC prompt.
         if last_sync.elapsed() > Duration::from_millis(100) {
             if let Err(e) = desktop.sync() {
