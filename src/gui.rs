@@ -1,0 +1,660 @@
+//! Host management GUI (double-click nya-server.exe): service control,
+//! pairing code, paired clients, settings, diagnostics and logs.
+
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::{anyhow, Result};
+use nya_transport::Identity;
+use nya_ui::egui::{self, Color32, RichText};
+use nya_ui::{Gui, Surface};
+use nya_win::d3d::D3dDevice;
+use windows_service::service::{ServiceAccess, ServiceState};
+use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+use winit::application::ApplicationHandler;
+use winit::dpi::LogicalSize;
+use winit::event::WindowEvent;
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use winit::window::{Window, WindowId};
+
+use crate::auth::{load_or_create_key, AuthStore, PairedClient};
+use crate::config::ServerConfig;
+use crate::service::SERVICE_NAME;
+use crate::{install, paths, winutil};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Overview,
+    Settings,
+    Clients,
+    Diagnostics,
+    Logs,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SvcState {
+    NotInstalled,
+    Stopped,
+    Running,
+    Pending,
+    Unknown,
+}
+
+/// Work done off the UI thread.
+enum Job {
+    Install,
+    Uninstall,
+    Start,
+    Stop,
+    Restart,
+    Diag,
+}
+
+struct Model {
+    elevated: bool,
+    dir: PathBuf,
+    tab: Tab,
+    svc: SvcState,
+    svc_checked: Instant,
+    code: String,
+    fingerprint: String,
+    cfg: ServerConfig,
+    cfg_dirty: bool,
+    clients: Vec<PairedClient>,
+    message: Option<(bool, String)>,
+    busy: Option<&'static str>,
+    job_rx: Option<mpsc::Receiver<Result<String, String>>>,
+    diag_text: String,
+    log_text: String,
+    log_name: &'static str,
+    confirm_reset: bool,
+    confirm_uninstall: bool,
+}
+
+fn service_state() -> SvcState {
+    let Ok(m) = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT) else { return SvcState::Unknown };
+    match m.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
+        Err(_) => SvcState::NotInstalled,
+        Ok(s) => match s.query_status().map(|x| x.current_state) {
+            Ok(ServiceState::Running) => SvcState::Running,
+            Ok(ServiceState::Stopped) => SvcState::Stopped,
+            Ok(_) => SvcState::Pending,
+            Err(_) => SvcState::Unknown,
+        },
+    }
+}
+
+fn control_service(start: bool, stop: bool) -> Result<String> {
+    let m = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+    let s = m.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS | ServiceAccess::START | ServiceAccess::STOP)?;
+    if stop {
+        install::stop_and_wait(&s);
+    }
+    if start {
+        s.start(&[] as &[&std::ffi::OsStr])?;
+    }
+    Ok(match (start, stop) {
+        (true, true) => "服务已重启".into(),
+        (true, false) => "服务已启动".into(),
+        _ => "服务已停止".into(),
+    })
+}
+
+/// Last `n` lines of the newest `<prefix>.*.log`.
+fn tail_log(dir: &Path, prefix: &str, n: usize) -> String {
+    let newest = std::fs::read_dir(dir.join("logs")).ok().and_then(|rd| {
+        rd.flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(&format!("{prefix}.")))
+            .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
+    });
+    let Some(entry) = newest else { return format!("没有 {prefix} 日志") };
+    let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
+    let lines: Vec<&str> = text.lines().collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+impl Model {
+    fn new() -> Self {
+        let elevated = winutil::is_elevated();
+        let dir = paths::service_dir();
+        let mut m = Self {
+            elevated,
+            dir,
+            tab: Tab::Overview,
+            svc: SvcState::Unknown,
+            svc_checked: Instant::now() - Duration::from_secs(10),
+            code: String::new(),
+            fingerprint: String::new(),
+            cfg: ServerConfig::default(),
+            cfg_dirty: false,
+            clients: Vec::new(),
+            message: None,
+            busy: None,
+            job_rx: None,
+            diag_text: String::new(),
+            log_text: String::new(),
+            log_name: "service",
+            confirm_reset: false,
+            confirm_uninstall: false,
+        };
+        m.reload();
+        m
+    }
+
+    /// Re-read pairing data, config and clients from the service directory.
+    fn reload(&mut self) {
+        if !self.elevated {
+            return;
+        }
+        let _ = std::fs::create_dir_all(&self.dir);
+        match load_or_create_key(&self.dir, false) {
+            Ok(k) => self.code = k.to_code(),
+            Err(e) => self.message = Some((true, format!("读取配对码失败：{e:#}"))),
+        }
+        if let Ok(id) = Identity::load_or_create(&self.dir) {
+            self.fingerprint = id.fingerprint().to_string();
+        }
+        if let Ok(c) = ServerConfig::load_or_create(&self.dir) {
+            self.cfg = c;
+            self.cfg_dirty = false;
+        }
+        self.clients = AuthStore::list(&self.dir);
+        self.log_text = tail_log(&self.dir, self.log_name, 200);
+    }
+
+    fn run_job(&mut self, job: Job, label: &'static str) {
+        let (tx, rx) = mpsc::channel();
+        self.busy = Some(label);
+        self.job_rx = Some(rx);
+        std::thread::spawn(move || {
+            let r = match job {
+                Job::Install => install::install(None),
+                Job::Uninstall => install::uninstall(false),
+                Job::Start => control_service(true, false),
+                Job::Stop => control_service(false, true),
+                Job::Restart => control_service(true, true),
+                Job::Diag => Ok(crate::diag::collect()),
+            };
+            let _ = tx.send(r.map_err(|e| format!("{e:#}")));
+        });
+    }
+
+    fn poll_job(&mut self) {
+        let Some(rx) = &self.job_rx else { return };
+        if let Ok(r) = rx.try_recv() {
+            let was_diag = self.busy == Some("诊断");
+            self.job_rx = None;
+            self.busy = None;
+            match r {
+                Ok(text) if was_diag => self.diag_text = text,
+                Ok(text) => self.message = Some((false, text)),
+                Err(e) => self.message = Some((true, e)),
+            }
+            self.svc_checked = Instant::now() - Duration::from_secs(10);
+            self.reload();
+        }
+    }
+
+    fn ui(&mut self, ctx: &egui::Context) {
+        self.poll_job();
+        if self.svc_checked.elapsed() > Duration::from_secs(2) {
+            self.svc = service_state();
+            self.svc_checked = Instant::now();
+        }
+
+        egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.heading("NyaRemoteControl 被控端");
+                ui.add_space(16.0);
+                for (t, name) in [
+                    (Tab::Overview, "概览"),
+                    (Tab::Settings, "设置"),
+                    (Tab::Clients, "已配对客户端"),
+                    (Tab::Diagnostics, "诊断"),
+                    (Tab::Logs, "日志"),
+                ] {
+                    ui.selectable_value(&mut self.tab, t, name);
+                }
+            });
+            ui.add_space(4.0);
+        });
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::central_panel(&ctx.style()).inner_margin(20.0))
+            .show(ctx, |ui| {
+                if !self.elevated {
+                    ui.label(RichText::new("需要管理员权限才能管理服务、查看配对码。").color(Color32::from_rgb(255, 180, 90)));
+                    if ui.button("以管理员身份重新打开").clicked() {
+                        match relaunch_elevated() {
+                            Ok(()) => std::process::exit(0),
+                            Err(e) => self.message = Some((true, format!("{e:#}"))),
+                        }
+                    }
+                    ui.add_space(12.0);
+                }
+                if let Some((err, text)) = &self.message {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            let color = if *err { Color32::from_rgb(255, 120, 110) } else { Color32::LIGHT_GREEN };
+                            ui.label(RichText::new(text).color(color));
+                        });
+                    });
+                    if ui.small_button("关闭提示").clicked() {
+                        self.message = None;
+                    }
+                    ui.add_space(8.0);
+                }
+                if let Some(b) = self.busy {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(format!("{b}…"));
+                    });
+                    ui.add_space(8.0);
+                }
+                ui.add_enabled_ui(self.elevated && self.busy.is_none(), |ui| match self.tab {
+                    Tab::Overview => self.overview(ui),
+                    Tab::Settings => self.settings(ui),
+                    Tab::Clients => self.clients_tab(ui),
+                    Tab::Diagnostics => self.diagnostics(ui),
+                    Tab::Logs => self.logs(ui),
+                });
+            });
+
+        if self.busy.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(200));
+        } else {
+            ctx.request_repaint_after(Duration::from_secs(2));
+        }
+    }
+
+    fn overview(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("服务").strong());
+        ui.horizontal(|ui| {
+            let (text, color) = match self.svc {
+                SvcState::Running => ("运行中", Color32::LIGHT_GREEN),
+                SvcState::Stopped => ("已停止", Color32::from_rgb(255, 180, 90)),
+                SvcState::Pending => ("正在切换…", Color32::LIGHT_BLUE),
+                SvcState::NotInstalled => ("未安装", Color32::GRAY),
+                SvcState::Unknown => ("未知", Color32::GRAY),
+            };
+            ui.label(RichText::new(text).color(color).strong());
+            ui.add_space(12.0);
+            match self.svc {
+                SvcState::NotInstalled => {
+                    if ui.button(RichText::new("安装服务").strong()).clicked() {
+                        self.run_job(Job::Install, "正在安装服务");
+                    }
+                }
+                SvcState::Stopped => {
+                    if ui.button("启动").clicked() {
+                        self.run_job(Job::Start, "正在启动服务");
+                    }
+                    if ui.button("卸载").clicked() {
+                        self.confirm_uninstall = true;
+                    }
+                }
+                SvcState::Running => {
+                    if ui.button("重启").clicked() {
+                        self.run_job(Job::Restart, "正在重启服务");
+                    }
+                    if ui.button("停止").clicked() {
+                        self.run_job(Job::Stop, "正在停止服务");
+                    }
+                    if ui.button("卸载").clicked() {
+                        self.confirm_uninstall = true;
+                    }
+                }
+                _ => {}
+            }
+        });
+        if self.confirm_uninstall {
+            ui.horizontal(|ui| {
+                ui.label("确定卸载服务？（证书和配对信息会保留）");
+                if ui.button("卸载").clicked() {
+                    self.confirm_uninstall = false;
+                    self.run_job(Job::Uninstall, "正在卸载服务");
+                }
+                if ui.button("取消").clicked() {
+                    self.confirm_uninstall = false;
+                }
+            });
+        }
+        ui.label(
+            RichText::new(format!("端口 UDP {}  ·  程序 {}", self.cfg.port, std::env::current_exe().unwrap_or_default().display()))
+                .weak(),
+        );
+
+        ui.add_space(16.0);
+        ui.label(RichText::new("配对码").strong());
+        ui.label(RichText::new("客户端第一次连接时输入。已配对的客户端之后不再需要。").weak());
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(&self.code).monospace().size(22.0).strong());
+            if ui.button("复制").clicked() {
+                ui.ctx().copy_text(self.code.clone());
+            }
+            if ui.button("重新生成").clicked() {
+                self.confirm_reset = true;
+            }
+        });
+        if self.confirm_reset {
+            ui.horizontal(|ui| {
+                ui.label("旧配对码将失效（已配对的客户端不受影响）。继续？");
+                if ui.button("重新生成").clicked() {
+                    self.confirm_reset = false;
+                    match load_or_create_key(&self.dir, true) {
+                        Ok(k) => {
+                            self.code = k.to_code();
+                            self.message = Some((false, "已生成新配对码；重启服务后生效".into()));
+                        }
+                        Err(e) => self.message = Some((true, format!("{e:#}"))),
+                    }
+                }
+                if ui.button("取消").clicked() {
+                    self.confirm_reset = false;
+                }
+            });
+        }
+
+        ui.add_space(16.0);
+        ui.label(RichText::new("证书指纹").strong());
+        ui.label(RichText::new(&self.fingerprint).monospace());
+        ui.label(RichText::new("客户端提示“证书已变化”时，用这里核对。").weak());
+
+        ui.add_space(16.0);
+        ui.label(RichText::new("最近的连接").strong());
+        let recent: Vec<String> = tail_log(&self.dir, "service", 400)
+            .lines()
+            .filter(|l| l.contains("client ") || l.contains("paired") || l.contains("session ended") || l.contains("bye"))
+            .map(|l| l.chars().take(160).collect())
+            .collect();
+        egui::ScrollArea::vertical().max_height(160.0).id_salt("recent").show(ui, |ui| {
+            if recent.is_empty() {
+                ui.label(RichText::new("暂无").weak());
+            }
+            for l in recent.iter().rev().take(12) {
+                ui.label(RichText::new(l).monospace().small());
+            }
+        });
+    }
+
+    fn settings(&mut self, ui: &mut egui::Ui) {
+        let before = format!("{:?}", self.cfg);
+        let c = &mut self.cfg;
+        egui::Grid::new("server-settings").num_columns(2).spacing([16.0, 10.0]).show(ui, |ui| {
+            ui.label("端口（UDP）");
+            ui.add(egui::DragValue::new(&mut c.port).range(1024..=65535));
+            ui.end_row();
+
+            ui.label("监听地址");
+            ui.vertical(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut c.bind).desired_width(220.0));
+                ui.label(RichText::new(":: 表示所有网卡；填组网 IP（如 100.x.y.z）则只接受该网卡").weak().small());
+            });
+            ui.end_row();
+
+            ui.label("显示名称");
+            ui.add(egui::TextEdit::singleline(&mut c.name).hint_text("留空 = 计算机名").desired_width(220.0));
+            ui.end_row();
+
+            ui.label("编码器");
+            egui::ComboBox::from_id_salt("enc").selected_text(c.encoder.clone()).show_ui(ui, |ui| {
+                for e in ["auto", "nvenc", "qsv", "amf", "software"] {
+                    ui.selectable_value(&mut c.encoder, e.to_string(), e);
+                }
+            });
+            ui.end_row();
+
+            ui.label("办公模式码率");
+            kbps(ui, &mut c.office_bitrate_kbps);
+            ui.end_row();
+
+            ui.label("游戏模式码率");
+            kbps(ui, &mut c.game_bitrate_kbps);
+            ui.end_row();
+
+            ui.label("最高帧率");
+            ui.add(egui::Slider::new(&mut c.max_fps, 30..=240).suffix(" fps"));
+            ui.end_row();
+
+            ui.label("声音");
+            ui.checkbox(&mut c.audio, "传输系统声音");
+            ui.end_row();
+
+            ui.label("日志级别");
+            egui::ComboBox::from_id_salt("log").selected_text(c.log_level.clone()).show_ui(ui, |ui| {
+                for l in ["error", "warn", "info", "debug"] {
+                    ui.selectable_value(&mut c.log_level, l.to_string(), l);
+                }
+            });
+            ui.end_row();
+        });
+        if before != format!("{:?}", self.cfg) {
+            self.cfg_dirty = true;
+        }
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            if ui.add_enabled(self.cfg_dirty, egui::Button::new("保存")).clicked() {
+                match toml::to_string_pretty(&self.cfg).map_err(|e| anyhow!(e)).and_then(|t| {
+                    std::fs::write(self.dir.join("server.toml"), t)?;
+                    Ok(())
+                }) {
+                    Ok(()) => {
+                        self.cfg_dirty = false;
+                        self.message = Some((false, "已保存。重启服务后生效（端口变更需要重新安装以更新防火墙规则）".into()));
+                    }
+                    Err(e) => self.message = Some((true, format!("保存失败：{e:#}"))),
+                }
+            }
+            if self.svc == SvcState::Running && ui.button("重启服务").clicked() {
+                self.run_job(Job::Restart, "正在重启服务");
+            }
+            if ui.button("放弃修改").clicked() {
+                self.reload();
+            }
+        });
+    }
+
+    fn clients_tab(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("已配对的客户端可以免配对码直接连接。移除后需要重新配对。").weak());
+        ui.add_space(8.0);
+        if self.clients.is_empty() {
+            ui.label(RichText::new("没有已配对的客户端").weak());
+        }
+        let mut remove = None;
+        egui::Grid::new("clients").num_columns(4).striped(true).spacing([20.0, 8.0]).show(ui, |ui| {
+            for (i, c) in self.clients.iter().enumerate() {
+                ui.label(RichText::new(&c.name).strong());
+                ui.label(RichText::new(&c.fingerprint[..16.min(c.fingerprint.len())]).monospace());
+                ui.label(RichText::new(&c.paired_at).weak());
+                if ui.button("移除").clicked() {
+                    remove = Some(i);
+                }
+                ui.end_row();
+            }
+        });
+        if let Some(i) = remove {
+            let mut list = self.clients.clone();
+            let c = list.remove(i);
+            match AuthStore::save_list(&self.dir, list) {
+                Ok(()) => self.message = Some((false, format!("已移除 {}", c.name))),
+                Err(e) => self.message = Some((true, format!("{e:#}"))),
+            }
+            self.clients = AuthStore::list(&self.dir);
+        }
+    }
+
+    fn diagnostics(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui.button("运行诊断").clicked() {
+                self.run_job(Job::Diag, "诊断");
+            }
+            if !self.diag_text.is_empty() {
+                if ui.button("复制结果").clicked() {
+                    ui.ctx().copy_text(self.diag_text.clone());
+                }
+                if ui.button("保存到日志目录").clicked() {
+                    let p = self.dir.join("logs").join("nya-diag.txt");
+                    match std::fs::write(&p, &self.diag_text) {
+                        Ok(()) => self.message = Some((false, format!("已保存 {}", p.display()))),
+                        Err(e) => self.message = Some((true, format!("{e}"))),
+                    }
+                }
+            }
+        });
+        ui.label(RichText::new("检测显卡、显示器、编码器、截屏、跨显卡传输和音频，大约需要 10 秒。").weak());
+        egui::ScrollArea::both().id_salt("diag").show(ui, |ui| {
+            ui.label(RichText::new(&self.diag_text).monospace().small());
+        });
+    }
+
+    fn logs(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            for (name, label) in [("service", "服务"), ("helper", "采集进程"), ("standalone", "开发模式")] {
+                if ui.selectable_label(self.log_name == name, label).clicked() {
+                    self.log_name = name;
+                    self.log_text = tail_log(&self.dir, name, 200);
+                }
+            }
+            if ui.button("刷新").clicked() {
+                self.log_text = tail_log(&self.dir, self.log_name, 200);
+            }
+            if ui.button("打开日志目录").clicked() {
+                let _ = std::process::Command::new("explorer").arg(self.dir.join("logs")).spawn();
+            }
+        });
+        egui::ScrollArea::both().id_salt("logs").stick_to_bottom(true).show(ui, |ui| {
+            ui.label(RichText::new(&self.log_text).monospace().small());
+        });
+    }
+}
+
+fn kbps(ui: &mut egui::Ui, v: &mut u32) {
+    ui.horizontal(|ui| {
+        let mut auto = *v == 0;
+        if ui.checkbox(&mut auto, "自动").changed() {
+            *v = if auto { 0 } else { 10_000 };
+        }
+        if !auto {
+            ui.add(egui::Slider::new(v, 1_000..=80_000).suffix(" kbps").logarithmic(true));
+        }
+    });
+}
+
+fn relaunch_elevated() -> Result<()> {
+    use windows::core::{w, HSTRING};
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let exe = std::env::current_exe()?;
+    let r = unsafe { ShellExecuteW(None, w!("runas"), &HSTRING::from(exe.as_os_str()), None, None, SW_SHOWNORMAL) };
+    if r.0 as isize <= 32 {
+        return Err(anyhow!("未获得管理员权限"));
+    }
+    Ok(())
+}
+
+struct App {
+    model: Model,
+    window: Option<Arc<Window>>,
+    surface: Option<Surface>,
+    gui: Option<Gui>,
+}
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, el: &ActiveEventLoop) {
+        if self.window.is_some() {
+            return;
+        }
+        let attrs = Window::default_attributes()
+            .with_title("NyaRemoteControl 被控端")
+            .with_inner_size(LogicalSize::new(900.0, 680.0));
+        let window = match el.create_window(attrs) {
+            Ok(w) => Arc::new(w),
+            Err(e) => {
+                crate::fatal(&format!("无法创建窗口：{e}"));
+                el.exit();
+                return;
+            }
+        };
+        let setup = (|| -> Result<(Surface, Gui)> {
+            let dev = D3dDevice::default_adapter()?;
+            let hwnd = match window.window_handle()?.as_raw() {
+                RawWindowHandle::Win32(h) => windows::Win32::Foundation::HWND(h.hwnd.get() as *mut _),
+                _ => return Err(anyhow!("no HWND")),
+            };
+            let size = window.inner_size();
+            Ok((Surface::new(&dev, hwnd, size.width, size.height)?, Gui::new(&window, &dev)?))
+        })();
+        match setup {
+            Ok((s, g)) => {
+                self.surface = Some(s);
+                self.gui = Some(g);
+            }
+            Err(e) => {
+                crate::fatal(&format!("无法初始化界面：{e:#}"));
+                el.exit();
+                return;
+            }
+        }
+        self.window = Some(window.clone());
+        window.request_redraw();
+    }
+
+    fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        let (Some(window), Some(gui)) = (self.window.clone(), self.gui.as_mut()) else { return };
+        if gui.on_event(&window, &event).repaint {
+            window.request_redraw();
+        }
+        match event {
+            WindowEvent::CloseRequested => el.exit(),
+            WindowEvent::Resized(size) => {
+                if let Some(s) = self.surface.as_mut() {
+                    let _ = s.resize(size.width, size.height);
+                }
+                window.request_redraw();
+            }
+            WindowEvent::RedrawRequested => {
+                let model = &mut self.model;
+                let frame = gui.run(&window, |ctx| model.ui(ctx));
+                if let Some(s) = self.surface.as_mut() {
+                    let r = s.begin([0.0, 0.0, 0.0, 1.0]).and_then(|rtv| {
+                        gui.paint(&rtv, (s.width, s.height), &frame)?;
+                        s.present()
+                    });
+                    if let Err(e) = r {
+                        tracing::warn!("gui render: {e:#}");
+                    }
+                }
+                let next = Instant::now() + frame.repaint_after.min(Duration::from_secs(2));
+                el.set_control_flow(ControlFlow::WaitUntil(next));
+            }
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        if let ControlFlow::WaitUntil(t) = el.control_flow() {
+            if Instant::now() >= t {
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+        }
+    }
+}
+
+pub fn run() -> Result<()> {
+    // Managing the service needs admin rights: ask for them up front.
+    if !winutil::is_elevated() && relaunch_elevated().is_ok() {
+        return Ok(());
+    }
+    let _log = crate::logging::init(&paths::service_dir(), "gui", false);
+    let el = EventLoop::new()?;
+    let mut app = App { model: Model::new(), window: None, surface: None, gui: None };
+    el.run_app(&mut app)?;
+    Ok(())
+}

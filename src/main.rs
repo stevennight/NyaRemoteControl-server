@@ -5,10 +5,14 @@
 //! * `helper`     – runs in the active console session with a SYSTEM token: capture, encode, input
 //! * `standalone` – single user-mode process for development (no lock screen / UAC support)
 //! * `install` / `uninstall` / `pair` / `clients` / `diag` – administration
+//! * no arguments – management GUI
+
+#![windows_subsystem = "windows"]
 
 mod auth;
 mod config;
 mod diag;
+mod gui;
 mod host;
 mod hub;
 mod install;
@@ -30,7 +34,7 @@ use clap::{Parser, Subcommand};
 #[command(name = "nya-server", version, about = "NyaRemoteControl 被控端")]
 struct Cli {
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -88,9 +92,38 @@ enum Cmd {
     },
 }
 
-fn main() -> Result<()> {
+/// Show an error to a user who may have no console.
+pub fn fatal(msg: &str) {
+    use windows::core::HSTRING;
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+    tracing::error!("{msg}");
+    eprintln!("错误：{msg}");
+    unsafe {
+        MessageBoxW(None, &HSTRING::from(msg), &HSTRING::from("NyaRemoteControl"), MB_OK | MB_ICONERROR);
+    }
+}
+
+fn main() {
+    // GUI subsystem: reuse the terminal we were started from, if any.
+    unsafe {
+        use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
     let cli = Cli::parse();
-    match cli.cmd {
+    let gui = cli.cmd.is_none();
+    if let Err(e) = real_main(cli) {
+        if gui {
+            fatal(&format!("{e:#}"));
+        } else {
+            eprintln!("错误：{e:#}");
+        }
+        std::process::exit(1);
+    }
+}
+
+fn real_main(cli: Cli) -> Result<()> {
+    let Some(cmd) = cli.cmd else { return gui::run() };
+    match cmd {
         Cmd::Standalone { data_dir, port } => {
             let dir = data_dir.unwrap_or_else(paths::standalone_dir);
             let _log = logging::init(&dir, "standalone", true);
@@ -107,8 +140,8 @@ fn main() -> Result<()> {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(ipc::run_helper(&pipe))
         }
-        Cmd::Install { port } => install::install(port),
-        Cmd::Uninstall { purge } => install::uninstall(purge),
+        Cmd::Install { port } => install::install(port).map(|s| println!("{s}")),
+        Cmd::Uninstall { purge } => install::uninstall(purge).map(|s| println!("{s}")),
         Cmd::Pair { reset, data_dir } => install::pair(data_dir, reset),
         Cmd::Clients { remove, data_dir } => install::clients(data_dir, remove),
         Cmd::Diag { out } => {

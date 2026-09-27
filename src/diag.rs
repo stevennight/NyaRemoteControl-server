@@ -21,14 +21,24 @@ macro_rules! out {
     ($s:expr, $($arg:tt)*) => {{
         let line = format!($($arg)*);
         println!("{line}");
-        let _ = writeln!($s, "{line}");
+        let _ = writeln!(*$s, "{line}");
     }};
 }
 
+/// Run all checks and return the report (also echoed to stdout line by line).
+pub fn collect() -> String {
+    let mut r = String::new();
+    body(&mut r);
+    r
+}
+
 pub fn run(path: Option<PathBuf>) -> Result<()> {
+    finish(collect(), path)
+}
+
+fn body(r: &mut String) {
     nya_win::com_init();
     nya_media::init_log_level();
-    let mut r = String::new();
     out!(r, "== NyaRemoteControl 诊断 ==");
     out!(r, "版本 {} / 协议 {}.{}", env!("CARGO_PKG_VERSION"), nya_proto::PROTO_MAJOR, nya_proto::PROTO_MINOR);
     let (c, u) = nya_media::ffmpeg_versions();
@@ -48,7 +58,7 @@ pub fn run(path: Option<PathBuf>) -> Result<()> {
         Ok(t) => t,
         Err(e) => {
             out!(r, "!! 枚举显卡失败：{e:#}");
-            return finish(r, path);
+            return;
         }
     };
     out!(r, "\n-- 显卡 --");
@@ -178,7 +188,6 @@ pub fn run(path: Option<PathBuf>) -> Result<()> {
     let svc = Command("sc", &["query", crate::service::SERVICE_NAME]);
     out!(r, "服务状态：{}", if svc.contains("RUNNING") { "运行中" } else if svc.contains("STOPPED") { "已停止" } else { "未安装" });
 
-    finish(r, path)
 }
 
 #[allow(non_snake_case)]

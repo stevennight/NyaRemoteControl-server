@@ -34,7 +34,7 @@ fn require_admin() -> Result<()> {
     Ok(())
 }
 
-pub fn install(port: Option<u16>) -> Result<()> {
+pub fn install(port: Option<u16>) -> Result<String> {
     require_admin()?;
     let exe = std::env::current_exe()?;
     let dir = paths::service_dir();
@@ -130,17 +130,20 @@ pub fn install(port: Option<u16>) -> Result<()> {
     })?;
     service.start(&[] as &[&std::ffi::OsStr])?;
 
-    println!("已安装并启动服务 {SERVICE_NAME}");
-    println!("  程序：{}", exe.display());
-    println!("  数据：{}", dir.display());
-    println!("  端口：UDP {}（已添加防火墙规则）", cfg.port);
-    println!("  配对码：{}", key.to_code());
-    println!("  证书指纹：{}", identity.fingerprint());
+    let mut out = vec![
+        format!("已安装并启动服务 {SERVICE_NAME}"),
+        format!("  程序：{}", exe.display()),
+        format!("  数据：{}", dir.display()),
+        format!("  端口：UDP {}（已添加防火墙规则）", cfg.port),
+        format!("  配对码：{}", key.to_code()),
+        format!("  证书指纹：{}", identity.fingerprint()),
+    ];
     if migrated {
-        println!("已沿用开发模式的证书、配对码和已配对客户端，客户端无需重新配对。");
+        out.push("已沿用开发模式的证书、配对码和已配对客户端，客户端无需重新配对。".into());
     }
-    println!("注意：服务直接使用上面的程序路径，移动或删除该文件前请先卸载。");
-    Ok(())
+    out.push("注意：服务直接使用上面的程序路径，移动或删除该文件前请先卸载。".into());
+    Ok(out.join("
+"))
 }
 
 /// First install after using standalone mode: reuse its certificate and
@@ -169,7 +172,7 @@ fn migrate_standalone_identity(service_dir: &std::path::Path) -> bool {
     ok
 }
 
-fn stop_and_wait(s: &windows_service::service::Service) {
+pub fn stop_and_wait(s: &windows_service::service::Service) {
     if let Ok(st) = s.query_status() {
         if st.current_state != ServiceState::Stopped {
             let _ = s.stop();
@@ -183,26 +186,28 @@ fn stop_and_wait(s: &windows_service::service::Service) {
     }
 }
 
-pub fn uninstall(purge: bool) -> Result<()> {
+pub fn uninstall(purge: bool) -> Result<String> {
+    let mut out = Vec::new();
     require_admin()?;
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
     match manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE) {
         Ok(s) => {
             stop_and_wait(&s);
             s.delete()?;
-            println!("已删除服务 {SERVICE_NAME}");
+            out.push(format!("已删除服务 {SERVICE_NAME}"));
         }
-        Err(_) => println!("服务未安装"),
+        Err(_) => out.push("服务未安装".into()),
     }
     let _ = run("netsh", &["advfirewall", "firewall", "delete", "rule", &format!("name={SERVICE_NAME}")]);
     if purge {
         let dir = paths::service_dir();
         if dir.exists() {
             std::fs::remove_dir_all(&dir).with_context(|| format!("remove {}", dir.display()))?;
-            println!("已删除数据目录 {}", dir.display());
+            out.push(format!("已删除数据目录 {}", dir.display()));
         }
     }
-    Ok(())
+    Ok(out.join("
+"))
 }
 
 fn pick_dir(data_dir: Option<PathBuf>) -> Result<PathBuf> {
