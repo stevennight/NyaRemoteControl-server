@@ -58,6 +58,7 @@ pub fn install(port: Option<u16>) -> Result<()> {
         cfg.port = p;
         std::fs::write(dir.join("server.toml"), toml::to_string_pretty(&cfg)?)?;
     }
+    let migrated = migrate_standalone_identity(&dir);
     let identity = Identity::load_or_create(&dir)?;
     let key = load_or_create_key(&dir, false)?;
 
@@ -135,8 +136,37 @@ pub fn install(port: Option<u16>) -> Result<()> {
     println!("  端口：UDP {}（已添加防火墙规则）", cfg.port);
     println!("  配对码：{}", key.to_code());
     println!("  证书指纹：{}", identity.fingerprint());
+    if migrated {
+        println!("已沿用开发模式的证书、配对码和已配对客户端，客户端无需重新配对。");
+    }
     println!("注意：服务直接使用上面的程序路径，移动或删除该文件前请先卸载。");
     Ok(())
+}
+
+/// First install after using standalone mode: reuse its certificate and
+/// pairing data so already-paired clients keep working. Returns true if copied.
+fn migrate_standalone_identity(service_dir: &std::path::Path) -> bool {
+    let src = paths::standalone_dir();
+    if service_dir.join("identity.cert.der").exists() || !src.join("identity.cert.der").exists() {
+        return false;
+    }
+    let mut ok = true;
+    for f in ["identity.cert.der", "identity.key.der", "pairing.key", "clients.toml"] {
+        let from = src.join(f);
+        if from.exists() {
+            if let Err(e) = std::fs::copy(&from, service_dir.join(f)) {
+                eprintln!("复制 {} 失败：{e}", from.display());
+                ok = false;
+            }
+        }
+    }
+    if !ok {
+        // Never leave a certificate without its key; start fresh instead.
+        for f in ["identity.cert.der", "identity.key.der"] {
+            let _ = std::fs::remove_file(service_dir.join(f));
+        }
+    }
+    ok
 }
 
 fn stop_and_wait(s: &windows_service::service::Service) {
