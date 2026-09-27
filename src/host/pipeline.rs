@@ -562,6 +562,8 @@ impl Pipeline {
                     transfer_ms = t.elapsed().as_secs_f32() * 1000.0;
                 } else {
                     self.converter.convert(&srv, &tex, surf.index, self.target, w, h)?;
+                    // The encoder runs on another engine: finish our rendering first.
+                    self.capture.flush_wait()?;
                 }
                 drop(tex);
                 self.encoder.encode(surf, key, &mut packets)?;
