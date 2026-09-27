@@ -6,12 +6,17 @@
 mod audio;
 mod clipboard;
 mod cursor;
+mod gamepad;
 mod input;
 mod mic;
 
 /// VB-Cable playback device name, if installed (for the GUI).
 pub fn mic_cable_name() -> Option<String> {
     mic::cable_device_name()
+}
+/// Can virtual gamepads be created (ViGEmBus installed, for the GUI)?
+pub fn gamepad_available() -> bool {
+    gamepad::available()
 }
 mod pipeline;
 pub mod select;
@@ -77,7 +82,10 @@ pub fn run(mut commands: mpsc::UnboundedReceiver<HostCommand>, events: mpsc::Sen
             let (sink, cfg, input_tx) = (sink.clone(), cfg.clone(), input_tx.clone());
             move || video::thread(video_rx, sink, input_tx, cfg)
         }),
-        spawn("nya-input", move || input::thread(input_rx)),
+        spawn("nya-input", {
+            let sink = sink.clone();
+            move || input::thread(input_rx, sink)
+        }),
         spawn("nya-audio", {
             let sink = sink.clone();
             move || audio::thread(audio_rx, sink)
@@ -137,6 +145,7 @@ pub fn run(mut commands: mpsc::UnboundedReceiver<HostCommand>, events: mpsc::Sen
                 let _ = video_tx.send(video::VideoCmd::Stop);
                 let _ = audio_tx.send(false);
                 let _ = input_tx.send(input::InputCmd::ReleaseAll);
+                let _ = input_tx.send(input::InputCmd::UnplugPads);
                 let _ = clip_tx.send(clipboard::ClipCmd::Enable(false));
             }
             Cmd::Shutdown(_) => break,

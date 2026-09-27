@@ -56,6 +56,7 @@ message HostEvent {
     nya.v1.DisplayChanged display_changed = 9;
     ClipboardImage clipboard_image = 10;
     ClipboardFiles clipboard_files = 11;
+    nya.v1.GamepadRumble gamepad_rumble = 12;
   }
 }
 

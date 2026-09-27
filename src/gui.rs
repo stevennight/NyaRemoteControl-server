@@ -83,10 +83,10 @@ fn detect_components() -> Vec<Component> {
             name: "ViGEmBus",
             purpose: "手柄：把客户端的手柄模拟成被控端的 Xbox 手柄",
             installed: service_exists("ViGEmBus"),
-            status: None,
-            ready: false,
+            status: if crate::host::gamepad_available() { Some("驱动可用".into()) } else { None },
+            ready: true,
             url: "https://github.com/nefarius/ViGEmBus/releases",
-            note: "开发中；作者已停止维护，但仍可用",
+            note: "免费；作者已停止维护，但仍可用。客户端插上 Xbox/XInput 手柄即自动使用",
         },
         Component {
             name: "Virtual Display Driver",

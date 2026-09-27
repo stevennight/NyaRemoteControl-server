@@ -9,6 +9,8 @@ pub enum InputCmd {
     Event(pb::InputMsg),
     SetRect(DisplayRect),
     ReleaseAll,
+    /// Client gone: remove its virtual gamepads.
+    UnplugPads,
     Shutdown,
 }
 
@@ -23,8 +25,9 @@ fn button(b: i32) -> Option<Button> {
     })
 }
 
-pub fn thread(rx: Receiver<InputCmd>) {
+pub fn thread(rx: Receiver<InputCmd>, sink: super::Sink) {
     let mut inj = Injector::new();
+    let mut pads = super::gamepad::Pads::new(sink);
     let mut desktop = DesktopTracker::new();
     let mut last_sync = Instant::now() - Duration::from_secs(1);
     let (mut events, mut since) = (0u64, Instant::now());
@@ -59,6 +62,7 @@ pub fn thread(rx: Receiver<InputCmd>) {
                 Ev::Wheel(w) => inj.wheel(w.dx, w.dy),
                 Ev::Key(k) => inj.key(k.scancode as u16, k.extended, k.down),
                 Ev::ReleaseAll(_) => inj.release_all(),
+                Ev::Gamepad(g) => pads.update(&g),
             },
             InputCmd::Event(_) => {}
             InputCmd::SetRect(r) => inj.set_display_rect(r),
@@ -68,6 +72,7 @@ pub fn thread(rx: Receiver<InputCmd>) {
                 }
                 inj.release_all();
             }
+            InputCmd::UnplugPads => pads.remove_all(),
             InputCmd::Shutdown => break,
         }
     }

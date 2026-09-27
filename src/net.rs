@@ -442,6 +442,7 @@ async fn run_session(
                         });
                     }
                     Some(Ev::ClipboardFiles(_)) | Some(Ev::ClipboardImage(_)) => {}
+                    Some(Ev::GamepadRumble(r)) => { let _ = ctl_tx.send(ctl(Msg::GamepadRumble(r))).await; }
                     Some(Ev::Clipboard(c)) => {
                         if clipboard_on {
                             let _ = ctl_tx.send(ctl(Msg::ClipboardText(c))).await;

@@ -1431,6 +1431,7 @@ name = "nya-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cc",
  "clap",
  "crossbeam-channel",
  "nya-media",

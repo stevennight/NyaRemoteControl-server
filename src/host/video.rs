@@ -43,6 +43,7 @@ pub fn session_info(topo: &Topology, probes: &[EncoderProbe], cfg: &HostConfig) 
     pb::SessionInfo {
         mic_device: super::mic::cable_device_name().unwrap_or_default(),
         usb_available: crate::usb::usbip_exe().is_some(),
+        gamepad_available: super::gamepad::available(),
         host_name: cfg.name.clone(),
         displays: display_infos(topo),
         gpus: topo

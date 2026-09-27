@@ -18,4 +18,6 @@ foreach ($dll in 'avcodec-62.dll', 'avutil-60.dll', 'swresample-6.dll') {
     Copy-Item (Join-Path $ffmpeg "bin\$dll") $out
 }
 Copy-Item (Join-Path $repo 'README.md') $out
+$vigem = Join-Path $repo '..\third_party\ViGEmClient\LICENSE'
+if (Test-Path $vigem) { Copy-Item $vigem (Join-Path $out 'LICENSE-ViGEmClient.txt') }
 Write-Host "packaged to $out"
