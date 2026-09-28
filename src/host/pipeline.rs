@@ -16,6 +16,7 @@ use nya_proto::{now_us, pb};
 use nya_win::convert::{Converter, TargetFormat};
 use nya_win::d3d::{tex_desc, D3dDevice};
 use nya_win::desktop::DesktopTracker;
+use nya_win::display_config;
 use nya_win::duplication::{DupError, Duplicator};
 use nya_win::input::DisplayRect;
 use nya_win::topology::{OutputInfo, Topology};
@@ -25,6 +26,7 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11ShaderResourceView, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
     D3D11_TEXTURE2D_DESC,
 };
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT;
 use windows::Win32::Graphics::Dxgi::IDXGIOutput;
 
 use super::cursor::CursorTracker;
@@ -75,6 +77,9 @@ pub struct Pipeline {
     pub frame_id: u64,
     first_frame_id: u64,
     output: IDXGIOutput,
+    output_name: String,
+    /// Re-read the desktop format / HDR white level with the next image.
+    recheck_format: bool,
     native: (u32, u32),
     capture: D3dDevice,
     dup: Option<Duplicator>,
@@ -273,6 +278,7 @@ impl Pipeline {
             cross_gpu: cross,
             source_width: native.0,
             source_height: native.1,
+            hdr_tonemapped: output.hdr,
         };
         tracing::info!(
             "stream {stream_id}: display {} {}x{} -> {w}x{h}@{fps} {} {:?} {} kbps{}",
@@ -293,6 +299,8 @@ impl Pipeline {
             frame_id: first_frame_id,
             first_frame_id,
             output: output.output.clone(),
+            output_name: output.device_name.clone(),
+            recheck_format: true,
             native,
             capture,
             dup: Some(dup),
@@ -364,6 +372,16 @@ impl Pipeline {
         let matches = self.desktop.as_ref().is_some_and(|d| {
             d.desc.Width == desc.Width && d.desc.Height == desc.Height && d.desc.Format == desc.Format
         });
+        if !matches || self.recheck_format {
+            self.recheck_format = false;
+            // FP16 = scRGB image of an HDR desktop: tone-map it to SDR.
+            let hdr = (desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT).then(|| {
+                let nits = display_config::sdr_white_nits(&self.output_name).unwrap_or(80.0);
+                tracing::info!("{}: HDR desktop, SDR white {nits:.0} nits; tone-mapping to SDR", self.output_name);
+                nits
+            });
+            self.converter.set_hdr(hdr);
+        }
         if !matches {
             let tex = self.capture.texture(&tex_desc(desc.Width, desc.Height, desc.Format, D3D11_BIND_SHADER_RESOURCE))?;
             let srv = self.capture.srv(&tex)?;
@@ -446,6 +464,8 @@ impl Pipeline {
                     self.dup = Some(d);
                     self.dup_failures = 0;
                     self.keyframe_pending = true;
+                    // HDR may have been switched on or off, or its SDR brightness changed.
+                    self.recheck_format = true;
                 }
                 Err(DupError::DeviceLost) => return Step::Rebuild("GPU device lost".into()),
                 Err(e) => {

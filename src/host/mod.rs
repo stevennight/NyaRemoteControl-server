@@ -11,6 +11,7 @@ mod input;
 mod mic;
 mod pipeline;
 pub mod select;
+mod vdisplay;
 mod video;
 
 use std::thread;
@@ -61,6 +62,8 @@ impl Sink {
 /// Run the host until `Shutdown` or the command channel closes. Blocking.
 pub fn run(mut commands: mpsc::UnboundedReceiver<HostCommand>, events: mpsc::Sender<HostEvent>, cfg: HostConfig) {
     let sink = Sink(events);
+    // Before anything enumerates displays.
+    vdisplay::cleanup_stale();
 
     let (input_tx, input_rx) = crossbeam_channel::unbounded();
     let (video_tx, video_rx) = crossbeam_channel::unbounded();

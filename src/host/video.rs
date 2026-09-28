@@ -12,6 +12,7 @@ use nya_win::topology::Topology;
 use super::input::InputCmd;
 use super::pipeline::{Pipeline, Step};
 use super::select::{self, EncoderProbe, Plan};
+use super::vdisplay::{self, VirtualDisplay, Want};
 use super::{HostConfig, Sink};
 use crate::ipc_pb::host_event::Ev;
 
@@ -37,15 +38,26 @@ struct State {
     next_stream_id: u64,
     /// Plans that opened fine but failed while encoding; skipped after two failures.
     failed: HashMap<Plan, u32>,
+    /// The session's virtual display, if it asked for one.
+    vd: Option<VirtualDisplay>,
+    /// Client gone: remove the virtual display at this time unless it comes
+    /// back (network hiccup, reconnect).
+    vd_release_at: Option<Instant>,
+    vd_available: bool,
 }
 
-pub fn session_info(topo: &Topology, probes: &[EncoderProbe], cfg: &HostConfig) -> pb::SessionInfo {
+/// How long a virtual display outlives its client.
+const VD_GRACE: Duration = Duration::from_secs(15);
+
+fn session_info(st: &State, cfg: &HostConfig) -> pb::SessionInfo {
+    let (topo, probes) = (&st.topo, &st.probes);
     pb::SessionInfo {
+        virtual_display_available: st.vd_available,
         mic_device: super::mic::cable_device_name().unwrap_or_default(),
         usb_available: crate::usb::usbip_exe().is_some(),
         gamepad_available: super::gamepad::available(),
         host_name: cfg.name.clone(),
-        displays: display_infos(topo),
+        displays: display_infos(st),
         gpus: topo
             .adapters
             .iter()
@@ -76,8 +88,10 @@ pub fn session_info(topo: &Topology, probes: &[EncoderProbe], cfg: &HostConfig) 
     }
 }
 
-fn display_infos(topo: &Topology) -> Vec<pb::DisplayInfo> {
-    topo.outputs
+fn display_infos(st: &State) -> Vec<pb::DisplayInfo> {
+    let vd = st.vd.as_ref().map(|v| v.gdi_name.as_str());
+    st.topo
+        .outputs
         .iter()
         .map(|o| pb::DisplayInfo {
             id: o.id,
@@ -89,6 +103,8 @@ fn display_infos(topo: &Topology) -> Vec<pb::DisplayInfo> {
             refresh_hz: o.refresh_hz,
             primary: o.primary,
             gpu_index: o.adapter_index,
+            is_virtual: vd.is_some_and(|n| n.eq_ignore_ascii_case(&o.device_name)),
+            hdr: o.hdr,
         })
         .collect()
 }
@@ -116,7 +132,6 @@ pub fn thread(rx: Receiver<VideoCmd>, sink: Sink, input_tx: Sender<InputCmd>, cf
         }
     };
     let probes = select::probe_all(&topo);
-    sink.send(Ev::SessionInfo(session_info(&topo, &probes, &cfg)));
 
     let mut st = State {
         topo,
@@ -128,7 +143,11 @@ pub fn thread(rx: Receiver<VideoCmd>, sink: Sink, input_tx: Sender<InputCmd>, cf
         frame_counter: 0,
         next_stream_id: nya_proto::now_us(),
         failed: HashMap::new(),
+        vd: None,
+        vd_release_at: None,
+        vd_available: vdisplay::available(),
     };
+    sink.send(Ev::SessionInfo(session_info(&st, &cfg)));
     let mut last_topo_check = Instant::now();
 
     loop {
@@ -152,6 +171,9 @@ pub fn thread(rx: Receiver<VideoCmd>, sink: Sink, input_tx: Sender<InputCmd>, cf
         for cmd in first.into_iter().chain(rx.try_iter()) {
             match cmd {
                 VideoCmd::Start(s) => {
+                    if apply_virtual_display(&mut st, &s, &sink) {
+                        refresh_topology(&mut st, &sink, &cfg);
+                    }
                     st.req = Some(s);
                     rebuild = true;
                 }
@@ -159,6 +181,9 @@ pub fn thread(rx: Receiver<VideoCmd>, sink: Sink, input_tx: Sender<InputCmd>, cf
                     drop_pipe(&mut st);
                     st.req = None;
                     st.retry_at = None;
+                    if st.vd.is_some() {
+                        st.vd_release_at = Some(Instant::now() + VD_GRACE);
+                    }
                 }
                 VideoCmd::Keyframe => {
                     if let Some(p) = st.pipe.as_mut() {
@@ -191,6 +216,12 @@ pub fn thread(rx: Receiver<VideoCmd>, sink: Sink, input_tx: Sender<InputCmd>, cf
                 }
                 VideoCmd::Shutdown => return,
             }
+        }
+
+        if st.vd_release_at.is_some_and(|t| Instant::now() >= t) {
+            st.vd_release_at = None;
+            st.vd = None;
+            refresh_topology(&mut st, &sink, &cfg);
         }
 
         // --- topology changes (hot-plug, MUX switch, driver reset) ---
@@ -253,18 +284,50 @@ fn refresh_topology(st: &mut State, sink: &Sink, cfg: &HostConfig) {
             }
             st.topo = t;
             st.failed.clear();
-            sink.send(Ev::DisplayChanged(pb::DisplayChanged { displays: display_infos(&st.topo) }));
-            sink.send(Ev::SessionInfo(session_info(&st.topo, &st.probes, cfg)));
+            sink.send(Ev::DisplayChanged(pb::DisplayChanged { displays: display_infos(st) }));
+            sink.send(Ev::SessionInfo(session_info(st, cfg)));
         }
         Err(e) => tracing::warn!("GPU enumeration failed: {e:#}"),
     }
 }
 
+/// Create, change or remove the virtual display for this request. Returns
+/// true if the displays changed.
+fn apply_virtual_display(st: &mut State, req: &pb::StartStream, sink: &Sink) -> bool {
+    let want = Want::from_pb(req.virtual_display.as_ref());
+    st.vd_release_at = None;
+    let current = st.vd.as_ref().map(|v| v.want());
+    if want == current {
+        return false;
+    }
+    // The pipeline captures the display that is about to change.
+    drop_pipe(st);
+    let Some(w) = want else {
+        st.vd = None;
+        return true;
+    };
+    let res = match st.vd.as_mut() {
+        Some(vd) => vd.update(w),
+        None => VirtualDisplay::open(w).map(|vd| st.vd = Some(vd)),
+    };
+    if let Err(e) = res {
+        tracing::error!("virtual display: {e:#}");
+        st.vd = None;
+        sink.send(Ev::StreamError(pb::StreamError { message: format!("虚拟显示器不可用，改用物理显示器：{e:#}") }));
+    }
+    true
+}
+
 fn build(st: &mut State, cfg: &HostConfig, desktop: &mut DesktopTracker) -> Result<Pipeline, String> {
     let req = st.req.clone().unwrap();
+    let virtual_output = st
+        .vd
+        .as_ref()
+        .and_then(|vd| st.topo.outputs.iter().find(|o| o.device_name.eq_ignore_ascii_case(&vd.gdi_name)));
     let output = st
         .topo
         .output(req.display_id)
+        .or(virtual_output)
         .or_else(|| st.topo.outputs.first())
         .ok_or_else(|| "没有可用的显示器".to_string())?
         .clone();

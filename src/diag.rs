@@ -91,7 +91,25 @@ fn body(r: &mut String) {
             o.adapter_index,
             o.rotation
         );
+        if o.hdr {
+            let white = nya_win::display_config::sdr_white_nits(&o.device_name)
+                .map(|n| format!("{n:.0} nits"))
+                .unwrap_or_else(|| "未知".into());
+            out!(r, "    HDR 已开启：按 SDR 转换后传输（SDR 内容亮度 {white}）");
+        }
     }
+    let vdd = crate::components::VDD_HWID;
+    out!(
+        r,
+        "虚拟显示器驱动：{}",
+        if !nya_win::devnode::exists(vdd) {
+            "未安装"
+        } else if nya_win::devnode::is_started(vdd) {
+            "已安装，正在使用"
+        } else {
+            "已安装（未启用，连接时按需启用）"
+        }
+    );
 
     out!(r, "\n-- 纹理格式支持（渲染目标）--");
     for a in topo.hardware_adapters() {
