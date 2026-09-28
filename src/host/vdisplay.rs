@@ -44,7 +44,11 @@ const COMMON: [(u32, u32); 16] = [
     (3840, 2160),
     (3840, 2400),
 ];
-const RATES: [u32; 8] = [60, 75, 90, 100, 120, 144, 165, 240];
+/// The driver fails to plug in its monitor ("monitor arrival", STATUS_NOT_SUPPORTED)
+/// with around 100 or more modes; each resolution entry is one mode.
+const MAX_MODES: usize = 64;
+/// Session sizes kept in the list besides [`COMMON`] (newest last).
+const MAX_EXTRA: usize = 8;
 
 /// Turn on the driver's own log (`C:\VirtualDisplayDriver\Logs`), for `vdd-test --driver-log`.
 static DRIVER_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -136,8 +140,12 @@ impl VirtualDisplay {
         let t0 = Instant::now();
         let w = self.want;
         let size = (w.width, w.height);
-        if !COMMON.contains(&size) && !self.extra.contains(&size) {
+        if !COMMON.contains(&size) {
+            self.extra.retain(|s| *s != size);
             self.extra.push(size);
+            if self.extra.len() > MAX_EXTRA {
+                self.extra.remove(0);
+            }
         }
         let changed = write_settings(&self.extra, w.hz).context("写入虚拟显示器设置")?;
         if changed && devnode::is_started(VDD_HWID) {
@@ -479,23 +487,36 @@ fn arrange(luid: LUID) -> Result<()> {
     dc::apply(&cfg.paths, &modes)
 }
 
+/// Refresh rates offered for every resolution: 60 Hz and the client's.
+fn rates(hz: u32) -> Vec<u32> {
+    if hz == 60 {
+        vec![60]
+    } else {
+        vec![60, hz]
+    }
+}
+
+/// The driver's settings. No global refresh rates: the driver multiplies them
+/// with every resolution (on top of each resolution's own rate), which
+/// quickly exceeds what it can report. Instead one entry per resolution and
+/// rate, at most [`MAX_MODES`].
 fn settings_xml(sizes: &[(u32, u32)], hz: u32) -> String {
-    let mut rates: Vec<u32> = RATES.to_vec();
-    if !rates.contains(&hz) {
-        rates.push(hz);
-        rates.sort();
-    }
+    let rates = rates(hz);
     let mut x = String::from(
-        "<?xml version='1.0' encoding='utf-8'?>\n<!-- Written by NyaRemoteControl for each session; edits are overwritten. -->\n<vdd_settings>\n    <monitors>\n        <count>1</count>\n    </monitors>\n    <gpu>\n        <friendlyname>default</friendlyname>\n    </gpu>\n    <global>\n",
+        "<?xml version='1.0' encoding='utf-8'?>\n<!-- Written by NyaRemoteControl for each session; edits are overwritten. -->\n<vdd_settings>\n    <monitors>\n        <count>1</count>\n    </monitors>\n    <gpu>\n        <friendlyname>default</friendlyname>\n    </gpu>\n    <global>\n    </global>\n    <resolutions>\n",
     );
-    for r in &rates {
-        x += &format!("        <g_refresh_rate>{r}</g_refresh_rate>\n");
-    }
-    x += "    </global>\n    <resolutions>\n";
-    for (w, h) in COMMON.iter().chain(sizes.iter()) {
-        x += &format!(
-            "        <resolution>\n            <width>{w}</width>\n            <height>{h}</height>\n            <refresh_rate>60</refresh_rate>\n        </resolution>\n"
-        );
+    // Session sizes first, so they survive the cap.
+    let mut n = 0;
+    'outer: for (w, h) in sizes.iter().rev().chain(COMMON.iter()) {
+        for r in &rates {
+            if n >= MAX_MODES {
+                break 'outer;
+            }
+            n += 1;
+            x += &format!(
+                "        <resolution>\n            <width>{w}</width>\n            <height>{h}</height>\n            <refresh_rate>{r}</refresh_rate>\n        </resolution>\n"
+            );
+        }
     }
     let log = DRIVER_LOG.load(std::sync::atomic::Ordering::Relaxed);
     x += &format!(
@@ -543,11 +564,23 @@ mod tests {
     #[test]
     fn xml_lists_requested_sizes_and_rate() {
         let x = settings_xml(&[(1916, 1042)], 144);
-        assert!(x.contains("<width>1916</width>\n            <height>1042</height>"));
+        assert!(x.contains("<width>1916</width>\n            <height>1042</height>\n            <refresh_rate>60</refresh_rate>"));
+        assert!(x.contains("<width>1916</width>\n            <height>1042</height>\n            <refresh_rate>144</refresh_rate>"));
         assert!(x.contains("<width>3840</width>"));
-        assert!(x.contains("<g_refresh_rate>144</g_refresh_rate>"));
-        let x = settings_xml(&[], 59);
-        assert!(x.contains("<g_refresh_rate>59</g_refresh_rate>"));
+        assert!(!x.contains("<g_refresh_rate>"));
+        assert_eq!(x.matches("<resolution>").count(), (COMMON.len() + 1) * 2);
+        let x = settings_xml(&[], 60);
         assert_eq!(x.matches("<resolution>").count(), COMMON.len());
+    }
+
+    /// Worst case stays under the driver's limit (it failed at 108, worked at 96).
+    #[test]
+    fn mode_count_is_capped() {
+        let extra: Vec<(u32, u32)> = (0..MAX_EXTRA as u32).map(|i| (1000 + 8 * i, 700)).collect();
+        let x = settings_xml(&extra, 144);
+        assert!(x.matches("<resolution>").count() <= MAX_MODES);
+        // Session sizes are never the ones cut.
+        assert!(x.contains(&format!("<width>{}</width>", 1000 + 8 * (MAX_EXTRA as u32 - 1))));
+        assert!(x.contains("<width>1000</width>"));
     }
 }
