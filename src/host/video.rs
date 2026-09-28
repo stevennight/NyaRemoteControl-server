@@ -12,7 +12,7 @@ use nya_win::topology::Topology;
 use super::input::InputCmd;
 use super::pipeline::{Pipeline, Step};
 use super::select::{self, EncoderProbe, Plan};
-use super::vdisplay::{self, VirtualDisplay, Want};
+use super::vdisplay::{self, HostDisplays, Setup};
 use super::{HostConfig, Sink};
 use crate::ipc_pb::host_event::Ev;
 
@@ -39,7 +39,7 @@ struct State {
     /// Plans that opened fine but failed while encoding; skipped after two failures.
     failed: HashMap<Plan, u32>,
     /// The session's virtual display, if it asked for one.
-    vd: Option<VirtualDisplay>,
+    vd: Option<HostDisplays>,
     /// Client gone: remove the virtual display at this time unless it comes
     /// back (network hiccup, reconnect).
     vd_release_at: Option<Instant>,
@@ -89,7 +89,7 @@ fn session_info(st: &State, cfg: &HostConfig) -> pb::SessionInfo {
 }
 
 fn display_infos(st: &State) -> Vec<pb::DisplayInfo> {
-    let vd = st.vd.as_ref().map(|v| v.gdi_name.as_str());
+    let virt = st.vd.as_ref().map(|v| v.gdi_names()).unwrap_or(&[]);
     st.topo
         .outputs
         .iter()
@@ -103,7 +103,7 @@ fn display_infos(st: &State) -> Vec<pb::DisplayInfo> {
             refresh_hz: o.refresh_hz,
             primary: o.primary,
             gpu_index: o.adapter_index,
-            is_virtual: vd.is_some_and(|n| n.eq_ignore_ascii_case(&o.device_name)),
+            is_virtual: virt.iter().any(|n| n.eq_ignore_ascii_case(&o.device_name)),
             hdr: o.hdr,
         })
         .collect()
@@ -228,6 +228,15 @@ pub fn thread(rx: Receiver<VideoCmd>, sink: Sink, input_tx: Sender<InputCmd>, cf
         if last_topo_check.elapsed() > Duration::from_secs(1) {
             last_topo_check = Instant::now();
             if !st.topo.is_current() {
+                // A monitor plugged in (or Windows restoring a layout) may have
+                // switched a physical display back on next to the virtual one.
+                if let Some(vd) = st.vd.as_mut() {
+                    match vd.enforce() {
+                        Ok(true) => tracing::info!("physical display switched off again"),
+                        Ok(false) => {}
+                        Err(e) => tracing::warn!("virtual display layout: {e:#}"),
+                    }
+                }
                 refresh_topology(&mut st, &sink, &cfg);
                 if st.pipe.is_some() {
                     rebuild = true;
@@ -291,24 +300,24 @@ fn refresh_topology(st: &mut State, sink: &Sink, cfg: &HostConfig) {
     }
 }
 
-/// Create, change or remove the virtual display for this request. Returns
-/// true if the displays changed.
+/// Create, change or remove the session's display setup (virtual screens,
+/// physical displays, local input). Returns true if the displays changed.
 fn apply_virtual_display(st: &mut State, req: &pb::StartStream, sink: &Sink) -> bool {
-    let want = Want::from_pb(req.virtual_display.as_ref());
+    let want = Setup::from_pb(req.display_setup.as_ref());
     st.vd_release_at = None;
-    let current = st.vd.as_ref().map(|v| v.want());
+    let current = st.vd.as_ref().map(|v| v.setup().clone()).unwrap_or_default();
     if want == current {
         return false;
     }
-    // The pipeline captures the display that is about to change.
+    // The pipeline captures a display that is about to change.
     drop_pipe(st);
-    let Some(w) = want else {
+    if want.is_default() {
         st.vd = None;
         return true;
-    };
+    }
     let res = match st.vd.as_mut() {
-        Some(vd) => vd.update(w),
-        None => VirtualDisplay::open(w).map(|vd| st.vd = Some(vd)),
+        Some(vd) => vd.update(want),
+        None => HostDisplays::open(want).map(|vd| st.vd = Some(vd)),
     };
     if let Err(e) = res {
         tracing::error!("virtual display: {e:#}");
@@ -323,7 +332,8 @@ fn build(st: &mut State, cfg: &HostConfig, desktop: &mut DesktopTracker) -> Resu
     let virtual_output = st
         .vd
         .as_ref()
-        .and_then(|vd| st.topo.outputs.iter().find(|o| o.device_name.eq_ignore_ascii_case(&vd.gdi_name)));
+        .and_then(|vd| vd.gdi_names().first())
+        .and_then(|n| st.topo.outputs.iter().find(|o| o.device_name.eq_ignore_ascii_case(n)));
     let output = st
         .topo
         .output(req.display_id)

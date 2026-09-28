@@ -1,15 +1,16 @@
-//! Virtual display for a session (Virtual Display Driver, optional component).
+//! Host display setup for a session: virtual screens (Virtual Display Driver,
+//! optional component), physical displays on or off, local input blocked.
 //!
 //! The driver's device stays disabled while nobody uses it. A session that
-//! asks for a virtual display gets it enabled at the requested resolution and
-//! made the primary display; in privacy mode it becomes the only display (the
-//! physical ones go dark) and the host's own keyboard and mouse are blocked.
-//! Dropping [`VirtualDisplay`] disables the device again and lets Windows
-//! re-apply the display layout it had stored for the physical monitors.
+//! asks for virtual screens gets it enabled with that many monitors at the
+//! requested resolutions; the first one becomes the primary display. The
+//! physical displays either stay on next to them or are switched off.
+//! Dropping [`HostDisplays`] disables the device again and lets Windows
+//! re-apply the layout it has stored for the physical monitors.
 //!
 //! The driver only offers the resolutions listed in its settings file, which
-//! it reads when it starts: a size that is not listed yet means rewriting the
-//! file and restarting the device (the virtual screen blinks once).
+//! it reads when it starts: a size that is not listed yet (or a different
+//! number of screens) means rewriting the file and restarting the device.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -49,14 +50,13 @@ const COMMON: [(u32, u32); 16] = [
 const MAX_MODES: usize = 64;
 /// Session sizes kept in the list besides [`COMMON`] (newest last).
 const MAX_EXTRA: usize = 8;
+pub const MAX_SCREENS: usize = 4;
 
 /// Turn on the driver's own log (`C:\VirtualDisplayDriver\Logs`), for `vdd-test --driver-log`.
 static DRIVER_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// What the client asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Want {
-    pub private: bool,
+pub struct Screen {
     pub width: u32,
     pub height: u32,
     pub hz: u32,
@@ -64,26 +64,42 @@ pub struct Want {
     pub scale: u32,
 }
 
-impl Want {
-    /// `None` = physical displays (no virtual display).
-    pub fn from_pb(v: Option<&pb::VirtualDisplay>) -> Option<Self> {
-        let v = v?;
-        let mode = pb::DisplayMode::try_from(v.mode).unwrap_or(pb::DisplayMode::Physical);
-        if mode == pb::DisplayMode::Physical {
-            return None;
-        }
-        let (width, height) = if v.width >= 640 && v.height >= 480 {
-            (v.width.min(7680) & !1, v.height.min(4320) & !1)
-        } else {
-            (1920, 1080)
-        };
-        Some(Self {
-            private: mode == pb::DisplayMode::Private,
-            width,
-            height,
-            hz: if v.refresh_hz == 0 { 60 } else { v.refresh_hz.clamp(24, 240) },
-            scale: v.scale_percent.min(500),
-        })
+/// What the client asked for.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Setup {
+    pub screens: Vec<Screen>,
+    /// Physical displays off (only with at least one virtual screen).
+    pub physical_off: bool,
+    pub block_input: bool,
+}
+
+impl Setup {
+    pub fn from_pb(v: Option<&pb::DisplaySetup>) -> Self {
+        let Some(v) = v else { return Self::default() };
+        let screens: Vec<Screen> = v
+            .virtual_screens
+            .iter()
+            .take(MAX_SCREENS)
+            .map(|s| {
+                let (width, height) = if s.width >= 640 && s.height >= 480 {
+                    (s.width.min(7680) & !1, s.height.min(4320) & !1)
+                } else {
+                    (1920, 1080)
+                };
+                Screen {
+                    width,
+                    height,
+                    hz: if s.refresh_hz == 0 { 60 } else { s.refresh_hz.clamp(24, 240) },
+                    scale: s.scale_percent.min(500),
+                }
+            })
+            .collect();
+        Self { physical_off: v.physical_off && !screens.is_empty(), screens, block_input: v.block_local_input }
+    }
+
+    /// Displays as they are: nothing to do.
+    pub fn is_default(&self) -> bool {
+        self.screens.is_empty() && !self.block_input
     }
 }
 
@@ -92,139 +108,201 @@ pub fn available() -> bool {
     devnode::exists(VDD_HWID)
 }
 
-pub struct VirtualDisplay {
-    want: Want,
-    /// `\\.\DISPLAYn` of the virtual display.
-    pub gdi_name: String,
-    instance: String,
+/// The display setup of the attached session.
+pub struct HostDisplays {
+    setup: Setup,
+    vdd: Option<Vdd>,
+    /// The driver was enabled by us (also after a failed setup): release it.
+    driver_on: bool,
+    blocker: Option<InputBlocker>,
     /// Sizes requested during this session (kept in the driver's list).
     extra: Vec<(u32, u32)>,
-    scale_set: u32,
-    blocker: Option<InputBlocker>,
 }
 
-impl VirtualDisplay {
-    pub fn open(want: Want) -> Result<Self> {
-        let instance = devnode::instance_ids(VDD_HWID)
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("被控端没有安装虚拟显示器驱动（在被控端管理界面的“可选组件”中安装）"))?;
-        let mut vd = Self { want, gdi_name: String::new(), instance, extra: Vec::new(), scale_set: 0, blocker: None };
-        // On error, dropping `vd` restores the physical displays.
-        vd.setup()?;
-        Ok(vd)
+/// The driver while it is up.
+struct Vdd {
+    luid: LUID,
+    /// `\\.\DISPLAYn` of each virtual screen, in screen order.
+    gdi_names: Vec<String>,
+    /// Scaling applied per screen.
+    scale_set: Vec<u32>,
+}
+
+impl HostDisplays {
+    pub fn open(setup: Setup) -> Result<Self> {
+        let mut d = Self { setup, vdd: None, driver_on: false, blocker: None, extra: Vec::new() };
+        // On error, dropping `d` restores the physical displays.
+        d.apply()?;
+        Ok(d)
     }
 
-    pub fn want(&self) -> Want {
-        self.want
+    pub fn setup(&self) -> &Setup {
+        &self.setup
     }
 
-    /// Apply a changed request (resolution, privacy, scaling).
-    pub fn update(&mut self, want: Want) -> Result<()> {
-        if want == self.want {
+    /// GDI names of the virtual screens (the first is primary).
+    pub fn gdi_names(&self) -> &[String] {
+        self.vdd.as_ref().map(|v| v.gdi_names.as_slice()).unwrap_or(&[])
+    }
+
+    pub fn update(&mut self, setup: Setup) -> Result<()> {
+        if setup == self.setup {
             return Ok(());
         }
-        if self.want.private && !want.private {
-            // The physical displays were switched off: bring back their
-            // stored layout first, then add the virtual display to it.
-            self.blocker = None;
-            release();
+        let restore_physical = self.setup.physical_off && !setup.physical_off;
+        self.setup = setup;
+        if restore_physical && self.driver_on {
+            // Switched-off displays come back from Windows' stored layout;
+            // then the virtual screens are added next to them again.
+            self.release();
         }
-        self.want = want;
-        self.setup()
+        self.apply()
     }
 
-    /// Bring the device and the display layout to what `self.want` says.
-    /// Idempotent.
-    fn setup(&mut self) -> Result<()> {
-        let t0 = Instant::now();
-        let w = self.want;
-        let size = (w.width, w.height);
-        if !COMMON.contains(&size) {
-            self.extra.retain(|s| *s != size);
-            self.extra.push(size);
-            if self.extra.len() > MAX_EXTRA {
-                self.extra.remove(0);
-            }
+    fn apply(&mut self) -> Result<()> {
+        if self.setup.screens.is_empty() {
+            self.release();
+        } else {
+            self.setup_vdd()?;
         }
-        let changed = write_settings(&self.extra, w.hz).context("写入虚拟显示器设置")?;
-        if changed && devnode::is_started(VDD_HWID) {
-            tracing::info!("virtual display: new resolution list; restarting the driver");
-            devnode::set_enabled(VDD_HWID, false).context("停用虚拟显示器")?;
-            std::thread::sleep(Duration::from_millis(500));
-            self.scale_set = 0; // a new monitor comes up
-        }
-        // Adapters with displays before the driver starts: if its device path
-        // does not match (it should), the new adapter is the driver's.
-        let before = if devnode::is_started(VDD_HWID) { Vec::new() } else { target_adapters() };
-        devnode::set_enabled(VDD_HWID, true).context("启用虚拟显示器（需要管理员权限，开发模式下不可用）")?;
-        let mut found = wait_for(Duration::from_secs(10), || find_vdd(&self.instance, &before));
-        if found.is_none() {
-            // Freshly installed or stuck: one restart of the device often helps.
-            tracing::warn!("virtual display did not appear:\n{}restarting the device once", describe_state(&self.instance));
-            let _ = devnode::set_enabled(VDD_HWID, false);
-            std::thread::sleep(Duration::from_millis(1000));
-            let before = target_adapters();
-            devnode::set_enabled(VDD_HWID, true).context("启用虚拟显示器")?;
-            found = wait_for(Duration::from_secs(10), || find_vdd(&self.instance, &before));
-        }
-        let luid = match found {
-            Some(l) => l,
-            None => {
-                let state = describe_state(&self.instance);
-                tracing::error!("virtual display did not appear:\n{state}");
-                return Err(anyhow!("虚拟显示器驱动已启用，但没有出现显示器。{}", summary(&state)));
-            }
-        };
-
-        activate(luid, w.private).context("切换显示器布局")?;
-        self.gdi_name = wait_for(Duration::from_secs(5), || vdd_gdi_name(luid))
-            .ok_or_else(|| anyhow!("虚拟显示器没有进入桌面"))?;
-        if let Err(e) = dc::set_mode(&self.gdi_name, w.width, w.height, w.hz) {
-            tracing::warn!("virtual display mode {}x{}@{}: {e:#}", w.width, w.height, w.hz);
-        }
-        if !w.private {
-            if let Err(e) = arrange(luid) {
-                tracing::warn!("virtual display: arrange displays: {e:#}");
-            }
-        }
-        if w.scale > 0 && w.scale != self.scale_set {
-            match dc::set_scale(&self.gdi_name, w.scale) {
-                Ok(s) => {
-                    self.scale_set = w.scale;
-                    tracing::info!("virtual display scaling {s}%");
-                }
-                Err(e) => tracing::warn!("virtual display scaling {}%: {e:#}", w.scale),
-            }
-        }
-        // The capture side needs DXGI to see the new output.
-        let _ = wait_for(Duration::from_secs(3), || {
-            nya_win::topology::Topology::enumerate()
-                .ok()
-                .and_then(|t| t.outputs.iter().any(|o| o.device_name.eq_ignore_ascii_case(&self.gdi_name)).then_some(()))
-        });
-        match (w.private, self.blocker.is_some()) {
+        match (self.setup.block_input, self.blocker.is_some()) {
             (true, false) => self.blocker = Some(InputBlocker::start()),
             (false, true) => self.blocker = None,
             _ => {}
         }
+        Ok(())
+    }
+
+    /// Bring the driver and the display layout to what `self.setup` says. Idempotent.
+    fn setup_vdd(&mut self) -> Result<()> {
+        let t0 = Instant::now();
+        let screens = self.setup.screens.clone();
+        let n = screens.len();
+        let instance = devnode::instance_ids(VDD_HWID)
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("被控端没有安装虚拟显示器驱动（在被控端管理界面的“可选组件”中安装）"))?;
+        for s in &screens {
+            let size = (s.width, s.height);
+            if !COMMON.contains(&size) {
+                self.extra.retain(|x| *x != size);
+                self.extra.push(size);
+                if self.extra.len() > MAX_EXTRA {
+                    self.extra.remove(0);
+                }
+            }
+        }
+        let rates = rates(&screens);
+        let changed = write_settings(n, &self.extra, &rates).context("写入虚拟显示器设置")?;
+        if changed && devnode::is_started(VDD_HWID) {
+            tracing::info!("virtual display: new settings ({n} screen(s)); restarting the driver");
+            self.vdd = None;
+            devnode::set_enabled(VDD_HWID, false).context("停用虚拟显示器")?;
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        // Adapters with displays before the driver starts: if its device path
+        // does not match (it should), the new adapter is the driver's.
+        let before = if devnode::is_started(VDD_HWID) { Vec::new() } else { target_adapters() };
+        self.driver_on = true;
+        devnode::set_enabled(VDD_HWID, true).context("启用虚拟显示器（需要管理员权限，开发模式下不可用）")?;
+        let mut found = wait_for(Duration::from_secs(10), || find_vdd(&instance, &before));
+        if found.is_none() {
+            // Freshly installed or stuck: one restart of the device often helps.
+            tracing::warn!("virtual display did not appear:\n{}restarting the device once", describe_state(&instance));
+            let _ = devnode::set_enabled(VDD_HWID, false);
+            std::thread::sleep(Duration::from_millis(1000));
+            let before = target_adapters();
+            devnode::set_enabled(VDD_HWID, true).context("启用虚拟显示器")?;
+            found = wait_for(Duration::from_secs(10), || find_vdd(&instance, &before));
+        }
+        let Some(luid) = found else {
+            let state = describe_state(&instance);
+            tracing::error!("virtual display did not appear:\n{state}");
+            return Err(anyhow!("虚拟显示器驱动已启用，但没有出现显示器。{}", summary(&state)));
+        };
+        // Every monitor of the driver arrives separately.
+        if wait_for(Duration::from_secs(5), || (available_targets(luid) >= n).then_some(())).is_none() {
+            tracing::warn!("virtual display: only {} of {n} screens appeared", available_targets(luid));
+        }
+
+        // Resolutions first, then the layout: the layout step saves the final
+        // state, so later display changes don't bring an older one back.
+        make_active(luid).context("启用虚拟显示器输出")?;
+        let gdi_names = wait_for(Duration::from_secs(5), || {
+            let names = vdd_gdi_names(luid);
+            (names.len() >= n.min(available_targets(luid)).max(1)).then_some(names)
+        })
+        .ok_or_else(|| anyhow!("虚拟显示器没有进入桌面"))?;
+        for (name, s) in gdi_names.iter().zip(&screens) {
+            if let Err(e) = dc::set_mode(name, s.width, s.height, s.hz) {
+                tracing::warn!("virtual display {name} mode {}x{}@{}: {e:#}", s.width, s.height, s.hz);
+            }
+        }
+        layout(luid, self.setup.physical_off).context(if self.setup.physical_off { "关闭物理显示器" } else { "排列显示器" })?;
+        let prev_scale = self.vdd.take().map(|v| v.scale_set).unwrap_or_default();
+        let mut scale_set = vec![0; gdi_names.len()];
+        for (i, (name, s)) in gdi_names.iter().zip(&screens).enumerate() {
+            if s.scale == 0 || prev_scale.get(i) == Some(&s.scale) && !changed {
+                scale_set[i] = prev_scale.get(i).copied().unwrap_or(0);
+                continue;
+            }
+            match dc::set_scale(name, s.scale) {
+                Ok(v) => {
+                    scale_set[i] = s.scale;
+                    tracing::info!("virtual display {name} scaling {v}%");
+                }
+                Err(e) => tracing::warn!("virtual display {name} scaling {}%: {e:#}", s.scale),
+            }
+        }
+        // The capture side needs DXGI to see the new outputs.
+        let first = gdi_names[0].clone();
+        let _ = wait_for(Duration::from_secs(3), || {
+            nya_win::topology::Topology::enumerate()
+                .ok()
+                .and_then(|t| t.outputs.iter().any(|o| o.device_name.eq_ignore_ascii_case(&first)).then_some(()))
+        });
         tracing::info!(
-            "virtual display {} {}x{}@{}{} ready in {} ms",
-            self.gdi_name,
-            w.width,
-            w.height,
-            w.hz,
-            if w.private { " (privacy: physical displays off, local input blocked)" } else { "" },
+            "virtual screens {:?} {:?}{} ready in {} ms",
+            gdi_names,
+            screens.iter().map(|s| format!("{}x{}@{}", s.width, s.height, s.hz)).collect::<Vec<_>>(),
+            if self.setup.physical_off { ", physical displays off" } else { "" },
             t0.elapsed().as_millis()
         );
+        self.vdd = Some(Vdd { luid, gdi_names, scale_set });
         Ok(())
+    }
+
+    /// After a display change (hot-plug, Windows restoring a layout): make
+    /// sure the physical displays are still off when they should be.
+    /// Returns whether something had to be changed.
+    pub fn enforce(&mut self) -> Result<bool> {
+        let Some(v) = &self.vdd else { return Ok(false) };
+        if !self.setup.physical_off {
+            return Ok(false);
+        }
+        let cfg = Config::query(false)?;
+        let others = cfg.active().filter(|p| !luid_eq(p.targetInfo.adapterId, v.luid)).count();
+        if others == 0 {
+            return Ok(false);
+        }
+        layout(v.luid, true)?;
+        Ok(true)
     }
 }
 
-impl Drop for VirtualDisplay {
+impl HostDisplays {
+    fn release(&mut self) {
+        self.vdd = None;
+        if std::mem::take(&mut self.driver_on) {
+            release();
+        }
+    }
+}
+
+impl Drop for HostDisplays {
     fn drop(&mut self) {
         self.blocker = None;
-        release();
+        self.release();
     }
 }
 
@@ -235,7 +313,7 @@ fn release() {
         Err(e) => tracing::warn!("disable virtual display: {e:#}"),
     }
     // Windows usually re-applies the stored layout by itself; make sure, also
-    // when the virtual display was the only active one.
+    // when the virtual screens were the only active displays.
     std::thread::sleep(Duration::from_millis(300));
     if let Err(e) = dc::restore_database() {
         tracing::warn!("restore display layout: {e:#}");
@@ -281,6 +359,20 @@ fn target_adapters() -> Vec<LUID> {
     v
 }
 
+/// Connected monitors of an adapter.
+fn available_targets(luid: LUID) -> usize {
+    let Ok(cfg) = Config::query(true) else { return 0 };
+    let mut ids: Vec<u32> = cfg
+        .paths
+        .iter()
+        .filter(|p| luid_eq(p.targetInfo.adapterId, luid) && p.targetInfo.targetAvailable.as_bool())
+        .map(|p| p.targetInfo.id)
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids.len()
+}
+
 /// Adapter LUID of the driver's device (the indirect display adapter), once
 /// it has a display: matched by device path, else the one adapter that got
 /// a display since `before`.
@@ -301,6 +393,131 @@ fn find_vdd(instance: &str, before: &[LUID]) -> Option<LUID> {
         return Some(new[0]);
     }
     None
+}
+
+/// Active paths of the driver, in monitor order.
+fn vdd_paths(cfg: &Config, luid: LUID) -> Vec<DISPLAYCONFIG_PATH_INFO> {
+    let mut v: Vec<DISPLAYCONFIG_PATH_INFO> = cfg.active().filter(|p| luid_eq(p.targetInfo.adapterId, luid)).copied().collect();
+    v.sort_by_key(|p| p.targetInfo.id);
+    v
+}
+
+fn vdd_gdi_names(luid: LUID) -> Vec<String> {
+    let Ok(cfg) = Config::query(false) else { return Vec::new() };
+    vdd_paths(&cfg, luid).iter().filter_map(dc::source_gdi_name).collect()
+}
+
+/// Make every connected monitor of the driver active (next to whatever is active).
+fn make_active(luid: LUID) -> Result<()> {
+    let all = Config::query(true)?;
+    let on_vdd = |p: &DISPLAYCONFIG_PATH_INFO| luid_eq(p.targetInfo.adapterId, luid);
+    let mut paths: Vec<_> = all.active().copied().collect();
+    let mut added = 0;
+    for cand in all.paths.iter().filter(|p| on_vdd(p) && p.targetInfo.targetAvailable.as_bool()) {
+        let target_active = paths.iter().any(|p| on_vdd(p) && p.targetInfo.id == cand.targetInfo.id);
+        let source_used = paths.iter().any(|p| luid_eq(p.sourceInfo.adapterId, cand.sourceInfo.adapterId) && p.sourceInfo.id == cand.sourceInfo.id);
+        if target_active || source_used {
+            continue;
+        }
+        let mut p = *cand;
+        p.flags |= PATH_ACTIVE;
+        p.sourceInfo.Anonymous.modeInfoIdx = MODE_IDX_INVALID;
+        p.targetInfo.Anonymous.modeInfoIdx = MODE_IDX_INVALID;
+        paths.push(p);
+        added += 1;
+    }
+    if added == 0 {
+        return Ok(());
+    }
+    tracing::info!("display layout: activating {added} virtual screen(s)");
+    dc::apply(&paths, &all.modes, false)
+}
+
+/// Virtual screens side by side from (0, 0) (the first is primary); the
+/// physical displays switched off, or to the right in their own arrangement.
+/// Saved, so Windows keeps it for this set of monitors.
+fn layout(luid: LUID, physical_off: bool) -> Result<()> {
+    for attempt in 0..3 {
+        let cfg = Config::query(false)?;
+        let mine = vdd_paths(&cfg, luid);
+        if mine.is_empty() {
+            anyhow::bail!("virtual screens not active");
+        }
+        let others: Vec<DISPLAYCONFIG_PATH_INFO> = cfg.active().filter(|p| !luid_eq(p.targetInfo.adapterId, luid)).copied().collect();
+        let mut modes = cfg.modes.clone();
+        let (vdd_ok, x_end) = place(&mine, &mut modes, 0);
+        let mut paths = mine.clone();
+        let mut others_ok = true;
+        if physical_off {
+            others_ok = others.is_empty();
+        } else {
+            others_ok &= shift_right(&others, &mut modes, x_end);
+            paths.extend(others.iter().copied());
+        }
+        if vdd_ok && others_ok {
+            return Ok(());
+        }
+        tracing::info!(
+            "display layout: {} virtual screen(s) from (0,0){}",
+            mine.len(),
+            if physical_off { format!(", {} physical display(s) off", others.len()) } else { ", physical displays to the right".into() }
+        );
+        dc::apply(&paths, &modes, true)?;
+        std::thread::sleep(Duration::from_millis(300 * (attempt + 1)));
+    }
+    let cfg = Config::query(false)?;
+    if physical_off && cfg.active().any(|p| !luid_eq(p.targetInfo.adapterId, luid)) {
+        anyhow::bail!("物理显示器关不掉（Windows 一直把它重新打开）");
+    }
+    Ok(())
+}
+
+fn source_idx(p: &DISPLAYCONFIG_PATH_INFO) -> usize {
+    unsafe { p.sourceInfo.Anonymous.modeInfoIdx as usize }
+}
+
+/// Put these sources in a row starting at `x0`, y = 0. Returns whether they
+/// already were there, and the x after the last one.
+fn place(paths: &[DISPLAYCONFIG_PATH_INFO], modes: &mut [DISPLAYCONFIG_MODE_INFO], x0: i32) -> (bool, i32) {
+    let (mut ok, mut x) = (true, x0);
+    let mut done: Vec<usize> = Vec::new();
+    for p in paths {
+        let i = source_idx(p);
+        if i >= modes.len() || done.contains(&i) {
+            continue;
+        }
+        done.push(i);
+        let m = unsafe { &mut modes[i].Anonymous.sourceMode };
+        if m.position.x != x || m.position.y != 0 {
+            ok = false;
+            m.position.x = x;
+            m.position.y = 0;
+        }
+        x += m.width as i32;
+    }
+    (ok, x)
+}
+
+/// Move these sources (keeping their arrangement) so they start at `x0`, top 0.
+fn shift_right(paths: &[DISPLAYCONFIG_PATH_INFO], modes: &mut [DISPLAYCONFIG_MODE_INFO], x0: i32) -> bool {
+    let mut idx: Vec<usize> = paths.iter().map(source_idx).filter(|&i| i < modes.len()).collect();
+    idx.sort();
+    idx.dedup();
+    if idx.is_empty() {
+        return true;
+    }
+    let pos = |m: &DISPLAYCONFIG_MODE_INFO| unsafe { m.Anonymous.sourceMode.position };
+    let min_x = idx.iter().map(|&i| pos(&modes[i]).x).min().unwrap();
+    let min_y = idx.iter().map(|&i| pos(&modes[i]).y).min().unwrap();
+    if min_x == x0 && min_y == 0 {
+        return true;
+    }
+    for &i in &idx {
+        let p = unsafe { &mut modes[i].Anonymous.sourceMode.position };
+        p.x = p.x - min_x + x0;
+        p.y -= min_y;
+    }
+    false
 }
 
 /// Device and display-path state, for the log and `vdd-test`.
@@ -372,143 +589,71 @@ fn print_driver_log() {
 /// The most useful hint from [`describe_state`] for the client.
 fn summary(state: &str) -> String {
     let dev = devnode::states(VDD_HWID);
-    if let Some(d) = dev.iter().find(|d| d.problem == 14) {
-        let _ = d;
+    if dev.iter().any(|d| d.problem == 14) {
         return "被控端需要重启电脑后才能使用虚拟显示器".into();
     }
     if let Some(d) = dev.iter().find(|d| !d.started) {
         return format!("驱动状态：{}", devnode::problem_text(d.problem));
     }
     if state.contains("<- 虚拟显示器") {
-        "驱动已运行但没有创建显示器，请在被控端运行 nya-server-svc vdd-test 查看详情".into()
+        "驱动已运行但没有创建显示器，请在被控端运行 nya-server-svc vdd-test --driver-log 查看详情".into()
     } else {
         "没有找到驱动对应的显卡，请在被控端运行 nya-server-svc vdd-test 查看详情".into()
     }
 }
 
-/// `nya-server-svc vdd-test`: create the virtual display, show what happened,
-/// keep it for `hold`, then remove it.
-pub fn self_test(private: bool, hold: Duration, driver_log: bool) -> Result<()> {
+/// `nya-server-svc vdd-test`: create virtual screens, show what happened,
+/// keep them for `hold`, then remove them.
+pub fn self_test(screens: usize, physical_off: bool, hold: Duration, driver_log: bool) -> Result<()> {
     if !crate::winutil::is_elevated() {
         anyhow::bail!("需要管理员权限：请右键“以管理员身份运行”终端后再执行");
     }
     DRIVER_LOG.store(driver_log, std::sync::atomic::Ordering::Relaxed);
     let instance = devnode::instance_ids(VDD_HWID).into_iter().next().unwrap_or_default();
     println!("== 启用前\n{}", describe_state(&instance));
-    let want = Want { private, width: 1920, height: 1080, hz: 60, scale: 0 };
-    let res = VirtualDisplay::open(want);
+    let screen = Screen { width: 1920, height: 1080, hz: 60, scale: 0 };
+    let setup = Setup { screens: vec![screen; screens.clamp(1, MAX_SCREENS)], physical_off, block_input: false };
+    let res = HostDisplays::open(setup);
     println!("== 启用后\n{}", describe_state(&instance));
     if driver_log {
         print_driver_log();
     }
-    let vd = res?;
-    println!("虚拟显示器 {} 已创建，{} 秒后移除…", vd.gdi_name, hold.as_secs());
+    let d = res?;
+    println!("虚拟显示器 {:?} 已创建，{} 秒后移除…", d.gdi_names(), hold.as_secs());
     if let Ok(t) = nya_win::topology::Topology::enumerate() {
         for o in &t.outputs {
-            println!("  DXGI 输出 {} {}x{} 主={}", o.device_name, o.width(), o.height(), o.primary);
+            println!("  DXGI 输出 {} {}x{} @({},{}) 主={}", o.device_name, o.width(), o.height(), o.left, o.top, o.primary);
         }
     }
     std::thread::sleep(hold);
-    drop(vd);
+    drop(d);
     println!("已移除，显示器布局已恢复");
     Ok(())
 }
 
-fn vdd_gdi_name(luid: LUID) -> Option<String> {
-    let cfg = Config::query(false).ok()?;
-    let found = cfg.active().find(|p| luid_eq(p.targetInfo.adapterId, luid)).and_then(dc::source_gdi_name);
-    found
-}
-
-fn same_path(a: &DISPLAYCONFIG_PATH_INFO, b: &DISPLAYCONFIG_PATH_INFO) -> bool {
-    luid_eq(a.targetInfo.adapterId, b.targetInfo.adapterId)
-        && a.targetInfo.id == b.targetInfo.id
-        && luid_eq(a.sourceInfo.adapterId, b.sourceInfo.adapterId)
-        && a.sourceInfo.id == b.sourceInfo.id
-}
-
-/// Make the virtual display active; in privacy mode, the only active display.
-fn activate(luid: LUID, private: bool) -> Result<()> {
-    let all = Config::query(true)?;
-    let on_vdd = |p: &DISPLAYCONFIG_PATH_INFO| luid_eq(p.targetInfo.adapterId, luid);
-    let mut paths: Vec<_> = all.active().copied().collect();
-    if !paths.iter().any(on_vdd) {
-        let used: Vec<u32> = paths.iter().filter(|p| luid_eq(p.sourceInfo.adapterId, luid)).map(|p| p.sourceInfo.id).collect();
-        let mut p = *all
-            .paths
-            .iter()
-            .find(|p| on_vdd(p) && p.targetInfo.targetAvailable.as_bool() && !used.contains(&p.sourceInfo.id))
-            .ok_or_else(|| anyhow!("no usable path to the virtual display"))?;
-        p.flags |= PATH_ACTIVE;
-        p.sourceInfo.Anonymous.modeInfoIdx = MODE_IDX_INVALID;
-        p.targetInfo.Anonymous.modeInfoIdx = MODE_IDX_INVALID;
-        paths.push(p);
-    }
-    if private {
-        paths.retain(|p| on_vdd(p));
-    }
-    let unchanged = paths.len() == all.active().count() && all.active().all(|a| paths.iter().any(|p| same_path(p, a)));
-    if unchanged {
-        return Ok(());
-    }
-    tracing::info!("display layout: {} active path(s) -> {}", all.active().count(), paths.len());
-    dc::apply(&paths, &all.modes)
-}
-
-/// Extended mode: the virtual display at (0, 0), which makes it primary, and
-/// the physical displays to its right in their existing arrangement.
-fn arrange(luid: LUID) -> Result<()> {
-    let cfg = Config::query(false)?;
-    let mut modes = cfg.modes.clone();
-    let src_idx = |p: &DISPLAYCONFIG_PATH_INFO| unsafe { p.sourceInfo.Anonymous.modeInfoIdx } as usize;
-    let vdd = cfg.active().find(|p| luid_eq(p.targetInfo.adapterId, luid)).ok_or_else(|| anyhow!("virtual display not active"))?;
-    let (vw, _, vx, vy) = cfg.source_mode(vdd).ok_or_else(|| anyhow!("no source mode"))?;
-    let mut others: Vec<usize> = cfg.active().filter(|p| !luid_eq(p.targetInfo.adapterId, luid)).map(src_idx).collect();
-    others.sort();
-    others.dedup();
-    let others: Vec<usize> = others.into_iter().filter(|&i| i != src_idx(vdd) && i < modes.len()).collect();
-    let pos = |m: &DISPLAYCONFIG_MODE_INFO| unsafe { m.Anonymous.sourceMode.position };
-    let min_x = others.iter().map(|&i| pos(&modes[i]).x).min().unwrap_or(0);
-    let min_y = others.iter().map(|&i| pos(&modes[i]).y).min().unwrap_or(0);
-    let done = vx == 0 && vy == 0 && (others.is_empty() || (min_x == vw as i32 && min_y == 0));
-    if done {
-        return Ok(());
-    }
-    unsafe {
-        let v = &mut modes[src_idx(vdd)].Anonymous.sourceMode.position;
-        v.x = 0;
-        v.y = 0;
-        for &i in &others {
-            let p = &mut modes[i].Anonymous.sourceMode.position;
-            p.x = p.x - min_x + vw as i32;
-            p.y -= min_y;
+/// Refresh rates offered for every resolution: 60 Hz and what the screens use.
+fn rates(screens: &[Screen]) -> Vec<u32> {
+    let mut v = vec![60];
+    for s in screens {
+        if !v.contains(&s.hz) && v.len() < 3 {
+            v.push(s.hz);
         }
     }
-    dc::apply(&cfg.paths, &modes)
-}
-
-/// Refresh rates offered for every resolution: 60 Hz and the client's.
-fn rates(hz: u32) -> Vec<u32> {
-    if hz == 60 {
-        vec![60]
-    } else {
-        vec![60, hz]
-    }
+    v
 }
 
 /// The driver's settings. No global refresh rates: the driver multiplies them
 /// with every resolution (on top of each resolution's own rate), which
 /// quickly exceeds what it can report. Instead one entry per resolution and
 /// rate, at most [`MAX_MODES`].
-fn settings_xml(sizes: &[(u32, u32)], hz: u32) -> String {
-    let rates = rates(hz);
-    let mut x = String::from(
-        "<?xml version='1.0' encoding='utf-8'?>\n<!-- Written by NyaRemoteControl for each session; edits are overwritten. -->\n<vdd_settings>\n    <monitors>\n        <count>1</count>\n    </monitors>\n    <gpu>\n        <friendlyname>default</friendlyname>\n    </gpu>\n    <global>\n    </global>\n    <resolutions>\n",
+fn settings_xml(count: usize, sizes: &[(u32, u32)], rates: &[u32]) -> String {
+    let mut x = format!(
+        "<?xml version='1.0' encoding='utf-8'?>\n<!-- Written by NyaRemoteControl for each session; edits are overwritten. -->\n<vdd_settings>\n    <monitors>\n        <count>{count}</count>\n    </monitors>\n    <gpu>\n        <friendlyname>default</friendlyname>\n    </gpu>\n    <global>\n    </global>\n    <resolutions>\n"
     );
     // Session sizes first, so they survive the cap.
     let mut n = 0;
     'outer: for (w, h) in sizes.iter().rev().chain(COMMON.iter()) {
-        for r in &rates {
+        for r in rates {
             if n >= MAX_MODES {
                 break 'outer;
             }
@@ -525,10 +670,10 @@ fn settings_xml(sizes: &[(u32, u32)], hz: u32) -> String {
     x
 }
 
-/// Write the driver's settings; true if the file changed.
-fn write_settings(sizes: &[(u32, u32)], hz: u32) -> Result<bool> {
+/// Write the driver's settings; true if the file changed while the driver runs.
+fn write_settings(count: usize, sizes: &[(u32, u32)], rates: &[u32]) -> Result<bool> {
     let path = Path::new(VDD_SETTINGS_DIR).join("vdd_settings.xml");
-    let xml = settings_xml(sizes, hz);
+    let xml = settings_xml(count, sizes, rates);
     if std::fs::read_to_string(&path).is_ok_and(|old| old == xml) {
         return Ok(false);
     }
@@ -544,40 +689,61 @@ fn write_settings(sizes: &[(u32, u32)], hz: u32) -> Result<bool> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn want_from_request() {
-        assert_eq!(Want::from_pb(None), None);
-        assert_eq!(Want::from_pb(Some(&pb::VirtualDisplay::default())), None);
-        let w = Want::from_pb(Some(&pb::VirtualDisplay {
-            mode: pb::DisplayMode::Private as i32,
-            width: 1917,
-            height: 1043,
-            refresh_hz: 0,
-            scale_percent: 150,
-        }))
-        .unwrap();
-        assert_eq!((w.private, w.width, w.height, w.hz, w.scale), (true, 1916, 1042, 60, 150));
-        let w = Want::from_pb(Some(&pb::VirtualDisplay { mode: pb::DisplayMode::Virtual as i32, width: 100, ..Default::default() })).unwrap();
-        assert_eq!((w.private, w.width, w.height), (false, 1920, 1080));
+    fn screen(w: u32, h: u32) -> pb::VirtualScreen {
+        pb::VirtualScreen { width: w, height: h, ..Default::default() }
     }
 
     #[test]
-    fn xml_lists_requested_sizes_and_rate() {
-        let x = settings_xml(&[(1916, 1042)], 144);
+    fn setup_from_request() {
+        assert!(Setup::from_pb(None).is_default());
+        assert!(Setup::from_pb(Some(&pb::DisplaySetup::default())).is_default());
+        // Physical displays can't be switched off without a virtual screen.
+        let s = Setup::from_pb(Some(&pb::DisplaySetup { physical_off: true, ..Default::default() }));
+        assert!(s.is_default() && !s.physical_off);
+        let s = Setup::from_pb(Some(&pb::DisplaySetup {
+            virtual_screens: vec![
+                pb::VirtualScreen { width: 1917, height: 1043, refresh_hz: 0, scale_percent: 150 },
+                screen(100, 100),
+            ],
+            physical_off: true,
+            block_local_input: true,
+        }));
+        assert_eq!(s.screens[0], Screen { width: 1916, height: 1042, hz: 60, scale: 150 });
+        assert_eq!((s.screens[1].width, s.screens[1].height), (1920, 1080));
+        assert!(s.physical_off && s.block_input);
+        let many = Setup::from_pb(Some(&pb::DisplaySetup { virtual_screens: vec![screen(0, 0); 9], ..Default::default() }));
+        assert_eq!(many.screens.len(), MAX_SCREENS);
+        // Blocking input alone is a real setup (no virtual screen).
+        let b = Setup::from_pb(Some(&pb::DisplaySetup { block_local_input: true, ..Default::default() }));
+        assert!(!b.is_default() && b.screens.is_empty());
+    }
+
+    #[test]
+    fn xml_lists_count_sizes_and_rates() {
+        let x = settings_xml(2, &[(1916, 1042)], &[60, 144]);
+        assert!(x.contains("<count>2</count>"));
         assert!(x.contains("<width>1916</width>\n            <height>1042</height>\n            <refresh_rate>60</refresh_rate>"));
         assert!(x.contains("<width>1916</width>\n            <height>1042</height>\n            <refresh_rate>144</refresh_rate>"));
         assert!(x.contains("<width>3840</width>"));
         assert!(!x.contains("<g_refresh_rate>"));
         assert_eq!(x.matches("<resolution>").count(), (COMMON.len() + 1) * 2);
-        let x = settings_xml(&[], 60);
+        let x = settings_xml(1, &[], &[60]);
         assert_eq!(x.matches("<resolution>").count(), COMMON.len());
+    }
+
+    #[test]
+    fn rates_are_few() {
+        let s = |hz| Screen { width: 1920, height: 1080, hz, scale: 0 };
+        assert_eq!(rates(&[s(60)]), vec![60]);
+        assert_eq!(rates(&[s(144), s(144)]), vec![60, 144]);
+        assert_eq!(rates(&[s(144), s(165), s(240)]), vec![60, 144, 165]);
     }
 
     /// Worst case stays under the driver's limit (it failed at 108, worked at 96).
     #[test]
     fn mode_count_is_capped() {
         let extra: Vec<(u32, u32)> = (0..MAX_EXTRA as u32).map(|i| (1000 + 8 * i, 700)).collect();
-        let x = settings_xml(&extra, 144);
+        let x = settings_xml(4, &extra, &[60, 144, 165]);
         assert!(x.matches("<resolution>").count() <= MAX_MODES);
         // Session sizes are never the ones cut.
         assert!(x.contains(&format!("<width>{}</width>", 1000 + 8 * (MAX_EXTRA as u32 - 1))));
