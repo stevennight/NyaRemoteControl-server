@@ -120,3 +120,21 @@ fn install_vdd(zip: &Path) -> Result<Installed> {
     }
     Ok(Installed { reboot, note: "已安装为禁用状态，远程会话需要时自动启用".into() })
 }
+
+/// Playback device names that belong to a virtual cable (first match wins).
+pub const CABLE_NAMES: [&str; 2] = ["CABLE Input", "VB-Audio Virtual Cable"];
+
+/// VB-Cable's playback device, if installed (COM initialised on this thread).
+pub fn cable_device_name() -> Option<String> {
+    CABLE_NAMES.iter().find_map(|n| nya_win::audio::find_render_device(n).map(|(_, name)| name))
+}
+
+/// usbip-win2's command-line tool, if installed.
+pub fn usbip_exe() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let candidates = [
+        std::env::var_os("ProgramFiles").map(|p| PathBuf::from(p).join("USBip").join("usbip.exe")),
+        std::env::var_os("ProgramFiles").map(|p| PathBuf::from(p).join("usbip-win2").join("usbip.exe")),
+    ];
+    candidates.into_iter().flatten().find(|p| p.exists())
+}

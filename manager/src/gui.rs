@@ -7,7 +7,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
-use nya_transport::Identity;
 use nya_ui::egui::{self, Color32, RichText};
 use nya_ui::{Gui, Surface};
 use nya_win::d3d::D3dDevice;
@@ -20,10 +19,12 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowId};
 
-use crate::auth::{load_or_create_key, AuthStore, PairedClient};
-use crate::config::ServerConfig;
-use crate::service::SERVICE_NAME;
-use crate::{components, install, paths, winutil};
+use nya_server_core::auth::PairedClient;
+use nya_server_core::backend::Backend;
+use nya_server_core::control_pb::{self as cpb, event::Kind};
+use nya_server_core::config::{ServerConfig, ENCODERS};
+use nya_server_core::SERVICE_NAME;
+use nya_server_core::{components, install, paths, win as winutil};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -53,16 +54,24 @@ fn service_exists(name: &str) -> bool {
         .is_ok()
 }
 
+/// Is the (driver) service loaded? The host itself checks by connecting to it.
+fn service_running(name: &str) -> bool {
+    ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .and_then(|m| m.open_service(name, ServiceAccess::QUERY_STATUS))
+        .and_then(|s| s.query_status())
+        .is_ok_and(|s| s.current_state == ServiceState::Running)
+}
+
 /// Detect optional components (COM is initialised on the calling thread).
 fn detect_components() -> Vec<Component> {
     nya_win::com_init();
-    let cable = crate::host::mic_cable_name();
+    let cable = components::cable_device_name();
     let vdd_active = nya_win::topology::Topology::enumerate()
         .ok()
         .and_then(|t| t.adapters.iter().find(|a| a.name.to_lowercase().contains("virtual display")).map(|a| a.name.clone()));
     let vdd_installed = vdd_active.is_some() || nya_win::devnode::exists(components::VDD_HWID);
     let vdd = vdd_active.or_else(|| vdd_installed.then(|| "已安装（未启用）".to_owned()));
-    let usbip = crate::usb::usbip_exe().map(|p| p.display().to_string());
+    let usbip = components::usbip_exe().map(|p| p.display().to_string());
     vec![
         Component {
             id: components::Id::Cable,
@@ -70,7 +79,7 @@ fn detect_components() -> Vec<Component> {
             purpose: "接收客户端麦克风：客户端工具条打开“麦克风”，被控端软件选择“CABLE Output”作为麦克风",
             installed: cable.is_some(),
             status: cable.map(|n| {
-                if crate::host::mic_cable_name().is_some() && nya_win::audio::default_render_is("CABLE") {
+                if components::cable_device_name().is_some() && nya_win::audio::default_render_is("CABLE") {
                     format!("{n}（注意：它现在是默认播放设备，本机会听不到声音，建议在声音设置里把默认播放设备改回扬声器）")
                 } else {
                     n
@@ -95,7 +104,7 @@ fn detect_components() -> Vec<Component> {
             name: "ViGEmBus",
             purpose: "手柄：把客户端的手柄模拟成被控端的 Xbox 手柄",
             installed: service_exists("ViGEmBus"),
-            status: if crate::host::gamepad_available() { Some("驱动可用".into()) } else { None },
+            status: service_running("ViGEmBus").then(|| "驱动已加载".into()),
             ready: true,
             url: "https://github.com/nefarius/ViGEmBus/releases",
             note: "免费；作者已停止维护，但仍可用。客户端插上 Xbox/XInput 手柄即自动使用",
@@ -138,6 +147,12 @@ struct Model {
     tab: Tab,
     svc: SvcState,
     svc_checked: Instant,
+    /// The running service (control pipe) or, while it is stopped, its files.
+    /// `None` until (re)connected.
+    backend: Option<Backend>,
+    status: Option<cpb::Status>,
+    /// Does the installed service run this directory's nya-server-svc.exe?
+    points_here: Option<bool>,
     code: String,
     fingerprint: String,
     cfg: ServerConfig,
@@ -185,17 +200,26 @@ fn control_service(start: bool, stop: bool) -> Result<String> {
     })
 }
 
-/// Last `n` lines of the newest `<prefix>.*.log`.
-fn tail_log(dir: &Path, prefix: &str, n: usize) -> String {
-    let newest = std::fs::read_dir(dir.join("logs")).ok().and_then(|rd| {
-        rd.flatten()
-            .filter(|e| e.file_name().to_string_lossy().starts_with(&format!("{prefix}.")))
-            .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
-    });
-    let Some(entry) = newest else { return format!("没有 {prefix} 日志") };
-    let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
-    let lines: Vec<&str> = text.lines().collect();
-    lines[lines.len().saturating_sub(n)..].join("\n")
+/// Diagnostics run in `nya-server-svc.exe`, which has the capture / encoding
+/// stack; the report is saved to `out`.
+fn run_diag(out: &Path) -> Result<String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let exe = paths::service_exe()?;
+    if let Some(d) = out.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    let r = std::process::Command::new(&exe)
+        .arg("diag")
+        .arg("--out")
+        .arg(out)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| anyhow!("无法运行 {}：{e}", exe.display()))?;
+    if !r.status.success() {
+        return Err(anyhow!("诊断失败（{}）：{}", r.status, String::from_utf8_lossy(&r.stderr)));
+    }
+    Ok(std::fs::read_to_string(out)?)
 }
 
 impl Model {
@@ -208,6 +232,9 @@ impl Model {
             tab: Tab::Overview,
             svc: SvcState::Unknown,
             svc_checked: Instant::now() - Duration::from_secs(10),
+            backend: None,
+            status: None,
+            points_here: None,
             code: String::new(),
             fingerprint: String::new(),
             cfg: ServerConfig::default(),
@@ -225,35 +252,66 @@ impl Model {
             confirm_reset: false,
             confirm_uninstall: false,
         };
+        m.svc = service_state();
         m.reload();
         m
     }
 
-    /// Re-read pairing data, config and clients from the service directory.
+    /// Run `f` on the backend, connecting first if needed. A failure drops
+    /// the connection so the next call reconnects (the service may have restarted).
+    fn with_backend<T>(&mut self, f: impl FnOnce(&mut Backend) -> Result<T>) -> Result<T> {
+        if self.backend.is_none() {
+            self.backend = Some(Backend::service("nya-server gui")?);
+        }
+        let r = f(self.backend.as_mut().unwrap());
+        if r.is_err() {
+            self.backend = None;
+        }
+        r
+    }
+
+    fn live(&self) -> bool {
+        self.backend.as_ref().is_some_and(|b| b.is_live())
+    }
+
+    /// Re-read pairing data, settings, clients and the log from the service
+    /// (or its files while it is stopped).
     fn reload(&mut self) {
         if !self.elevated {
             return;
         }
-        let _ = std::fs::create_dir_all(&self.dir);
-        match load_or_create_key(&self.dir, false) {
-            Ok(k) => self.code = k.to_code(),
+        self.backend = None;
+        self.points_here = install::service_points_here();
+        match self.with_backend(|b| b.pairing()) {
+            Ok(p) => {
+                self.code = p.code;
+                self.fingerprint = p.fingerprint;
+            }
             Err(e) => self.message = Some((true, format!("读取配对码失败：{e:#}"))),
         }
-        if let Ok(id) = Identity::load_or_create(&self.dir) {
-            self.fingerprint = id.fingerprint().to_string();
-        }
-        if let Ok(c) = ServerConfig::load_or_create(&self.dir) {
+        if let Ok(c) = self.with_backend(|b| b.config()) {
             self.cfg = c;
             self.cfg_dirty = false;
         }
-        self.clients = AuthStore::list(&self.dir);
-        self.log_text = tail_log(&self.dir, self.log_name, 200);
+        self.clients = self.with_backend(|b| b.clients()).unwrap_or_default();
+        self.refresh_log();
+        self.refresh_status();
+    }
+
+    fn refresh_status(&mut self) {
+        self.status = self.with_backend(|b| b.status()).ok().flatten();
+    }
+
+    fn refresh_log(&mut self) {
+        let name = self.log_name;
+        self.log_text = self.with_backend(|b| b.tail_log(name, 300)).unwrap_or_else(|e| format!("{e:#}"));
     }
 
     fn run_job(&mut self, job: Job, label: &'static str) {
         let (tx, rx) = mpsc::channel();
         self.busy = Some(label);
         self.job_rx = Some(rx);
+        let diag_out = self.dir.join("logs").join("nya-diag.txt");
         std::thread::spawn(move || {
             let r = match job {
                 Job::Install => install::install(None),
@@ -261,7 +319,7 @@ impl Model {
                 Job::Start => control_service(true, false),
                 Job::Stop => control_service(false, true),
                 Job::Restart => control_service(true, true),
-                Job::Diag => Ok(crate::diag::collect()),
+                Job::Diag => run_diag(&diag_out),
             };
             let _ = tx.send(r.map_err(|e| format!("{e:#}")));
         });
@@ -279,15 +337,27 @@ impl Model {
                 Err(e) => self.message = Some((true, e)),
             }
             self.svc_checked = Instant::now() - Duration::from_secs(10);
-            self.reload();
+            if !was_diag {
+                // The service was (un)installed / started / stopped.
+                self.reload();
+            }
         }
     }
 
     fn ui(&mut self, ctx: &egui::Context) {
         self.poll_job();
-        if self.svc_checked.elapsed() > Duration::from_secs(2) {
+        if self.svc_checked.elapsed() > Duration::from_secs(1) {
+            let before = self.svc;
             self.svc = service_state();
             self.svc_checked = Instant::now();
+            if self.elevated && self.busy.is_none() {
+                // Started / stopped: switch between the pipe and the files.
+                if before != self.svc || (self.svc == SvcState::Running && !self.live()) {
+                    self.reload();
+                } else {
+                    self.refresh_status();
+                }
+            }
         }
 
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
@@ -355,16 +425,17 @@ impl Model {
         if self.busy.is_some() || self.install_job.as_ref().is_some_and(|j| !j.lock().unwrap().done) {
             ctx.request_repaint_after(Duration::from_millis(200));
         } else {
-            ctx.request_repaint_after(Duration::from_secs(2));
+            ctx.request_repaint_after(Duration::from_secs(1));
         }
     }
 
     fn overview(&mut self, ui: &mut egui::Ui) {
+        let warn = Color32::from_rgb(255, 180, 90);
         ui.label(RichText::new("服务").strong());
         ui.horizontal(|ui| {
             let (text, color) = match self.svc {
                 SvcState::Running => ("运行中", Color32::LIGHT_GREEN),
-                SvcState::Stopped => ("已停止", Color32::from_rgb(255, 180, 90)),
+                SvcState::Stopped => ("已停止", warn),
                 SvcState::Pending => ("正在切换…", Color32::LIGHT_BLUE),
                 SvcState::NotInstalled => ("未安装", Color32::GRAY),
                 SvcState::Unknown => ("未知", Color32::GRAY),
@@ -411,10 +482,65 @@ impl Model {
                 }
             });
         }
-        ui.label(
-            RichText::new(format!("端口 UDP {}  ·  程序 {}", self.cfg.port, std::env::current_exe().unwrap_or_default().display()))
-                .weak(),
-        );
+        if self.points_here == Some(false) {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("已安装的服务用的不是本目录的 nya-server-svc.exe（程序被移动过，或服务由旧版本安装）。")
+                        .color(warn),
+                );
+                if ui.button("重新安装服务").clicked() {
+                    self.run_job(Job::Install, "正在重新安装服务");
+                }
+            });
+        } else if self.svc == SvcState::Running && !self.live() {
+            ui.label(RichText::new("服务在运行，但连不上它的控制通道（服务版本较旧？）：请重新安装服务。").color(warn));
+        }
+        match &self.status {
+            Some(s) if s.listen.is_empty() => {
+                ui.label(RichText::new(format!("没有在监听：{}", s.listen_error)).color(Color32::from_rgb(255, 120, 110)));
+            }
+            Some(s) => {
+                let host = s.host.clone().unwrap_or_default();
+                let helper = if host.running { format!("采集进程运行中（会话 {}）", host.console_session) } else { "采集进程未运行".into() };
+                ui.label(RichText::new(format!("UDP {}  ·  {helper}  ·  版本 {}", s.listen, s.server_version)).weak());
+            }
+            None => {
+                ui.label(RichText::new(format!("端口 UDP {}", self.cfg.port)).weak());
+            }
+        }
+
+        ui.add_space(16.0);
+        ui.label(RichText::new("当前连接").strong());
+        let session = self.status.as_ref().and_then(|s| s.session.clone());
+        match session {
+            Some(c) => {
+                let stream = self.status.as_ref().and_then(|s| s.host.as_ref()).map(|h| h.stream.clone()).unwrap_or_default();
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&c.client_name).strong().color(Color32::LIGHT_GREEN));
+                    ui.label(
+                        RichText::new(format!("{}  ·  {}  ·  {} 起", c.client_version, c.remote_addr, crate::format_unix(c.since_unix)))
+                            .weak(),
+                    );
+                    if ui.button("断开").clicked() {
+                        let r = self.with_backend(|b| b.disconnect("被控端管理员断开了连接"));
+                        self.message = Some(match r {
+                            Ok(m) => (false, m),
+                            Err(e) => (true, format!("{e:#}")),
+                        });
+                        self.refresh_status();
+                    }
+                });
+                if !stream.is_empty() {
+                    ui.label(RichText::new(format!("画面：{stream}")).weak());
+                }
+            }
+            None if self.live() => {
+                ui.label(RichText::new("无").weak());
+            }
+            None => {
+                ui.label(RichText::new("服务运行后显示").weak());
+            }
+        }
 
         ui.add_space(16.0);
         ui.label(RichText::new("配对码").strong());
@@ -433,10 +559,11 @@ impl Model {
                 ui.label("旧配对码将失效（已配对的客户端不受影响）。继续？");
                 if ui.button("重新生成").clicked() {
                     self.confirm_reset = false;
-                    match load_or_create_key(&self.dir, true) {
-                        Ok(k) => {
-                            self.code = k.to_code();
-                            self.message = Some((false, "已生成新配对码；重启服务后生效".into()));
+                    match self.with_backend(|b| b.reset_pairing_code()) {
+                        Ok(p) => {
+                            self.code = p.code;
+                            let when = if self.live() { "已生效" } else { "服务启动后生效" };
+                            self.message = Some((false, format!("已生成新配对码，{when}")));
                         }
                         Err(e) => self.message = Some((true, format!("{e:#}"))),
                     }
@@ -453,18 +580,23 @@ impl Model {
         ui.label(RichText::new("客户端提示“证书已变化”时，用这里核对。").weak());
 
         ui.add_space(16.0);
-        ui.label(RichText::new("最近的连接").strong());
-        let recent: Vec<String> = tail_log(&self.dir, "service", 400)
-            .lines()
-            .filter(|l| l.contains("client ") || l.contains("paired") || l.contains("session ended") || l.contains("bye"))
-            .map(|l| l.chars().take(160).collect())
-            .collect();
-        egui::ScrollArea::vertical().max_height(160.0).id_salt("recent").show(ui, |ui| {
+        ui.label(RichText::new("最近事件").strong());
+        let recent = self.status.as_ref().map(|s| s.recent.clone()).unwrap_or_default();
+        let live = self.live();
+        egui::ScrollArea::vertical().max_height(180.0).id_salt("recent").show(ui, |ui| {
             if recent.is_empty() {
-                ui.label(RichText::new("暂无").weak());
+                ui.label(RichText::new(if live { "暂无" } else { "服务运行后显示（更早的记录见“日志”）" }).weak());
             }
-            for l in recent.iter().rev().take(12) {
-                ui.label(RichText::new(l).monospace().small());
+            for e in recent.iter().rev().take(30) {
+                let color = match Kind::try_from(e.kind).unwrap_or(Kind::Other) {
+                    Kind::Connected | Kind::Paired => Color32::LIGHT_GREEN,
+                    Kind::PairingFailed | Kind::Rejected => Color32::from_rgb(255, 150, 120),
+                    _ => ui.visuals().text_color(),
+                };
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(crate::format_unix(e.unix)).monospace().small().weak());
+                    ui.label(RichText::new(&e.text).small().color(color));
+                });
             }
         });
     }
@@ -490,7 +622,7 @@ impl Model {
 
             ui.label("编码器");
             egui::ComboBox::from_id_salt("enc").selected_text(c.encoder.clone()).show_ui(ui, |ui| {
-                for e in ["auto", "nvenc", "qsv", "amf", "software"] {
+                for e in ENCODERS {
                     ui.selectable_value(&mut c.encoder, e.to_string(), e);
                 }
             });
@@ -524,21 +656,24 @@ impl Model {
             self.cfg_dirty = true;
         }
         ui.add_space(12.0);
+        ui.label(
+            RichText::new(if self.live() {
+                "保存后立即生效：画面相关的设置会让采集进程重启一下，改端口或监听地址会断开当前连接。"
+            } else {
+                "服务没有运行：保存到配置文件，服务启动时生效。"
+            })
+            .weak(),
+        );
         ui.horizontal(|ui| {
             if ui.add_enabled(self.cfg_dirty, egui::Button::new("保存")).clicked() {
-                match toml::to_string_pretty(&self.cfg).map_err(|e| anyhow!(e)).and_then(|t| {
-                    std::fs::write(self.dir.join("server.toml"), t)?;
-                    Ok(())
-                }) {
-                    Ok(()) => {
+                let cfg = self.cfg.clone();
+                match self.with_backend(|b| b.set_config(&cfg)) {
+                    Ok(msg) => {
                         self.cfg_dirty = false;
-                        self.message = Some((false, "已保存。重启服务后生效（端口变更需要重新安装以更新防火墙规则）".into()));
+                        self.message = Some((false, msg));
                     }
                     Err(e) => self.message = Some((true, format!("保存失败：{e:#}"))),
                 }
-            }
-            if self.svc == SvcState::Running && ui.button("重启服务").clicked() {
-                self.run_job(Job::Restart, "正在重启服务");
             }
             if ui.button("放弃修改").clicked() {
                 self.reload();
@@ -547,7 +682,7 @@ impl Model {
     }
 
     fn clients_tab(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("已配对的客户端可以免配对码直接连接。移除后需要重新配对。").weak());
+        ui.label(RichText::new("已配对的客户端可以免配对码直接连接。移除后需要重新配对；正在连接的会被断开。").weak());
         ui.add_space(8.0);
         if self.clients.is_empty() {
             ui.label(RichText::new("没有已配对的客户端").weak());
@@ -565,13 +700,12 @@ impl Model {
             }
         });
         if let Some(i) = remove {
-            let mut list = self.clients.clone();
-            let c = list.remove(i);
-            match AuthStore::save_list(&self.dir, list) {
-                Ok(()) => self.message = Some((false, format!("已移除 {}", c.name))),
-                Err(e) => self.message = Some((true, format!("{e:#}"))),
-            }
-            self.clients = AuthStore::list(&self.dir);
+            let fp = self.clients[i].fingerprint.clone();
+            self.message = Some(match self.with_backend(|b| b.remove_client(&fp)) {
+                Ok(m) => (false, m),
+                Err(e) => (true, format!("{e:#}")),
+            });
+            self.clients = self.with_backend(|b| b.clients()).unwrap_or_default();
         }
     }
 
@@ -584,12 +718,8 @@ impl Model {
                 if ui.button("复制结果").clicked() {
                     ui.ctx().copy_text(self.diag_text.clone());
                 }
-                if ui.button("保存到日志目录").clicked() {
-                    let p = self.dir.join("logs").join("nya-diag.txt");
-                    match std::fs::write(&p, &self.diag_text) {
-                        Ok(()) => self.message = Some((false, format!("已保存 {}", p.display()))),
-                        Err(e) => self.message = Some((true, format!("{e}"))),
-                    }
+                if ui.button("打开所在目录").on_hover_text("结果保存在日志目录的 nya-diag.txt").clicked() {
+                    let _ = std::process::Command::new("explorer").arg(self.dir.join("logs")).spawn();
                 }
             }
         });
@@ -702,14 +832,14 @@ impl Model {
 
     fn logs(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            for (name, label) in [("service", "服务"), ("helper", "采集进程"), ("standalone", "开发模式")] {
+            for (name, label) in [("service", "服务"), ("helper", "采集进程"), ("gui", "管理界面"), ("standalone", "开发模式")] {
                 if ui.selectable_label(self.log_name == name, label).clicked() {
                     self.log_name = name;
-                    self.log_text = tail_log(&self.dir, name, 200);
+                    self.refresh_log();
                 }
             }
             if ui.button("刷新").clicked() {
-                self.log_text = tail_log(&self.dir, self.log_name, 200);
+                self.refresh_log();
             }
             if ui.button("打开日志目录").clicked() {
                 let _ = std::process::Command::new("explorer").arg(self.dir.join("logs")).spawn();
@@ -763,7 +893,7 @@ impl ApplicationHandler for App {
         let window = match el.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => {
-                crate::fatal(&format!("无法创建窗口：{e}"));
+                nya_server_core::fatal(&format!("无法创建窗口：{e}"));
                 el.exit();
                 return;
             }
@@ -783,7 +913,7 @@ impl ApplicationHandler for App {
                 self.gui = Some(g);
             }
             Err(e) => {
-                crate::fatal(&format!("无法初始化界面：{e:#}"));
+                nya_server_core::fatal(&format!("无法初始化界面：{e:#}"));
                 el.exit();
                 return;
             }
@@ -840,7 +970,7 @@ pub fn run() -> Result<()> {
     if !winutil::is_elevated() && relaunch_elevated().is_ok() {
         return Ok(());
     }
-    let _log = crate::logging::init(&paths::service_dir(), "gui", false);
+    let _log = nya_server_core::logging::init(&paths::service_dir(), "gui", false);
     let el = EventLoop::new()?;
     let mut app = App { model: Model::new(), window: None, surface: None, gui: None };
     el.run_app(&mut app)?;

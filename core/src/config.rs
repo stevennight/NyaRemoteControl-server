@@ -1,7 +1,9 @@
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+
+pub const ENCODERS: [&str; 5] = ["auto", "nvenc", "qsv", "amf", "software"];
 
 /// `server.toml`
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,9 +57,40 @@ impl ServerConfig {
         Ok(cfg)
     }
 
+    pub fn save(&self, dir: &Path) -> Result<()> {
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(dir.join("server.toml"), toml::to_string_pretty(self)?).context("write server.toml")
+    }
+
+    /// Reject values the host cannot use (messages are shown to the user).
+    pub fn validate(&self) -> Result<()> {
+        if self.port < 1024 {
+            bail!("端口必须在 1024–65535 之间");
+        }
+        if self.bind.parse::<std::net::IpAddr>().is_err() {
+            bail!("监听地址 {:?} 不是有效的 IP 地址（:: 表示所有网卡）", self.bind);
+        }
+        if !ENCODERS.contains(&self.encoder.as_str()) {
+            bail!("未知编码器 {:?}（可选：{}）", self.encoder, ENCODERS.join(" / "));
+        }
+        if !(1..=1000).contains(&self.max_fps) {
+            bail!("最高帧率必须在 1–1000 之间");
+        }
+        if tracing_subscriber::EnvFilter::try_new(&self.log_level).is_err() {
+            bail!("日志级别 {:?} 无效", self.log_level);
+        }
+        Ok(())
+    }
+
+    /// Do the settings the host (helper) reads at startup differ?
+    pub fn host_part_differs(&self, o: &Self) -> bool {
+        (&self.name, &self.encoder, self.office_bitrate_kbps, self.game_bitrate_kbps, self.max_fps, self.audio)
+            != (&o.name, &o.encoder, o.office_bitrate_kbps, o.game_bitrate_kbps, o.max_fps, o.audio)
+    }
+
     pub fn display_name(&self) -> String {
         if self.name.is_empty() {
-            crate::winutil::computer_name()
+            crate::win::computer_name()
         } else {
             self.name.clone()
         }

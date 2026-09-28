@@ -1,30 +1,34 @@
+[workspace]
+# The host (this package, nya-server-svc.exe), what it shares with the
+# management program (core), and the management program itself (manager,
+# nya-server.exe). manager must never depend on this package: it would link
+# the capture / encoding stack and FFmpeg.
+members = [".", "core", "manager"]
+default-members = [".", "core", "manager"]
+resolver = "2"
+
 [package]
 name = "nya-server"
-description = "NyaRemoteControl host: Windows service, per-session helper and standalone mode"
+description = "NyaRemoteControl host: Windows service, per-session helper and standalone mode (nya-server-svc.exe)"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
 publish = false
 
 [dependencies]
+nya-server-core = { path = "core" }
 # Shared crates from the common repository. For CI / releases switch these to
 # `git = "<common repo url>", tag = "vX.Y.Z"` and keep a `[patch]` for local work.
 nya-proto = { path = "../common/crates/nya-proto" }
 nya-transport = { path = "../common/crates/nya-transport" }
 nya-media = { path = "../common/crates/nya-media" }
 nya-win = { path = "../common/crates/nya-win" }
-nya-ui = { path = "../common/crates/nya-ui" }
-winit = "0.30"
 
 anyhow = "1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-appender = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process"] }
 prost = "0.13"
 clap = { version = "4", features = ["derive"] }
-serde = { version = "1", features = ["derive"] }
-toml = "0.8"
 crossbeam-channel = "0.5"
 windows-service = "0.7"
 rand = "0.8"
@@ -47,6 +51,7 @@ features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Console",
+    "Win32_System_Pipes",
 ]
 
 [build-dependencies]

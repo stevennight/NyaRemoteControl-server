@@ -1,7 +1,6 @@
 //! `install` / `uninstall` / `pair` / `clients`.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
@@ -13,11 +12,11 @@ use windows_service::service::{
 };
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
-use crate::auth::{load_or_create_key, AuthStore};
+use crate::auth::load_or_create_key;
 use crate::config::ServerConfig;
 use crate::paths;
-use crate::service::{SERVICE_DISPLAY, SERVICE_NAME};
-use crate::winutil::is_elevated;
+use crate::{SERVICE_DISPLAY, SERVICE_NAME};
+use crate::win::is_elevated;
 
 fn run(cmd: &str, args: &[&str]) -> Result<()> {
     let out = Command::new(cmd).args(args).output().with_context(|| format!("run {cmd}"))?;
@@ -36,7 +35,10 @@ fn require_admin() -> Result<()> {
 
 pub fn install(port: Option<u16>) -> Result<String> {
     require_admin()?;
-    let exe = std::env::current_exe()?;
+    let exe = paths::service_exe()?;
+    if !exe.exists() {
+        bail!("找不到 {}：它应当和 nya-server.exe 放在同一个目录", exe.display());
+    }
     let dir = paths::service_dir();
     std::fs::create_dir_all(&dir)?;
     // Keys and pairing data: SYSTEM and Administrators only.
@@ -78,22 +80,7 @@ pub fn install(port: Option<u16>) -> Result<String> {
         ],
     )?;
 
-    let _ = run("netsh", &["advfirewall", "firewall", "delete", "rule", &format!("name={SERVICE_NAME}")]);
-    run(
-        "netsh",
-        &[
-            "advfirewall",
-            "firewall",
-            "add",
-            "rule",
-            &format!("name={SERVICE_NAME}"),
-            "dir=in",
-            "action=allow",
-            "protocol=UDP",
-            &format!("localport={}", cfg.port),
-            &format!("program={}", exe.display()),
-        ],
-    )?;
+    firewall_allow_program(cfg.port, &exe)?;
 
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
     let info = ServiceInfo {
@@ -141,9 +128,8 @@ pub fn install(port: Option<u16>) -> Result<String> {
     if migrated {
         out.push("已沿用开发模式的证书、配对码和已配对客户端，客户端无需重新配对。".into());
     }
-    out.push("注意：服务直接使用上面的程序路径，移动或删除该文件前请先卸载。".into());
-    Ok(out.join("
-"))
+    out.push("注意：服务直接使用上面的程序路径，移动程序目录前请先卸载。".into());
+    Ok(out.join("\n"))
 }
 
 /// First install after using standalone mode: reuse its certificate and
@@ -206,52 +192,47 @@ pub fn uninstall(purge: bool) -> Result<String> {
             out.push(format!("已删除数据目录 {}", dir.display()));
         }
     }
-    Ok(out.join("
-"))
+    Ok(out.join("\n"))
 }
 
-fn pick_dir(data_dir: Option<PathBuf>) -> Result<PathBuf> {
-    if let Some(d) = data_dir {
-        return Ok(d);
-    }
-    let svc = paths::service_dir();
-    if svc.join("pairing.key").exists() || svc.exists() {
-        if !is_elevated() {
-            bail!("服务的数据目录只有管理员能读取：请以管理员身份运行，或用 --data-dir 指定开发模式目录");
-        }
-        return Ok(svc);
-    }
-    Ok(paths::standalone_dir())
+/// (Re)create the inbound UDP rule for the service executable.
+fn firewall_allow_program(port: u16, exe: &std::path::Path) -> Result<()> {
+    let _ = run("netsh", &["advfirewall", "firewall", "delete", "rule", &format!("name={SERVICE_NAME}")]);
+    run(
+        "netsh",
+        &[
+            "advfirewall",
+            "firewall",
+            "add",
+            "rule",
+            &format!("name={SERVICE_NAME}"),
+            "dir=in",
+            "action=allow",
+            "protocol=UDP",
+            &format!("localport={port}"),
+            &format!("program={}", exe.display()),
+        ],
+    )
 }
 
-pub fn pair(data_dir: Option<PathBuf>, reset: bool) -> Result<()> {
-    let dir = pick_dir(data_dir)?;
-    let key = load_or_create_key(&dir, reset)?;
-    let id = Identity::load_or_create(&dir)?;
-    if reset {
-        println!("已重新生成配对码（服务会在下次连接时使用新配对码；已配对的客户端不受影响）");
-    }
-    println!("配对码：{}", key.to_code());
-    println!("证书指纹：{}", id.fingerprint());
-    println!("数据目录：{}", dir.display());
-    Ok(())
+/// Called by the running service (SYSTEM) when the port changes.
+pub fn firewall_allow(port: u16) -> Result<()> {
+    firewall_allow_program(port, &std::env::current_exe()?)
 }
 
-pub fn clients(data_dir: Option<PathBuf>, remove: Option<String>) -> Result<()> {
-    let dir = pick_dir(data_dir)?;
-    let mut list = AuthStore::list(&dir);
-    if let Some(prefix) = remove {
-        let prefix = prefix.to_ascii_lowercase().replace('-', "");
-        let before = list.len();
-        list.retain(|c| !c.fingerprint.starts_with(&prefix));
-        AuthStore::save_list(&dir, list.clone())?;
-        println!("已移除 {} 个客户端", before - list.len());
-    }
-    if list.is_empty() {
-        println!("没有已配对的客户端");
-    }
-    for c in &list {
-        println!("{}  {}  {}", &c.fingerprint[..16], c.name, c.paired_at);
-    }
-    Ok(())
+/// Is the installed service this directory's `nya-server-svc.exe`? `None`:
+/// not installed. `Some(false)` after the program was moved, or for services
+/// installed by versions that had a single executable — installing again fixes it.
+pub fn service_points_here() -> Option<bool> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).ok()?;
+    let s = manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_CONFIG).ok()?;
+    let cmd = s.query_config().ok()?.executable_path.to_string_lossy().to_lowercase();
+    let ours = paths::service_exe().ok()?.to_string_lossy().to_lowercase();
+    Some(cmd.contains(&ours))
+}
+
+/// Update the firewall rule of the installed service (management side, elevated).
+pub fn firewall_allow_service(port: u16) -> Result<()> {
+    require_admin()?;
+    firewall_allow_program(port, &paths::service_exe()?)
 }

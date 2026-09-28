@@ -1,0 +1,37 @@
+[package]
+name = "nya-server-core"
+description = "NyaRemoteControl host: what the service and the management program share (settings, pairing data, control protocol). No capture / encoding stack."
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+nya-proto = { path = "../../common/crates/nya-proto" }
+nya-transport = { path = "../../common/crates/nya-transport" }
+nya-win = { path = "../../common/crates/nya-win" }
+
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+prost = "0.13"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+windows-service = "0.7"
+
+[dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_Pipes",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[build-dependencies]
+prost-build = "0.13"
+protox = "0.7"

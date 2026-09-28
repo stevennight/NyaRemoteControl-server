@@ -18,10 +18,12 @@ use windows_service::{define_windows_service, service_dispatcher};
 
 use crate::auth::AuthStore;
 use crate::config::ServerConfig;
+use crate::control_pb::{event::Kind, Mode};
 use crate::host::{self, HostConfig};
 use crate::hub::Hub;
-use crate::ipc_pb::HostCommand;
-use crate::{ipc, net, paths, winutil};
+use crate::ipc_pb::{host_command::Cmd, HostCommand};
+use crate::state::State;
+use crate::{control, ipc, net, paths, winutil};
 
 pub const SERVICE_NAME: &str = "NyaRemoteControl";
 pub const SERVICE_DISPLAY: &str = "NyaRemoteControl 远程桌面";
@@ -39,56 +41,116 @@ async fn serve_all(dir: PathBuf, port: Option<u16>, mode: HostMode) -> Result<()
     let identity = Identity::load_or_create(&dir)?;
     let _ = net::SERVER_FP.set(identity.fingerprint());
     let auth = Arc::new(AuthStore::open(&dir)?);
-    let ip: IpAddr = cfg.bind.parse().with_context(|| format!("bind address {:?}", cfg.bind))?;
-    let bind = SocketAddr::new(ip, cfg.port);
     let (hub, cmd_rx) = Hub::new();
+    let pb_mode = match mode {
+        HostMode::InProcess => Mode::Standalone,
+        HostMode::Helper { .. } => Mode::Service,
+    };
+    let state = State::new(pb_mode, dir, cfg.clone(), identity.fingerprint().to_string(), auth.clone(), hub);
+    state.event(Kind::Service, format!("被控端已启动（版本 {}）", env!("CARGO_PKG_VERSION")));
+    tokio::spawn(control::serve(state.clone()));
 
     match mode {
         HostMode::InProcess => {
             println!("被控端已启动（开发模式），UDP 端口 {}", cfg.port);
             println!("配对码：{}", auth.key().to_code());
             println!("证书指纹：{}", identity.fingerprint());
-            tokio::spawn(run_in_process(hub.clone(), cmd_rx, HostConfig::from(&cfg)));
+            tokio::spawn(run_in_process(state.clone(), cmd_rx));
         }
         HostMode::Helper { session_changed } => {
-            tokio::spawn(helper_manager(hub.clone(), cmd_rx, session_changed));
+            tokio::spawn(helper_manager(state.clone(), cmd_rx, session_changed));
         }
     }
-    net::serve(net::NetConfig { bind, server_name: cfg.display_name() }, identity, auth, hub).await
+    listen(state, identity).await
+}
+
+/// Keep the network endpoint bound to the configured address; re-bind when
+/// the control pipe changes it. A bind failure is reported (status, event)
+/// and retried instead of stopping the service, so it can still be fixed
+/// from the management tools.
+async fn listen(state: Arc<State>, identity: Identity) -> Result<()> {
+    loop {
+        let cfg = state.config();
+        let bound = cfg
+            .bind
+            .parse::<IpAddr>()
+            .with_context(|| format!("监听地址 {:?} 无效", cfg.bind))
+            .and_then(|ip| nya_transport::endpoint::server_endpoint(SocketAddr::new(ip, cfg.port), &identity));
+        let endpoint = match bound {
+            Ok(ep) => ep,
+            Err(e) => {
+                let msg = format!("无法监听 UDP {}：{e:#}", cfg.port);
+                tracing::error!("{msg}");
+                state.set_listening(Err(msg.clone()));
+                state.event(Kind::Service, msg);
+                tokio::select! {
+                    _ = state.rebind.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+                }
+                continue;
+            }
+        };
+        state.set_listening(Ok(endpoint.local_addr().map(|a| a.to_string()).unwrap_or_default()));
+        tokio::select! {
+            r = net::serve_endpoint(endpoint.clone(), state.clone()) => return r,
+            _ = state.rebind.notified() => {
+                tracing::info!("listen address changed; re-binding");
+                endpoint.close(0u32.into(), "被控端的监听地址已更改".as_bytes());
+                let _ = tokio::time::timeout(Duration::from_secs(3), endpoint.wait_idle()).await;
+            }
+        }
+    }
 }
 
 pub async fn run_standalone(dir: PathBuf, port: Option<u16>) -> Result<()> {
     serve_all(dir, port, HostMode::InProcess).await
 }
 
-async fn run_in_process(hub: Arc<Hub>, mut commands: mpsc::UnboundedReceiver<HostCommand>, cfg: HostConfig) {
-    let (host_tx, host_rx) = mpsc::unbounded_channel();
-    let (ev_tx, mut ev_rx) = mpsc::channel(256);
-    std::thread::Builder::new()
-        .name("nya-host".into())
-        .spawn(move || host::run(host_rx, ev_tx, cfg))
-        .expect("spawn host");
-    hub.host_restarted();
+/// Standalone mode: the host runs on a thread of this process. It is
+/// restarted when the capture / encoding settings change.
+async fn run_in_process(state: Arc<State>, mut commands: mpsc::UnboundedReceiver<HostCommand>) {
+    let hub = state.hub.clone();
     loop {
-        tokio::select! {
-            c = commands.recv() => match c {
-                Some(c) => { let _ = host_tx.send(c); }
-                None => return,
-            },
-            e = ev_rx.recv() => match e {
-                Some(e) => hub.publish(e).await,
-                None => {
-                    tracing::error!("host stopped");
-                    return;
-                }
-            },
+        let cfg = HostConfig::from(&state.config());
+        let (host_tx, host_rx) = mpsc::unbounded_channel();
+        let (ev_tx, mut ev_rx) = mpsc::channel(256);
+        std::thread::Builder::new()
+            .name("nya-host".into())
+            .spawn(move || host::run(host_rx, ev_tx, cfg))
+            .expect("spawn host");
+        state.set_host(true, winutil::active_console_session().unwrap_or(0));
+        hub.host_restarted();
+        loop {
+            tokio::select! {
+                c = commands.recv() => match c {
+                    Some(c) => { let _ = host_tx.send(c); }
+                    None => return,
+                },
+                e = ev_rx.recv() => match e {
+                    Some(e) => hub.publish(e).await,
+                    None => {
+                        tracing::error!("host stopped");
+                        state.set_host(false, 0);
+                        return;
+                    }
+                },
+                _ = state.restart_host.notified() => break,
+            }
         }
+        tracing::info!("restarting host with new settings");
+        let _ = host_tx.send(HostCommand { cmd: Some(Cmd::Shutdown(Default::default())) });
+        drop(host_tx);
+        // The host threads block on a full event channel: drain until they are gone.
+        let _ = tokio::time::timeout(Duration::from_secs(5), async { while ev_rx.recv().await.is_some() {} }).await;
+        state.set_host(false, 0);
     }
 }
 
 /// Keep one helper running in the active console session; restart it when
-/// the session changes (logon, logoff, fast user switching) or it dies.
-async fn helper_manager(hub: Arc<Hub>, mut commands: mpsc::UnboundedReceiver<HostCommand>, session_changed: Arc<Notify>) {
+/// the session changes (logon, logoff, fast user switching), it dies, or the
+/// capture / encoding settings change.
+async fn helper_manager(state: Arc<State>, mut commands: mpsc::UnboundedReceiver<HostCommand>, session_changed: Arc<Notify>) {
+    let hub = state.hub.clone();
     let job = winutil::kill_on_close_job().map_err(|e| tracing::warn!("job object: {e:#}")).ok();
     let exe = std::env::current_exe().unwrap_or_default();
     loop {
@@ -124,6 +186,7 @@ async fn helper_manager(hub: Arc<Hub>, mut commands: mpsc::UnboundedReceiver<Hos
         // Drop commands meant for the previous helper (stale input must not replay).
         while commands.try_recv().is_ok() {}
         hub.host_restarted();
+        state.set_host(true, session);
         tracing::info!("helper connected (session {session})");
 
         {
@@ -148,9 +211,14 @@ async fn helper_manager(hub: Arc<Hub>, mut commands: mpsc::UnboundedReceiver<Hos
                             break;
                         }
                     }
+                    _ = state.restart_host.notified() => {
+                        tracing::info!("settings changed; restarting helper");
+                        break;
+                    }
                 }
             }
         }
+        state.set_host(false, 0);
         // The pipe is closed now; the helper exits on its own.
         let p = process.clone();
         let _ = tokio::task::spawn_blocking(move || winutil::wait_or_kill(&p, 4000)).await;

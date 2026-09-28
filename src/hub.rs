@@ -17,14 +17,31 @@ use crate::ipc_pb::{host_command::Cmd, host_event::Ev, HostCommand, HostEvent};
 pub struct Attachment {
     pub token: u64,
     pub events: mpsc::Receiver<HostEvent>,
-    /// Notified when a newer session replaces this one.
-    pub kicked: Arc<Notify>,
+    /// Fires when a newer session replaces this one or it is disconnected locally.
+    pub kicked: Arc<Kick>,
+}
+
+#[derive(Default)]
+pub struct Kick {
+    pub notify: Notify,
+    reason: Mutex<String>,
+}
+
+impl Kick {
+    fn fire(&self, reason: &str) {
+        *self.reason.lock().unwrap() = reason.to_owned();
+        self.notify.notify_one();
+    }
+
+    pub fn reason(&self) -> String {
+        self.reason.lock().unwrap().clone()
+    }
 }
 
 struct Subscriber {
     token: u64,
     tx: mpsc::Sender<HostEvent>,
-    kicked: Arc<Notify>,
+    kicked: Arc<Kick>,
 }
 
 pub struct Hub {
@@ -55,7 +72,7 @@ impl Hub {
     /// Attach a client session; any previous session is kicked.
     pub fn attach(&self) -> Attachment {
         let (tx, rx) = mpsc::channel(256);
-        let kicked = Arc::new(Notify::new());
+        let kicked = Arc::new(Kick::default());
         let token = {
             let mut t = self.next_token.lock().unwrap();
             *t += 1;
@@ -63,9 +80,18 @@ impl Hub {
         };
         let old = self.subscriber.lock().unwrap().replace(Subscriber { token, tx, kicked: kicked.clone() });
         if let Some(old) = old {
-            old.kicked.notify_one();
+            old.kicked.fire("另一个客户端已连接");
         }
         Attachment { token, events: rx, kicked }
+    }
+
+    /// Drop the attached session, if any. Returns whether there was one.
+    pub fn kick(&self, reason: &str) -> bool {
+        let s = self.subscriber.lock().unwrap();
+        if let Some(s) = s.as_ref() {
+            s.kicked.fire(reason);
+        }
+        s.is_some()
     }
 
     pub fn detach(&self, token: u64) {

@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use crate::host::{self, HostConfig};
 use crate::hub::Hub;
 use crate::ipc_pb::{host_command::Cmd, HostCommand, HostEvent};
-use crate::winutil::SystemOnlySa;
+use crate::winutil::{PipeSa, SYSTEM_ONLY};
 
 /// Video frames can be several MB (4K keyframes).
 const MAX_IPC_MSG: usize = nya_proto::MAX_VIDEO_FRAME_LEN + 4096;
@@ -23,7 +23,7 @@ pub fn pipe_path(name: &str) -> String {
 
 /// Create the pipe server end, accessible to SYSTEM only.
 pub fn create_server(name: &str) -> Result<NamedPipeServer> {
-    let mut sa = SystemOnlySa::new()?;
+    let mut sa = PipeSa::new(SYSTEM_ONLY)?;
     let server = unsafe {
         ServerOptions::new()
             .first_pipe_instance(true)

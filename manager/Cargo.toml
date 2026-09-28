@@ -1,0 +1,34 @@
+[package]
+name = "nya-server-manager"
+description = "NyaRemoteControl host management: GUI and command line (nya-server.exe)"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# Keep the executable name users know.
+[[bin]]
+name = "nya-server"
+path = "src/main.rs"
+
+[dependencies]
+# Never depend on the `nya-server` package (host): see the workspace manifest.
+nya-server-core = { path = "../core" }
+nya-ui = { path = "../../common/crates/nya-ui" }
+nya-win = { path = "../../common/crates/nya-win" }
+winit = "0.30"
+
+anyhow = "1"
+tracing = "0.1"
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+windows-service = "0.7"
+
+[dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_System_Time",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]

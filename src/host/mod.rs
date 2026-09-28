@@ -9,15 +9,6 @@ mod cursor;
 mod gamepad;
 mod input;
 mod mic;
-
-/// VB-Cable playback device name, if installed (for the GUI).
-pub fn mic_cable_name() -> Option<String> {
-    mic::cable_device_name()
-}
-/// Can virtual gamepads be created (ViGEmBus installed, for the GUI)?
-pub fn gamepad_available() -> bool {
-    gamepad::available()
-}
 mod pipeline;
 pub mod select;
 mod video;

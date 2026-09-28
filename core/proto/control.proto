@@ -1,0 +1,197 @@
+// Management channel: the running host (service or standalone) <-> management
+// tools (GUI, CLI, future tray / updater).
+//
+// Transport: a named pipe, `\\.\pipe\NyaRemoteControl.control` for the
+// service, `\\.\pipe\NyaRemoteControl.control.standalone` for standalone mode.
+// Messages are varint length-delimited (same framing as everything else).
+//
+// Unlike ipc.proto this IS a compatibility surface: during an upgrade the
+// management tool and the service can be different versions. Only ever add
+// fields / oneof cases; never renumber or change types. Unknown requests are
+// answered with an Error, so tools can probe for features.
+//
+// Access: every local interactive user may connect. Callers that are elevated
+// administrators (or SYSTEM, or the same user in standalone mode) get full
+// access; everybody else gets a reduced Status and nothing else.
+syntax = "proto3";
+package nya.control;
+
+// `control_version` in Hello / HelloReply is bumped when requests are added
+// (1: initial set), so a tool can tell what the other side knows.
+
+message Request {
+  uint64 id = 1;  // echoed in the Response
+  oneof req {
+    Hello hello = 2;
+    GetStatus get_status = 3;
+    GetPairing get_pairing = 4;
+    ResetPairingCode reset_pairing_code = 5;
+    GetConfig get_config = 6;
+    SetConfig set_config = 7;
+    ListClients list_clients = 8;
+    RemoveClient remove_client = 9;
+    Disconnect disconnect = 10;
+    TailLog tail_log = 11;
+  }
+}
+
+message Response {
+  uint64 id = 1;
+  oneof resp {
+    Error error = 2;
+    HelloReply hello = 3;
+    Status status = 4;
+    Pairing pairing = 5;
+    Config config = 6;
+    SetConfigReply set_config = 7;
+    Clients clients = 8;
+    Done done = 9;
+    LogText log = 10;
+  }
+}
+
+message Error {
+  enum Code {
+    INTERNAL = 0;
+    DENIED = 1;       // needs administrator
+    INVALID = 2;      // bad argument
+    UNSUPPORTED = 3;  // unknown request (older service)
+    NOT_FOUND = 4;
+  }
+  Code code = 1;
+  string message = 2;  // for humans (Chinese)
+}
+
+message Done { string message = 1; }
+
+// ---- handshake -------------------------------------------------------------
+
+message Hello {
+  uint32 control_version = 1;  // the tool's CONTROL_VERSION
+  string tool = 2;             // e.g. "nya-server 0.1.0 gui"
+}
+
+enum Mode {
+  MODE_UNSPECIFIED = 0;
+  SERVICE = 1;
+  STANDALONE = 2;
+}
+
+message HelloReply {
+  uint32 control_version = 1;
+  string server_version = 2;
+  Mode mode = 3;
+  bool admin = 4;  // does this connection have full access?
+}
+
+// ---- status ------------------------------------------------------------------
+
+message GetStatus {}
+
+message Status {
+  string server_version = 1;
+  Mode mode = 2;
+  uint64 started_unix = 3;
+  string server_name = 4;
+  string listen = 5;        // bound address, e.g. "[::]:47100"; empty if not listening
+  string listen_error = 6;  // why it is not listening
+  string fingerprint = 7;   // our certificate
+  Host host = 8;
+  Session session = 9;          // absent = nobody connected
+  repeated Event recent = 10;   // newest last; admin only
+  string data_dir = 11;         // admin only
+  string exe = 12;              // service executable
+}
+
+message Host {
+  bool running = 1;            // helper connected / in-process host alive
+  uint32 console_session = 2;  // Windows session the helper runs in
+  string stream = 3;           // e.g. "1920x1080 · h264 · nvenc"; empty when idle
+}
+
+message Session {
+  string client_name = 1;
+  string client_version = 2;
+  string fingerprint = 3;   // admin only
+  string remote_addr = 4;   // admin only
+  uint64 since_unix = 5;
+}
+
+message Event {
+  enum Kind {
+    OTHER = 0;
+    CONNECTED = 1;
+    DISCONNECTED = 2;
+    PAIRED = 3;
+    PAIRING_FAILED = 4;
+    REJECTED = 5;
+    SERVICE = 6;  // started, settings applied, helper restarted, ...
+  }
+  uint64 unix = 1;
+  Kind kind = 2;
+  string text = 3;
+}
+
+// ---- pairing -----------------------------------------------------------------
+
+message GetPairing {}
+message ResetPairingCode {}
+
+message Pairing {
+  string code = 1;
+  string fingerprint = 2;
+}
+
+// ---- settings (server.toml) --------------------------------------------------
+
+message GetConfig {}
+
+message Config {
+  uint32 port = 1;
+  string bind = 2;
+  string name = 3;
+  string encoder = 4;  // auto | nvenc | qsv | amf | software
+  uint32 office_bitrate_kbps = 5;
+  uint32 game_bitrate_kbps = 6;
+  uint32 max_fps = 7;
+  bool audio = 8;
+  string log_level = 9;
+}
+
+// Replaces the whole config; the service validates, saves and applies it.
+message SetConfig { Config config = 1; }
+
+message SetConfigReply {
+  Config config = 1;          // as saved
+  bool host_restarted = 2;    // capture/encoding settings changed
+  bool listener_restarted = 3;// port / address changed (current client dropped)
+  bool needs_restart = 4;     // something only applies after a service restart
+  string message = 5;
+}
+
+// ---- paired clients ------------------------------------------------------------
+
+message ListClients {}
+
+message PairedClient {
+  string fingerprint = 1;  // hex
+  string name = 2;
+  string paired_at = 3;
+}
+
+message Clients { repeated PairedClient clients = 1; }
+
+// Forget a client; a connected session from it is dropped too.
+message RemoveClient { string fingerprint = 1; }
+
+// Drop the current remote session.
+message Disconnect { string reason = 1; }
+
+// ---- logs ----------------------------------------------------------------------
+
+message TailLog {
+  string name = 1;    // service | helper | standalone | gui
+  uint32 lines = 2;   // default 200, max 5000
+}
+
+message LogText { string text = 1; }

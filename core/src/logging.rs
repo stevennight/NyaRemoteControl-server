@@ -35,3 +35,16 @@ pub fn init(dir: &Path, name: &str, stderr: bool) -> Option<WorkerGuard> {
     }));
     guard
 }
+
+/// Last `n` lines of the newest `<dir>/logs/<name>.*.log`.
+pub fn tail(dir: &Path, name: &str, n: usize) -> String {
+    let newest = std::fs::read_dir(dir.join("logs")).ok().and_then(|rd| {
+        rd.flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(&format!("{name}.")))
+            .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
+    });
+    let Some(entry) = newest else { return format!("没有 {name} 日志") };
+    let text = std::fs::read(entry.path()).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+    let lines: Vec<&str> = text.lines().collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}

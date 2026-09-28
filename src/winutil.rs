@@ -5,14 +5,14 @@ use std::ffi::c_void;
 
 use anyhow::{bail, Context, Result};
 use windows::core::{s, w, HSTRING, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, LocalFree, BOOL, HANDLE, HLOCAL};
+use windows::Win32::Foundation::{LocalFree, BOOL, HANDLE, HLOCAL};
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows::Win32::Security::{
-    DuplicateTokenEx, GetTokenInformation, SecurityImpersonation, SetTokenInformation, TokenElevation,
+    DuplicateTokenEx, SecurityImpersonation, SetTokenInformation,
     TokenPrimary, TokenSessionId, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_ACCESS_MASK,
-    TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_ELEVATION,
+    TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
     TOKEN_QUERY,
 };
 use windows::Win32::System::JobObjects::{
@@ -21,64 +21,17 @@ use windows::Win32::System::JobObjects::{
 };
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
-use windows::Win32::System::SystemInformation::{ComputerNamePhysicalDnsHostname, GetComputerNameExW};
 use windows::Win32::System::Threading::{
     CreateProcessAsUserW, GetCurrentProcess, OpenProcessToken, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
     PROCESS_INFORMATION, STARTUPINFOW,
 };
 
-/// Owned Win32 handle.
-pub struct Handle(pub HANDLE);
-
-unsafe impl Send for Handle {}
-unsafe impl Sync for Handle {}
-
-impl Drop for Handle {
-    fn drop(&mut self) {
-        if !self.0.is_invalid() {
-            unsafe {
-                let _ = CloseHandle(self.0);
-            }
-        }
-    }
-}
-
-pub fn computer_name() -> String {
-    let mut buf = [0u16; 256];
-    let mut len = buf.len() as u32;
-    unsafe {
-        if GetComputerNameExW(ComputerNamePhysicalDnsHostname, PWSTR(buf.as_mut_ptr()), &mut len).is_ok() {
-            return String::from_utf16_lossy(&buf[..len as usize]);
-        }
-    }
-    std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows".into())
-}
+pub use nya_server_core::win::{computer_name, is_elevated, Handle};
 
 /// Session attached to the physical console, or None while switching.
 pub fn active_console_session() -> Option<u32> {
     let s = unsafe { WTSGetActiveConsoleSessionId() };
     (s != 0xFFFF_FFFF).then_some(s)
-}
-
-pub fn is_elevated() -> bool {
-    unsafe {
-        let mut token = HANDLE::default();
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
-            return false;
-        }
-        let token = Handle(token);
-        let mut elev = TOKEN_ELEVATION::default();
-        let mut len = 0u32;
-        GetTokenInformation(
-            token.0,
-            TokenElevation,
-            Some(&mut elev as *mut _ as *mut c_void),
-            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
-            &mut len,
-        )
-        .is_ok()
-            && elev.TokenIsElevated != 0
-    }
 }
 
 /// A job object that kills its processes when the service exits.
@@ -161,25 +114,23 @@ pub fn send_sas() -> Result<()> {
     Ok(())
 }
 
-/// Security attributes allowing only SYSTEM (for the helper pipe).
-pub struct SystemOnlySa {
+/// Only SYSTEM (the helper pipe).
+pub const SYSTEM_ONLY: &str = "D:P(A;;GA;;;SY)";
+
+/// Security attributes from an SDDL string (for named pipes).
+pub struct PipeSa {
     pub sa: SECURITY_ATTRIBUTES,
     sd: PSECURITY_DESCRIPTOR,
 }
 
-unsafe impl Send for SystemOnlySa {}
+unsafe impl Send for PipeSa {}
 
-impl SystemOnlySa {
-    pub fn new() -> Result<Self> {
+impl PipeSa {
+    pub fn new(sddl: &str) -> Result<Self> {
         let mut sd = PSECURITY_DESCRIPTOR::default();
         unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                &HSTRING::from("D:P(A;;GA;;;SY)"),
-                SDDL_REVISION_1,
-                &mut sd,
-                None,
-            )
-            .context("security descriptor")?;
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(&HSTRING::from(sddl), SDDL_REVISION_1, &mut sd, None)
+                .context("security descriptor")?;
         }
         let sa = SECURITY_ATTRIBUTES {
             nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -190,11 +141,41 @@ impl SystemOnlySa {
     }
 }
 
-impl Drop for SystemOnlySa {
+impl Drop for PipeSa {
     fn drop(&mut self) {
         unsafe {
             let _ = LocalFree(HLOCAL(self.sd.0));
         }
+    }
+}
+
+/// Is the client of this pipe an elevated administrator (or SYSTEM)? Must be
+/// called after reading from the pipe. Uses the client's own token, so a
+/// non-elevated admin (UAC filtered token) is not an administrator here.
+pub fn pipe_client_is_admin(pipe: &impl std::os::windows::io::AsRawHandle) -> bool {
+    use windows::Win32::Security::{
+        CheckTokenMembership, CreateWellKnownSid, RevertToSelf, WinBuiltinAdministratorsSid, PSID,
+        SECURITY_MAX_SID_SIZE,
+    };
+    use windows::Win32::System::Pipes::ImpersonateNamedPipeClient;
+    let mut sid = [0u8; SECURITY_MAX_SID_SIZE as usize];
+    let mut len = sid.len() as u32;
+    let psid = PSID(sid.as_mut_ptr() as *mut c_void);
+    unsafe {
+        if CreateWellKnownSid(WinBuiltinAdministratorsSid, None, psid, &mut len).is_err() {
+            return false;
+        }
+        if let Err(e) = ImpersonateNamedPipeClient(HANDLE(pipe.as_raw_handle())) {
+            tracing::warn!("ImpersonateNamedPipeClient: {e}");
+            return false;
+        }
+        let mut member = BOOL(0);
+        let ok = CheckTokenMembership(None, psid, &mut member).is_ok() && member.as_bool();
+        if RevertToSelf().is_err() {
+            // Never keep running as somebody else.
+            std::process::abort();
+        }
+        ok
     }
 }
 

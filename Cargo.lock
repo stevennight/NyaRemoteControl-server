@@ -1436,19 +1436,50 @@ dependencies = [
  "crossbeam-channel",
  "nya-media",
  "nya-proto",
+ "nya-server-core",
  "nya-transport",
- "nya-ui",
  "nya-win",
  "prost",
  "prost-build",
  "protox",
  "rand 0.8.8",
- "serde",
  "tokio",
+ "tracing",
+ "windows",
+ "windows-service",
+]
+
+[[package]]
+name = "nya-server-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "nya-proto",
+ "nya-transport",
+ "nya-win",
+ "prost",
+ "prost-build",
+ "protox",
+ "serde",
  "toml",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "windows",
+ "windows-service",
+]
+
+[[package]]
+name = "nya-server-manager"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "nya-server-core",
+ "nya-ui",
+ "nya-win",
+ "toml",
+ "tracing",
  "windows",
  "windows-service",
  "winit",

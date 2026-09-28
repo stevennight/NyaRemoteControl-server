@@ -13,7 +13,10 @@ try {
 $out = Join-Path $repo 'dist\nya-server'
 if (Test-Path $out) { Remove-Item $out -Recurse -Force }
 New-Item -ItemType Directory -Force $out | Out-Null
-Copy-Item (Join-Path $repo '..\target\release\nya-server.exe') $out
+# nya-server.exe: management (GUI / CLI). nya-server-svc.exe + FFmpeg DLLs: the host.
+foreach ($exe in 'nya-server.exe', 'nya-server-svc.exe') {
+    Copy-Item (Join-Path $repo "..\target\release\$exe") $out
+}
 foreach ($dll in 'avcodec-62.dll', 'avutil-60.dll', 'swresample-6.dll') {
     Copy-Item (Join-Path $ffmpeg "bin\$dll") $out
 }

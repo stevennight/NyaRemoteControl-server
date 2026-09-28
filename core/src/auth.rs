@@ -24,7 +24,7 @@ struct ClientsFile {
 
 pub struct AuthStore {
     dir: PathBuf,
-    key: PairingKey,
+    key: Mutex<PairingKey>,
     clients: Mutex<Vec<PairedClient>>,
     failures: Mutex<Vec<Instant>>,
 }
@@ -59,7 +59,7 @@ impl AuthStore {
     pub fn open(dir: &Path) -> Result<Self> {
         let key = load_or_create_key(dir, false)?;
         let clients = Self::read_clients(dir);
-        Ok(Self { dir: dir.to_owned(), key, clients: Mutex::new(clients), failures: Mutex::new(Vec::new()) })
+        Ok(Self { dir: dir.to_owned(), key: Mutex::new(key), clients: Mutex::new(clients), failures: Mutex::new(Vec::new()) })
     }
 
     fn read_clients(dir: &Path) -> Vec<PairedClient> {
@@ -79,8 +79,34 @@ impl AuthStore {
         std::fs::write(dir.join("clients.toml"), text).context("write clients.toml")
     }
 
-    pub fn key(&self) -> &PairingKey {
-        &self.key
+    pub fn key(&self) -> PairingKey {
+        self.key.lock().unwrap().clone()
+    }
+
+    /// New pairing code; already paired clients are unaffected.
+    pub fn reset_key(&self) -> Result<PairingKey> {
+        let k = load_or_create_key(&self.dir, true)?;
+        *self.key.lock().unwrap() = k.clone();
+        Ok(k)
+    }
+
+    pub fn clients(&self) -> Vec<PairedClient> {
+        let fresh = Self::read_clients(&self.dir);
+        *self.clients.lock().unwrap() = fresh.clone();
+        fresh
+    }
+
+    /// Forget a client by its full fingerprint (hex). Returns whether it was paired.
+    pub fn remove(&self, fingerprint_hex: &str) -> Result<bool> {
+        let mut list = self.clients.lock().unwrap();
+        *list = Self::read_clients(&self.dir);
+        let before = list.len();
+        list.retain(|c| !c.fingerprint.eq_ignore_ascii_case(fingerprint_hex));
+        if list.len() == before {
+            return Ok(false);
+        }
+        Self::save_list(&self.dir, list.clone())?;
+        Ok(true)
     }
 
     pub fn is_paired(&self, fp: &Fingerprint) -> bool {
@@ -109,5 +135,20 @@ impl AuthStore {
 
     pub fn record_failure(&self) {
         self.failures.lock().unwrap().push(Instant::now());
+    }
+}
+
+/// Look a client up by fingerprint or a prefix of it (8+ hex digits; ':' / '-'
+/// and case are ignored). `Err` explains why the input is unusable.
+pub fn find_by_prefix(clients: &[PairedClient], prefix: &str) -> Result<Option<PairedClient>, &'static str> {
+    let prefix: String = prefix.chars().filter(|c| c.is_ascii_hexdigit()).collect::<String>().to_ascii_lowercase();
+    if prefix.len() < 8 {
+        return Err("指纹至少需要 8 位");
+    }
+    let mut matches = clients.iter().filter(|c| c.fingerprint.to_ascii_lowercase().starts_with(&prefix));
+    match (matches.next(), matches.next()) {
+        (None, _) => Ok(None),
+        (Some(c), None) => Ok(Some(c.clone())),
+        _ => Err("有多个客户端匹配，请输入更长的指纹"),
     }
 }

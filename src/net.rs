@@ -1,7 +1,6 @@
 //! Network side of the host: accept QUIC connections, run the handshake
 //! (version negotiation + pairing), then bridge the client with the hub.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,44 +13,25 @@ use nya_proto::MAX_MESSAGE_LEN;
 use nya_transport::identity::peer_fingerprint;
 use nya_transport::pairing::{self, Transcript};
 use nya_transport::quinn::{self, Connection, RecvStream, SendStream};
-use nya_transport::{Fingerprint, Identity};
+use nya_transport::Fingerprint;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-use crate::auth::AuthStore;
+use crate::control_pb::{self as cpb, event::Kind};
 use crate::hub::Hub;
 use crate::ipc_pb::{host_command::Cmd, host_event::Ev, FrameSent, SetAudio};
+use crate::state::{unix_now, State};
 
-pub struct NetConfig {
-    pub bind: SocketAddr,
-    pub server_name: String,
-}
-
-pub async fn serve(cfg: NetConfig, identity: Identity, auth: Arc<AuthStore>, hub: Arc<Hub>) -> Result<()> {
-    let endpoint = nya_transport::endpoint::server_endpoint(cfg.bind, &identity)?;
-    serve_endpoint(endpoint, cfg.server_name, identity, auth, hub).await
-}
-
-pub async fn serve_endpoint(
-    endpoint: quinn::Endpoint,
-    server_name: String,
-    identity: Identity,
-    auth: Arc<AuthStore>,
-    hub: Arc<Hub>,
-) -> Result<()> {
-    tracing::info!(
-        "listening on UDP {} (certificate {})",
-        endpoint.local_addr()?,
-        identity.fingerprint()
-    );
-    let name = Arc::new(server_name);
+/// Accept connections until the endpoint is closed.
+pub async fn serve_endpoint(endpoint: quinn::Endpoint, state: Arc<State>) -> Result<()> {
+    tracing::info!("listening on UDP {} (certificate {})", endpoint.local_addr()?, state.fingerprint);
     while let Some(incoming) = endpoint.accept().await {
-        let (auth, hub, name) = (auth.clone(), hub.clone(), name.clone());
+        let state = state.clone();
         tokio::spawn(async move {
             let remote = incoming.remote_address();
             match incoming.await {
                 Ok(conn) => {
-                    if let Err(e) = handle(conn, auth, hub, &name).await {
+                    if let Err(e) = handle(conn, &state).await {
                         tracing::info!("{remote}: session ended: {e:#}");
                     }
                 }
@@ -71,18 +51,20 @@ async fn handshake(
     conn: &Connection,
     send: &mut SendStream,
     recv: &mut RecvStream,
-    auth: &AuthStore,
-    server_name: &str,
+    state: &State,
     server_fp: Fingerprint,
 ) -> Result<(Negotiated, pb::Hello)> {
+    let auth = &state.auth;
     let hello: pb::Hello = timeout(Duration::from_secs(10), expect_msg(recv, MAX_MESSAGE_LEN))
         .await
         .context("hello timeout")??;
     let client_fp = peer_fingerprint(conn).ok_or_else(|| anyhow!("no client certificate"))?;
+    let remote = conn.remote_address();
     let negotiated = match negotiate::negotiate(&hello, &LocalVersion::current()) {
         Ok(n) => n,
         Err(reject) => {
             tracing::warn!("rejecting {}: {}", hello.client_name, reject.message);
+            state.event(Kind::Rejected, format!("拒绝 {}（{remote}）：{}", hello.client_name, reject.message));
             write_msg(send, &pb::HelloReply { reply: Some(pb::hello_reply::Reply::Reject(reject)) }).await?;
             let _ = send.finish();
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -92,6 +74,7 @@ async fn handshake(
 
     let paired = auth.is_paired(&client_fp);
     if !paired && auth.locked_out() {
+        state.event(Kind::Rejected, format!("拒绝 {}（{remote}）：配对失败次数过多", hello.client_name));
         let reject = pb::Reject {
             reason: pb::RejectReason::AuthFailed as i32,
             message: "配对失败次数过多，请 10 分钟后再试".into(),
@@ -105,7 +88,7 @@ async fn handshake(
     let welcome = pb::Welcome {
         proto_major: negotiated.major,
         proto_minor: negotiated.minor,
-        server_name: server_name.to_owned(),
+        server_name: state.server_name(),
         server_version: env!("CARGO_PKG_VERSION").to_owned(),
         features: negotiated.features.iter().copied().collect(),
         needs_pairing: !paired,
@@ -121,8 +104,10 @@ async fn handshake(
             .context("pairing timeout")??;
         let Some(Msg::AuthResponse(r)) = resp.msg else { bail!("expected AuthResponse") };
         let t = Transcript { server_nonce: &server_nonce, client_nonce: &r.client_nonce, server_fp, client_fp };
-        if r.client_nonce.len() != pairing::NONCE_LEN || !t.verify_client(auth.key(), &r.mac) {
+        let key = auth.key();
+        if r.client_nonce.len() != pairing::NONCE_LEN || !t.verify_client(&key, &r.mac) {
             auth.record_failure();
+            state.event(Kind::PairingFailed, format!("{}（{remote}）配对码错误", hello.client_name));
             tokio::time::sleep(Duration::from_secs(1)).await;
             write_msg(
                 send,
@@ -135,20 +120,21 @@ async fn handshake(
         }
         auth.add(&client_fp, &hello.client_name)?;
         tracing::info!("paired new client {} ({client_fp})", hello.client_name);
+        state.event(Kind::Paired, format!("新客户端 {}（{remote}）配对成功", hello.client_name));
         write_msg(
             send,
-            &ctl(Msg::AuthResult(pb::AuthResult { ok: true, server_mac: t.server_mac(auth.key()), message: String::new() })),
+            &ctl(Msg::AuthResult(pb::AuthResult { ok: true, server_mac: t.server_mac(&key), message: String::new() })),
         )
         .await?;
     }
     Ok((negotiated, hello))
 }
 
-async fn handle(conn: Connection, auth: Arc<AuthStore>, hub: Arc<Hub>, server_name: &str) -> Result<()> {
+async fn handle(conn: Connection, state: &State) -> Result<()> {
     let remote = conn.remote_address();
     let server_fp = auth_server_fp(&conn)?;
     let (mut send, mut recv) = timeout(Duration::from_secs(10), conn.accept_bi()).await.context("control stream timeout")??;
-    let (neg, hello) = handshake(&conn, &mut send, &mut recv, &auth, server_name, server_fp).await?;
+    let (neg, hello) = handshake(&conn, &mut send, &mut recv, state, server_fp).await?;
     tracing::info!(
         "{remote}: client {} {} (proto {}.{}, features {:?})",
         hello.client_name,
@@ -158,10 +144,29 @@ async fn handle(conn: Connection, auth: Arc<AuthStore>, hub: Arc<Hub>, server_na
         neg.features
     );
 
+    let hub = &state.hub;
     let att = hub.attach();
     let token = att.token;
-    let result = run_session(&conn, send, recv, &hub, att, &neg).await;
+    let fingerprint = peer_fingerprint(&conn).map(|f| f.to_hex()).unwrap_or_default();
+    state.session_started(
+        token,
+        cpb::Session {
+            client_name: hello.client_name.clone(),
+            client_version: hello.client_version.clone(),
+            fingerprint,
+            remote_addr: remote.to_string(),
+            since_unix: unix_now(),
+        },
+    );
+    state.event(Kind::Connected, format!("{} 已连接（{remote}）", hello.client_name));
+    let result = run_session(&conn, send, recv, hub, att, &neg, state).await;
     hub.detach(token);
+    state.session_ended(token);
+    let why = match &result {
+        Ok(()) => "客户端断开".to_owned(),
+        Err(e) => format!("{e:#}"),
+    };
+    state.event(Kind::Disconnected, format!("{} 已断开：{why}", hello.client_name));
     conn.close(0u32.into(), b"bye");
     result
 }
@@ -190,6 +195,7 @@ async fn run_session(
     hub: &Arc<Hub>,
     mut att: crate::hub::Attachment,
     neg: &Negotiated,
+    state: &State,
 ) -> Result<()> {
     // Control writer task.
     let (ctl_tx, mut ctl_rx) = mpsc::channel::<pb::ControlMsg>(64);
@@ -389,6 +395,10 @@ async fn run_session(
                         let policy = crate::abr::resolve(requested, mode);
                         abr = if max > 0 { crate::abr::Abr::new(max, policy, std::time::Instant::now()) } else { None };
                         tracing::info!("bitrate policy: {} (max {max} kbps)", crate::abr::policy_name(policy));
+                        if let Some(c) = &s.config {
+                            let codec = pb::Codec::try_from(c.codec).map(|c| c.as_str_name()).unwrap_or("?");
+                            state.set_stream(format!("{}x{} {} fps · {codec} · {}", c.width, c.height, c.fps, s.encoder_name));
+                        }
                         let _ = ctl_tx.send(ctl(Msg::StreamStarted(s))).await;
                     }
                     Some(Ev::StreamError(e)) => { let _ = ctl_tx.send(ctl(Msg::StreamError(e))).await; }
@@ -458,10 +468,11 @@ async fn run_session(
                 if replay.audio { hub.send(Cmd::SetAudio(SetAudio { enabled: true })); }
                 if let Some(s) = &replay.start { hub.send(Cmd::StartStream(s.clone())); }
             }
-            _ = att.kicked.notified() => {
-                let _ = ctl_tx.send(ctl(Msg::Bye(pb::Bye { reason: "另一个客户端已连接".into() }))).await;
+            _ = att.kicked.notify.notified() => {
+                let reason = att.kicked.reason();
+                let _ = ctl_tx.send(ctl(Msg::Bye(pb::Bye { reason: reason.clone() }))).await;
                 tokio::time::sleep(Duration::from_millis(100)).await;
-                break Ok(());
+                break Err(anyhow!("{reason}"));
             }
             e = conn.closed() => break Err(anyhow!("connection closed: {e}")),
         }
@@ -663,10 +674,14 @@ mod tests {
     //! host (no GPU involved).
 
     use super::*;
+    use std::net::SocketAddr;
+
+    use crate::auth::AuthStore;
     use crate::ipc_pb::{HostCommand, HostEvent, VideoFrame};
     use nya_proto::frame::VideoFrameHeader;
     use nya_proto::pb::input_msg::Ev as InEv;
     use nya_transport::pairing::PairingKey;
+    use nya_transport::Identity;
 
     async fn fake_host(hub: Arc<Hub>, mut cmds: mpsc::UnboundedReceiver<HostCommand>, inputs: mpsc::UnboundedSender<pb::InputMsg>) {
         let mut sent_acks = 0;
@@ -734,13 +749,15 @@ mod tests {
         let server_fp = server_id.fingerprint();
         let _ = SERVER_FP.set(server_fp);
         let auth = Arc::new(AuthStore::open(&dir).unwrap());
-        let key = auth.key().clone();
+        let key = auth.key();
         let (hub, cmd_rx) = Hub::new();
         let (in_tx, mut in_rx) = mpsc::unbounded_channel();
         tokio::spawn(fake_host(hub.clone(), cmd_rx, in_tx));
         let ep = nya_transport::endpoint::server_endpoint("127.0.0.1:0".parse().unwrap(), &server_id).unwrap();
         let addr = ep.local_addr().unwrap();
-        tokio::spawn(serve_endpoint(ep, "test-host".into(), server_id, auth, hub));
+        let cfg = crate::config::ServerConfig { name: "test-host".into(), ..Default::default() };
+        let state = State::new(cpb::Mode::Standalone, dir.clone(), cfg, server_fp.to_string(), auth, hub);
+        tokio::spawn(serve_endpoint(ep, state.clone()));
 
         let client_id = Identity::generate().unwrap();
 
@@ -804,6 +821,27 @@ mod tests {
             let m: pb::ControlMsg = expect_msg(&mut c.recv, MAX_MESSAGE_LEN).await.unwrap();
             if let Some(Msg::Pong(p)) = m.msg {
                 assert_eq!(p.t_us, 42);
+                break;
+            }
+        }
+
+        // The control pipe's view: the session and what happened before it.
+        let st = state.status(true);
+        let s = st.session.expect("session in status");
+        assert_eq!(s.client_name, "test");
+        assert_eq!(s.fingerprint, client_id.fingerprint().to_hex());
+        let kinds: Vec<i32> = st.recent.iter().map(|e| e.kind).collect();
+        for k in [Kind::PairingFailed, Kind::Paired, Kind::Connected] {
+            assert!(kinds.contains(&(k as i32)), "missing {k:?} in {kinds:?}");
+        }
+        assert!(state.status(false).session.unwrap().remote_addr.is_empty());
+
+        // Disconnecting from the control side ends the session with a Bye.
+        assert!(state.hub.kick("管理员断开了连接"));
+        loop {
+            let m: pb::ControlMsg = expect_msg(&mut c.recv, MAX_MESSAGE_LEN).await.unwrap();
+            if let Some(Msg::Bye(b)) = m.msg {
+                assert_eq!(b.reason, "管理员断开了连接");
                 break;
             }
         }

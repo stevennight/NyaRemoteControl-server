@@ -6,7 +6,6 @@
 //! usbipd there. usbip-win2 then attaches devices from 127.0.0.1.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -16,16 +15,9 @@ use nya_transport::quinn::Connection;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 
-pub const USBIP_PORT: u16 = 3240;
+pub use nya_server_core::components::usbip_exe;
 
-/// usbip-win2's command-line tool, if installed.
-pub fn usbip_exe() -> Option<PathBuf> {
-    let candidates = [
-        std::env::var_os("ProgramFiles").map(|p| PathBuf::from(p).join("USBip").join("usbip.exe")),
-        std::env::var_os("ProgramFiles").map(|p| PathBuf::from(p).join("usbip-win2").join("usbip.exe")),
-    ];
-    candidates.into_iter().flatten().find(|p| p.exists())
-}
+pub const USBIP_PORT: u16 = 3240;
 
 pub struct UsbHost {
     conn: Connection,

@@ -9,13 +9,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError};
 use nya_media::audio::OpusDecoder;
 use nya_proto::frame::AudioPacket;
 use nya_win::audio::{find_render_device, AudioRenderer};
-
-/// Playback device names that belong to a virtual cable (first match wins).
-pub const CABLE_NAMES: [&str; 2] = ["CABLE Input", "VB-Audio Virtual Cable"];
-
-pub fn cable_device_name() -> Option<String> {
-    CABLE_NAMES.iter().find_map(|n| find_render_device(n).map(|(_, name)| name))
-}
+pub use nya_server_core::components::{cable_device_name, CABLE_NAMES};
 
 const SAMPLES_PER_MS: usize = 48 * 2;
 
