@@ -66,11 +66,14 @@ fn service_running(name: &str) -> bool {
 fn detect_components() -> Vec<Component> {
     nya_win::com_init();
     let cable = components::cable_device_name();
-    let vdd_active = nya_win::topology::Topology::enumerate()
-        .ok()
-        .and_then(|t| t.adapters.iter().find(|a| a.name.to_lowercase().contains("virtual display")).map(|a| a.name.clone()));
-    let vdd_installed = vdd_active.is_some() || nya_win::devnode::exists(components::VDD_HWID);
-    let vdd = vdd_active.or_else(|| vdd_installed.then(|| "已安装（未启用）".to_owned()));
+    let vdd_installed = nya_win::devnode::exists(components::VDD_HWID);
+    let vdd = vdd_installed.then(|| {
+        if nya_win::devnode::is_started(components::VDD_HWID) {
+            "正在使用（有客户端选择了虚拟显示器 / 隐私屏）".to_owned()
+        } else {
+            "平时停用，客户端选择虚拟显示器 / 隐私屏时自动启用".to_owned()
+        }
+    });
     let usbip = components::usbip_exe().map(|p| p.display().to_string());
     vec![
         Component {
@@ -95,9 +98,9 @@ fn detect_components() -> Vec<Component> {
             purpose: "USB 设备透传（U 盾、加密狗等）：被控端虚拟 USB 控制器",
             installed: usbip.is_some(),
             status: usbip,
-            ready: false,
+            ready: true,
             url: "https://github.com/vadimgrn/usbip-win2/releases",
-            note: "开发中；客户端另需 usbipd-win",
+            note: "客户端另需 usbipd-win（客户端工具条“USB 设备”里可一键安装）",
         },
         Component {
             id: components::Id::Vigem,
@@ -112,12 +115,12 @@ fn detect_components() -> Vec<Component> {
         Component {
             id: components::Id::Vdd,
             name: "Virtual Display Driver",
-            purpose: "虚拟显示器：不接显示器也能用，分辨率 / 刷新率可自定义",
+            purpose: "虚拟显示器 / 隐私屏：客户端连接时可选用虚拟显示器（分辨率跟随客户端窗口），或隐私屏（本机显示器黑屏、本机键鼠屏蔽）；需要服务模式",
             installed: vdd_installed,
             status: vdd,
-            ready: false,
+            ready: true,
             url: "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases",
-            note: "开发中",
+            note: "免费开源；平时保持停用，不影响本机显示器",
         },
     ]
 }
