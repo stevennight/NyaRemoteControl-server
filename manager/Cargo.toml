@@ -14,7 +14,7 @@ path = "src/main.rs"
 [dependencies]
 # Never depend on the `nya-server` package (host): see the workspace manifest.
 nya-server-core = { path = "../core" }
-nya-ui = { path = "../../common/crates/nya-ui" }
+nya-webui = { path = "../../common/crates/nya-webui" }
 nya-win = { path = "../../common/crates/nya-win" }
 winit = "0.30"
 
@@ -22,6 +22,8 @@ anyhow = "1"
 tracing = "0.1"
 clap = { version = "4", features = ["derive"] }
 toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 windows-service = "0.7"
 
 [dependencies.windows]
