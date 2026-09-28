@@ -31,6 +31,15 @@ enum Cmd {
         #[arg(long)]
         out: Option<std::path::PathBuf>,
     },
+    /// 测试虚拟显示器：创建 1920x1080 虚拟显示器，打印驱动和显示器状态，保持一会儿后移除（需要管理员）
+    VddTest {
+        /// 隐私屏模式（关闭物理显示器并屏蔽本机键鼠）
+        #[arg(long)]
+        private: bool,
+        /// 保持的秒数
+        #[arg(long, default_value_t = 15)]
+        secs: u64,
+    },
     /// （内部）由服务控制管理器启动
     #[command(hide = true)]
     Service,
@@ -67,6 +76,11 @@ fn real_main(cli: Cli) -> Result<()> {
             nya_win::dpi::set_per_monitor_aware();
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(ipc::run_helper(&pipe))
+        }
+        Cmd::VddTest { private, secs } => {
+            let _log = logging::init(&paths::service_dir(), "vdd-test", true);
+            nya_win::dpi::set_per_monitor_aware();
+            nya_server::host::vdisplay::self_test(private, std::time::Duration::from_secs(secs.clamp(3, 600)))
         }
         Cmd::Diag { out } => {
             nya_win::dpi::set_per_monitor_aware();

@@ -143,9 +143,28 @@ impl VirtualDisplay {
             std::thread::sleep(Duration::from_millis(500));
             self.scale_set = 0; // a new monitor comes up
         }
+        // Adapters with displays before the driver starts: if its device path
+        // does not match (it should), the new adapter is the driver's.
+        let before = if devnode::is_started(VDD_HWID) { Vec::new() } else { target_adapters() };
         devnode::set_enabled(VDD_HWID, true).context("启用虚拟显示器（需要管理员权限，开发模式下不可用）")?;
-        let luid = wait_for(Duration::from_secs(10), || vdd_adapter(&self.instance).filter(|&l| has_target(l)))
-            .ok_or_else(|| anyhow!("虚拟显示器驱动已启用，但没有出现显示器"))?;
+        let mut found = wait_for(Duration::from_secs(10), || find_vdd(&self.instance, &before));
+        if found.is_none() {
+            // Freshly installed or stuck: one restart of the device often helps.
+            tracing::warn!("virtual display did not appear:\n{}restarting the device once", describe_state(&self.instance));
+            let _ = devnode::set_enabled(VDD_HWID, false);
+            std::thread::sleep(Duration::from_millis(1000));
+            let before = target_adapters();
+            devnode::set_enabled(VDD_HWID, true).context("启用虚拟显示器")?;
+            found = wait_for(Duration::from_secs(10), || find_vdd(&self.instance, &before));
+        }
+        let luid = match found {
+            Some(l) => l,
+            None => {
+                let state = describe_state(&self.instance);
+                tracing::error!("virtual display did not appear:\n{state}");
+                return Err(anyhow!("虚拟显示器驱动已启用，但没有出现显示器。{}", summary(&state)));
+            }
+        };
 
         activate(luid, w.private).context("切换显示器布局")?;
         self.gdi_name = wait_for(Duration::from_secs(5), || vdd_gdi_name(luid))
@@ -238,27 +257,124 @@ fn luid_eq(a: LUID, b: LUID) -> bool {
     a.LowPart == b.LowPart && a.HighPart == b.HighPart
 }
 
-/// Adapter LUID of the driver's device (the indirect display adapter).
-fn vdd_adapter(instance: &str) -> Option<LUID> {
-    let cfg = Config::query(true).ok()?;
-    let mut seen: Vec<LUID> = Vec::new();
-    for p in &cfg.paths {
-        let l = p.targetInfo.adapterId;
-        if seen.iter().any(|s| luid_eq(*s, l)) {
-            continue;
+/// Adapters that have an available (connected) display target.
+fn target_adapters() -> Vec<LUID> {
+    let mut v: Vec<LUID> = Vec::new();
+    if let Ok(cfg) = Config::query(true) {
+        for p in cfg.paths.iter().filter(|p| p.targetInfo.targetAvailable.as_bool()) {
+            if !v.iter().any(|s| luid_eq(*s, p.targetInfo.adapterId)) {
+                v.push(p.targetInfo.adapterId);
+            }
         }
-        seen.push(l);
-        if dc::adapter_path(l).is_some_and(|path| dc::adapter_path_matches(&path, instance)) {
-            return Some(l);
-        }
+    }
+    v
+}
+
+/// Adapter LUID of the driver's device (the indirect display adapter), once
+/// it has a display: matched by device path, else the one adapter that got
+/// a display since `before`.
+fn find_vdd(instance: &str, before: &[LUID]) -> Option<LUID> {
+    let now = target_adapters();
+    if let Some(l) = now.iter().find(|&&l| dc::adapter_path(l).is_some_and(|p| dc::adapter_path_matches(&p, instance))) {
+        return Some(*l);
+    }
+    if before.is_empty() {
+        return None;
+    }
+    let new: Vec<LUID> = now.into_iter().filter(|l| !before.iter().any(|b| luid_eq(*b, *l))).collect();
+    if new.len() == 1 {
+        tracing::warn!(
+            "virtual display adapter found as the new adapter (path {:?} does not match {instance})",
+            dc::adapter_path(new[0])
+        );
+        return Some(new[0]);
     }
     None
 }
 
-fn has_target(luid: LUID) -> bool {
-    Config::query(true)
-        .map(|c| c.paths.iter().any(|p| luid_eq(p.targetInfo.adapterId, luid) && p.targetInfo.targetAvailable.as_bool()))
-        .unwrap_or(false)
+/// Device and display-path state, for the log and `vdd-test`.
+pub fn describe_state(instance: &str) -> String {
+    let mut s = String::new();
+    for d in devnode::states(VDD_HWID) {
+        s += &format!(
+            "设备 {}：{}，{}\n",
+            d.instance_id,
+            if d.started { "已启动" } else { "未启动" },
+            devnode::problem_text(d.problem)
+        );
+    }
+    match Config::query(true) {
+        Ok(cfg) => {
+            let mut seen: Vec<LUID> = Vec::new();
+            for p in &cfg.paths {
+                let l = p.targetInfo.adapterId;
+                if seen.iter().any(|x| luid_eq(*x, l)) {
+                    continue;
+                }
+                seen.push(l);
+                let targets = cfg.paths.iter().filter(|q| luid_eq(q.targetInfo.adapterId, l));
+                let (mut n, mut avail, mut active) = (0, 0, 0);
+                let mut ids: Vec<u32> = Vec::new();
+                for q in targets {
+                    if !ids.contains(&q.targetInfo.id) {
+                        ids.push(q.targetInfo.id);
+                        n += 1;
+                        if q.targetInfo.targetAvailable.as_bool() {
+                            avail += 1;
+                        }
+                    }
+                    if q.flags & PATH_ACTIVE != 0 {
+                        active += 1;
+                    }
+                }
+                let path = dc::adapter_path(l).unwrap_or_else(|| "?".into());
+                let mark = if dc::adapter_path_matches(&path, instance) { "  <- 虚拟显示器" } else { "" };
+                s += &format!("显卡 {path}：输出 {n} 个，已连接 {avail} 个，使用中 {active} 个{mark}\n");
+            }
+        }
+        Err(e) => s += &format!("QueryDisplayConfig 失败：{e:#}\n"),
+    }
+    let settings = Path::new(VDD_SETTINGS_DIR).join("vdd_settings.xml");
+    s += &format!("设置文件 {}：{}\n", settings.display(), if settings.exists() { "存在" } else { "不存在" });
+    s
+}
+
+/// The most useful hint from [`describe_state`] for the client.
+fn summary(state: &str) -> String {
+    let dev = devnode::states(VDD_HWID);
+    if let Some(d) = dev.iter().find(|d| d.problem == 14) {
+        let _ = d;
+        return "被控端需要重启电脑后才能使用虚拟显示器".into();
+    }
+    if let Some(d) = dev.iter().find(|d| !d.started) {
+        return format!("驱动状态：{}", devnode::problem_text(d.problem));
+    }
+    if state.contains("<- 虚拟显示器") {
+        "驱动已运行但没有创建显示器，请在被控端运行 nya-server-svc vdd-test 查看详情".into()
+    } else {
+        "没有找到驱动对应的显卡，请在被控端运行 nya-server-svc vdd-test 查看详情".into()
+    }
+}
+
+/// `nya-server-svc vdd-test`: create the virtual display, show what happened,
+/// keep it for `hold`, then remove it.
+pub fn self_test(private: bool, hold: Duration) -> Result<()> {
+    let instance = devnode::instance_ids(VDD_HWID).into_iter().next().unwrap_or_default();
+    println!("== 启用前\n{}", describe_state(&instance));
+    let want = Want { private, width: 1920, height: 1080, hz: 60, scale: 0 };
+    let res = VirtualDisplay::open(want);
+    println!("== 启用后\n{}", describe_state(&instance));
+    let vd = res?;
+    println!("虚拟显示器 {} 已创建，{} 秒后移除…", vd.gdi_name, hold.as_secs());
+    if let Ok(t) = nya_win::topology::Topology::enumerate() {
+        for o in &t.outputs {
+            println!("  DXGI 输出 {} {}x{} 主={}", o.device_name, o.width(), o.height(), o.primary);
+        }
+    }
+    std::thread::sleep(hold);
+    drop(vd);
+    println!("已移除，显示器布局已恢复");
+    Ok(())
 }
 
 fn vdd_gdi_name(luid: LUID) -> Option<String> {

@@ -11,7 +11,7 @@ mod input;
 mod mic;
 mod pipeline;
 pub mod select;
-mod vdisplay;
+pub mod vdisplay;
 mod video;
 
 use std::thread;
