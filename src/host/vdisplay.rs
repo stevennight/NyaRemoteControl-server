@@ -46,6 +46,9 @@ const COMMON: [(u32, u32); 16] = [
 ];
 const RATES: [u32; 8] = [60, 75, 90, 100, 120, 144, 165, 240];
 
+/// Turn on the driver's own log (`C:\VirtualDisplayDriver\Logs`), for `vdd-test --driver-log`.
+static DRIVER_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// What the client asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Want {
@@ -339,6 +342,25 @@ pub fn describe_state(instance: &str) -> String {
     s
 }
 
+/// Print the end of the driver's newest log file.
+fn print_driver_log() {
+    let dir = Path::new(VDD_SETTINGS_DIR).join("Logs");
+    let newest = std::fs::read_dir(&dir)
+        .ok()
+        .and_then(|rd| rd.flatten().max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok()));
+    match newest {
+        Some(e) => {
+            let text = std::fs::read(e.path()).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+            let lines: Vec<&str> = text.lines().collect();
+            println!("== 驱动日志 {}（最后 {} 行）", e.path().display(), lines.len().min(80));
+            for l in &lines[lines.len().saturating_sub(80)..] {
+                println!("{l}");
+            }
+        }
+        None => println!("== 驱动日志：{} 下没有日志文件（驱动没有读到设置，或者没有写入权限）", dir.display()),
+    }
+}
+
 /// The most useful hint from [`describe_state`] for the client.
 fn summary(state: &str) -> String {
     let dev = devnode::states(VDD_HWID);
@@ -358,12 +380,19 @@ fn summary(state: &str) -> String {
 
 /// `nya-server-svc vdd-test`: create the virtual display, show what happened,
 /// keep it for `hold`, then remove it.
-pub fn self_test(private: bool, hold: Duration) -> Result<()> {
+pub fn self_test(private: bool, hold: Duration, driver_log: bool) -> Result<()> {
+    if !crate::winutil::is_elevated() {
+        anyhow::bail!("需要管理员权限：请右键“以管理员身份运行”终端后再执行");
+    }
+    DRIVER_LOG.store(driver_log, std::sync::atomic::Ordering::Relaxed);
     let instance = devnode::instance_ids(VDD_HWID).into_iter().next().unwrap_or_default();
     println!("== 启用前\n{}", describe_state(&instance));
     let want = Want { private, width: 1920, height: 1080, hz: 60, scale: 0 };
     let res = VirtualDisplay::open(want);
     println!("== 启用后\n{}", describe_state(&instance));
+    if driver_log {
+        print_driver_log();
+    }
     let vd = res?;
     println!("虚拟显示器 {} 已创建，{} 秒后移除…", vd.gdi_name, hold.as_secs());
     if let Ok(t) = nya_win::topology::Topology::enumerate() {
@@ -468,7 +497,10 @@ fn settings_xml(sizes: &[(u32, u32)], hz: u32) -> String {
             "        <resolution>\n            <width>{w}</width>\n            <height>{h}</height>\n            <refresh_rate>60</refresh_rate>\n        </resolution>\n"
         );
     }
-    x += "    </resolutions>\n    <options>\n        <CustomEdid>false</CustomEdid>\n        <PreventSpoof>false</PreventSpoof>\n        <EdidCeaOverride>false</EdidCeaOverride>\n        <HardwareCursor>true</HardwareCursor>\n        <SDR10bit>false</SDR10bit>\n        <HDRPlus>false</HDRPlus>\n        <logging>false</logging>\n        <debuglogging>false</debuglogging>\n    </options>\n</vdd_settings>\n";
+    let log = DRIVER_LOG.load(std::sync::atomic::Ordering::Relaxed);
+    x += &format!(
+        "    </resolutions>\n    <options>\n        <CustomEdid>false</CustomEdid>\n        <PreventSpoof>false</PreventSpoof>\n        <EdidCeaOverride>false</EdidCeaOverride>\n        <HardwareCursor>true</HardwareCursor>\n        <SDR10bit>false</SDR10bit>\n        <HDRPlus>false</HDRPlus>\n        <logging>{log}</logging>\n        <debuglogging>{log}</debuglogging>\n    </options>\n</vdd_settings>\n"
+    );
     x
 }
 

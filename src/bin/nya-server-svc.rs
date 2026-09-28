@@ -39,6 +39,9 @@ enum Cmd {
         /// 保持的秒数
         #[arg(long, default_value_t = 15)]
         secs: u64,
+        /// 打开驱动自身的日志并打印（C:\VirtualDisplayDriver\Logs）
+        #[arg(long)]
+        driver_log: bool,
     },
     /// （内部）由服务控制管理器启动
     #[command(hide = true)]
@@ -77,10 +80,10 @@ fn real_main(cli: Cli) -> Result<()> {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(ipc::run_helper(&pipe))
         }
-        Cmd::VddTest { private, secs } => {
+        Cmd::VddTest { private, secs, driver_log } => {
             let _log = logging::init(&paths::service_dir(), "vdd-test", true);
             nya_win::dpi::set_per_monitor_aware();
-            nya_server::host::vdisplay::self_test(private, std::time::Duration::from_secs(secs.clamp(3, 600)))
+            nya_server::host::vdisplay::self_test(private, std::time::Duration::from_secs(secs.clamp(3, 600)), driver_log)
         }
         Cmd::Diag { out } => {
             nya_win::dpi::set_per_monitor_aware();
