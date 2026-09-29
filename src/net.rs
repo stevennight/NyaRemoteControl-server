@@ -241,13 +241,25 @@ async fn run_session(
     let usb = Arc::new(tokio::sync::Mutex::new(crate::usb::UsbHost::new(conn.clone())));
     let files_on = neg.has(Feature::FileTransfer);
     let images_on = neg.has(Feature::ClipboardImage);
+    // Copy on one side, paste on the other (folders too), both directions.
+    let clip_files_on = files_on && neg.has(Feature::ClipboardFiles);
+    let incoming = nya_transport::clipfiles::Incoming::default();
     let input_task = tokio::spawn(client_streams(
         conn.clone(),
         hub.clone(),
-        FileCtx { ctl_tx: ctl_tx.clone(), files_on, images_on, batches: Default::default() },
+        FileCtx { ctl_tx: ctl_tx.clone(), files_on, images_on, clip_files_on, incoming: incoming.clone(), batches: Default::default() },
     ));
-    // Files copied on the host and offered to the client: offer id -> paths.
-    let mut offers: std::collections::VecDeque<(u64, Vec<std::path::PathBuf>)> = Default::default();
+    // Files copied on the host and offered to the client.
+    let mut offers = nya_transport::clipfiles::Outgoing::default();
+    // Where the client's files are fetched to when they are pasted here.
+    let clip_cache = if clip_files_on {
+        let dir = tokio::task::spawn_blocking(crate::winutil::clipboard_cache_dir).await.unwrap_or_else(|_| std::env::temp_dir());
+        let d = dir.clone();
+        tokio::task::spawn_blocking(move || nya_transport::files::prune_cache(&d));
+        dir
+    } else {
+        std::path::PathBuf::new()
+    };
 
     let mut replay = Replay::default();
     let mut generation = hub.generation.subscribe();
@@ -337,9 +349,13 @@ async fn run_session(
                         });
                     }
                     Some(Msg::FileRequest(req)) if files_on => {
-                        match offers.iter().find(|(id, _)| *id == req.transfer_id) {
-                            Some((id, paths)) => {
-                                tokio::spawn(send_offered(conn.clone(), *id, paths.clone(), ctl_tx.clone()));
+                        let purpose = match pb::FilePurpose::try_from(req.purpose) {
+                            Ok(pb::FilePurpose::Clipboard) if clip_files_on => pb::FilePurpose::Clipboard,
+                            _ => pb::FilePurpose::Save,
+                        };
+                        match offers.items(req.transfer_id) {
+                            Some(items) => {
+                                tokio::spawn(send_offered(conn.clone(), req.transfer_id, items, purpose, ctl_tx.clone()));
                             }
                             None => {
                                 let _ = ctl_tx.try_send(ctl(Msg::FileResult(pb::FileResult {
@@ -349,6 +365,16 @@ async fn run_session(
                                     saved_to: String::new(),
                                 })));
                             }
+                        }
+                    }
+                    Some(Msg::FileOffer(o)) if clip_files_on => {
+                        tracing::info!("client copied {} item(s) (offer {:016x})", o.files.len(), o.transfer_id);
+                        incoming.register(&o, &clip_cache);
+                        hub.send(Cmd::ClipboardOffer(crate::ipc_pb::ClipboardOffer { transfer_id: o.transfer_id }));
+                    }
+                    Some(Msg::FileResult(r)) if !r.ok => {
+                        if let Some(Err(e)) = incoming.fail(r.transfer_id, r.message.clone()) {
+                            hub.send(paste_done(r.transfer_id, Err(e)));
                         }
                     }
                     Some(Msg::Ping(p)) => {
@@ -411,28 +437,25 @@ async fn run_session(
                         let _ = ctl_tx.try_send(ctl(Msg::ServerStats(s)));
                     }
                     Some(Ev::ClipboardFiles(f)) if files_on => {
-                        let mut entries = Vec::new();
-                        let mut paths = Vec::new();
-                        for p in f.paths.iter().map(std::path::PathBuf::from) {
-                            match std::fs::metadata(&p) {
-                                Ok(m) if m.is_file() => {
-                                    entries.push(pb::FileEntry {
-                                        name: p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-                                        size: m.len(),
-                                    });
-                                    paths.push(p);
-                                }
-                                // Folders are not supported yet.
-                                _ => tracing::info!("not offering {} (folder or unreadable)", p.display()),
-                            }
+                        let paths: Vec<std::path::PathBuf> = f.paths.iter().map(std::path::PathBuf::from).collect();
+                        match offers.offer(&paths, clip_files_on) {
+                            Some(o) => { let _ = ctl_tx.send(ctl(Msg::FileOffer(o))).await; }
+                            None => tracing::info!("nothing to offer from {} copied item(s)", paths.len()),
                         }
-                        if !entries.is_empty() {
-                            let id = rand::random::<u64>();
-                            offers.push_back((id, paths));
-                            if offers.len() > 8 {
-                                offers.pop_front();
+                    }
+                    Some(Ev::ClipboardPaste(p)) => {
+                        use nya_transport::clipfiles::Paste;
+                        let id = p.transfer_id;
+                        match incoming.paste(id) {
+                            Paste::Ready(paths) => hub.send(paste_done(id, Ok(paths))),
+                            Paste::Request => {
+                                tracing::info!("fetching the client's files for a paste (offer {id:016x})");
+                                let req = pb::FileRequest { transfer_id: id, purpose: pb::FilePurpose::Clipboard as i32 };
+                                let _ = ctl_tx.send(ctl(Msg::FileRequest(req))).await;
                             }
-                            let _ = ctl_tx.send(ctl(Msg::FileOffer(pb::FileOffer { transfer_id: id, files: entries }))).await;
+                            Paste::Wait => {}
+                            Paste::Failed(e) => hub.send(paste_done(id, Err(e))),
+                            Paste::Unknown => hub.send(paste_done(id, Err("这批文件已过期，请在客户端重新复制".into()))),
                         }
                     }
                     Some(Ev::ClipboardImage(img)) if images_on => {
@@ -445,6 +468,7 @@ async fn run_session(
                                 purpose: pb::FilePurpose::ClipboardImage as i32,
                                 index: 0,
                                 count: 1,
+                                path: String::new(),
                             };
                             if let Err(e) = nya_transport::files::send_bytes(&conn, h, &img.dib).await {
                                 tracing::debug!("clipboard image: {e:#}");
@@ -545,38 +569,44 @@ async fn cursor_writer(conn: Connection, mut rx: mpsc::Receiver<pb::CursorMsg>) 
 
 /// Accept client uni streams; the input stream feeds the host.
 /// Send files the client asked for (from a FileOffer).
-async fn send_offered(conn: Connection, id: u64, paths: Vec<std::path::PathBuf>, ctl_tx: mpsc::Sender<pb::ControlMsg>) {
-    let count = paths.len() as u32;
-    for (i, p) in paths.iter().enumerate() {
-        let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-        let h = pb::FileHeader {
-            transfer_id: id,
-            name: p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-            size,
-            purpose: pb::FilePurpose::Save as i32,
-            index: i as u32,
-            count,
-        };
-        if let Err(e) = nya_transport::files::send_file(&conn, h, p, |_| {}).await {
-            tracing::warn!("sending {}: {e:#}", p.display());
-            let _ = ctl_tx
-                .send(ctl(Msg::FileResult(pb::FileResult {
-                    transfer_id: id,
-                    ok: false,
-                    message: format!("发送 {} 失败：{e:#}", p.display()),
-                    saved_to: String::new(),
-                })))
-                .await;
-            return;
-        }
+async fn send_offered(
+    conn: Connection,
+    id: u64,
+    items: Vec<nya_transport::files::Item>,
+    purpose: pb::FilePurpose,
+    ctl_tx: mpsc::Sender<pb::ControlMsg>,
+) {
+    let files = items.iter().filter(|i| !i.is_dir).count();
+    if let Err(e) = nya_transport::clipfiles::send_items(&conn, id, &items, purpose, |_, _| {}).await {
+        tracing::warn!("sending offer {id:016x}: {e:#}");
+        let _ = ctl_tx
+            .send(ctl(Msg::FileResult(pb::FileResult {
+                transfer_id: id,
+                ok: false,
+                message: format!("被控端发送文件失败：{e:#}"),
+                saved_to: String::new(),
+            })))
+            .await;
+        return;
     }
-    tracing::info!("sent {count} offered file(s) to client");
+    tracing::info!("sent {files} offered file(s) to client ({purpose:?})");
+}
+
+fn paste_done(id: u64, r: Result<Vec<std::path::PathBuf>, String>) -> Cmd {
+    let (paths, error) = match r {
+        Ok(p) => (p.into_iter().map(|p| p.to_string_lossy().into_owned()).collect(), String::new()),
+        Err(e) => (Vec::new(), e),
+    };
+    Cmd::ClipboardPasteDone(crate::ipc_pb::ClipboardPasteDone { transfer_id: id, paths, error })
 }
 
 struct FileCtx {
     ctl_tx: mpsc::Sender<pb::ControlMsg>,
     files_on: bool,
     images_on: bool,
+    clip_files_on: bool,
+    /// Client offers being pasted on the host.
+    incoming: nya_transport::clipfiles::Incoming,
     /// transfer id -> files received so far
     batches: Arc<std::sync::Mutex<std::collections::HashMap<u64, Vec<String>>>>,
 }
@@ -621,6 +651,21 @@ async fn receive_file(mut r: RecvStream, hub: Arc<Hub>, ctx: Arc<FileCtx>) -> Re
             };
             if let Some(m) = msg {
                 let _ = ctx.ctl_tx.send(ctl(Msg::FileResult(m))).await;
+            }
+        }
+        pb::FilePurpose::Clipboard if ctx.clip_files_on => {
+            let Some(root) = ctx.incoming.root(h.transfer_id) else {
+                let _ = r.stop(0u32.into());
+                return Ok(());
+            };
+            let result = files::receive_to_tree(&mut r, &h, &root, |_| {}).await;
+            let r = result.map(|_| ()).map_err(|e| format!("接收 {} 失败：{e:#}", if h.path.is_empty() { &h.name } else { &h.path }));
+            if let Some(done) = ctx.incoming.file_done(h.transfer_id, r) {
+                match &done {
+                    Ok(p) => tracing::info!("client files for the paste are here: {} item(s) in {}", p.len(), root.display()),
+                    Err(e) => tracing::warn!("paste of client files failed: {e}"),
+                }
+                hub.send(paste_done(h.transfer_id, done));
             }
         }
         pb::FilePurpose::ClipboardImage if ctx.images_on => {
@@ -708,6 +753,14 @@ mod tests {
         }
     }
 
+    /// One server identity for all tests: the server fingerprint is process-wide.
+    fn server_identity() -> Identity {
+        static ID: std::sync::OnceLock<Identity> = std::sync::OnceLock::new();
+        let id = ID.get_or_init(|| Identity::generate().unwrap()).clone();
+        let _ = SERVER_FP.set(id.fingerprint());
+        id
+    }
+
     struct Client {
         _ep: quinn::Endpoint,
         conn: Connection,
@@ -745,9 +798,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn handshake_pairing_stream_and_input() {
         let dir = std::env::temp_dir().join(format!("nya-net-test-{}", nya_proto::now_us()));
-        let server_id = Identity::load_or_create(&dir).unwrap();
+        let server_id = server_identity();
         let server_fp = server_id.fingerprint();
-        let _ = SERVER_FP.set(server_fp);
         let auth = Arc::new(AuthStore::open(&dir).unwrap());
         let key = auth.key();
         let (hub, cmd_rx) = Hub::new();
@@ -845,6 +897,80 @@ mod tests {
                 break;
             }
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A host whose user pastes the client's files as soon as they are offered.
+    async fn pasting_host(hub: Arc<Hub>, mut cmds: mpsc::UnboundedReceiver<HostCommand>, done: mpsc::UnboundedSender<crate::ipc_pb::ClipboardPasteDone>) {
+        while let Some(HostCommand { cmd: Some(c) }) = cmds.recv().await {
+            match c {
+                Cmd::ClipboardOffer(o) => {
+                    let paste = crate::ipc_pb::ClipboardPaste { transfer_id: o.transfer_id };
+                    hub.publish(HostEvent { ev: Some(Ev::ClipboardPaste(paste)) }).await;
+                }
+                Cmd::ClipboardPasteDone(d) => {
+                    let _ = done.send(d);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Client copies a folder and a file; the host pastes: the service asks
+    /// for the files, receives them into its paste cache and hands the host
+    /// the top-level items.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clipboard_files_client_to_host() {
+        let dir = std::env::temp_dir().join(format!("nya-clip-test-{}", nya_proto::now_us()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let server_id = server_identity();
+        let server_fp = server_id.fingerprint();
+        let auth = Arc::new(AuthStore::open(&dir).unwrap());
+        let key = auth.key();
+        let (hub, cmd_rx) = Hub::new();
+        let (done_tx, mut done_rx) = mpsc::unbounded_channel();
+        tokio::spawn(pasting_host(hub.clone(), cmd_rx, done_tx));
+        let ep = nya_transport::endpoint::server_endpoint("127.0.0.1:0".parse().unwrap(), &server_id).unwrap();
+        let addr = ep.local_addr().unwrap();
+        let state = State::new(cpb::Mode::Standalone, dir.clone(), Default::default(), server_fp.to_string(), auth, hub);
+        tokio::spawn(serve_endpoint(ep, state));
+        let client_id = Identity::generate().unwrap();
+        let (mut c, _) = connect(addr, &client_id, server_fp).await;
+        assert!(pair(&mut c, &client_id, server_fp, &key).await.ok);
+        c.conn.close(0u32.into(), b"");
+        let (mut c, w) = connect(addr, &client_id, server_fp).await;
+        assert!(w.features.contains(&(Feature::ClipboardFiles as u32)));
+
+        // What the client copied.
+        let src = dir.join("src");
+        std::fs::create_dir_all(src.join("docs").join("empty")).unwrap();
+        std::fs::write(src.join("docs").join("a.txt"), b"hello").unwrap();
+        std::fs::write(src.join("b.txt"), b"bye").unwrap();
+        let mut outgoing = nya_transport::clipfiles::Outgoing::default();
+        let offer = outgoing.offer(&[src.join("docs"), src.join("b.txt")], true).unwrap();
+        let id = offer.transfer_id;
+        write_msg(&mut c.send, &ctl(Msg::FileOffer(offer))).await.unwrap();
+
+        // The paste makes the service request the files for the clipboard.
+        let req = loop {
+            let m: pb::ControlMsg = timeout(Duration::from_secs(5), expect_msg(&mut c.recv, MAX_MESSAGE_LEN)).await.unwrap().unwrap();
+            if let Some(Msg::FileRequest(r)) = m.msg {
+                break r;
+            }
+        };
+        assert_eq!((req.transfer_id, req.purpose), (id, pb::FilePurpose::Clipboard as i32));
+        let items = outgoing.items(id).unwrap();
+        nya_transport::clipfiles::send_items(&c.conn, id, &items, pb::FilePurpose::Clipboard, |_, _| {}).await.unwrap();
+
+        let done = timeout(Duration::from_secs(10), done_rx.recv()).await.unwrap().unwrap();
+        assert_eq!(done.error, "");
+        let paths: Vec<std::path::PathBuf> = done.paths.iter().map(std::path::PathBuf::from).collect();
+        assert_eq!(paths.len(), 2);
+        assert!(paths[0].ends_with("docs") && paths[1].ends_with("b.txt"), "{paths:?}");
+        assert_eq!(std::fs::read(paths[0].join("a.txt")).unwrap(), b"hello");
+        assert!(paths[0].join("empty").is_dir(), "empty folders are recreated");
+        assert_eq!(std::fs::read(&paths[1]).unwrap(), b"bye");
+        let _ = std::fs::remove_dir_all(paths[0].parent().unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

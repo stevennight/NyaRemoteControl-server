@@ -204,6 +204,15 @@ pub fn console_user_token() -> Option<Handle> {
 
 /// Folder for files received from the client: the console user's
 /// `Downloads\NyaRemoteControl` (or the current user's in standalone mode).
+/// The console user's paste cache (`%LOCALAPPDATA%\NyaRemoteControl\clipboard`):
+/// Explorer, running as that user, copies pasted files from there.
+pub fn clipboard_cache_dir() -> std::path::PathBuf {
+    let token = console_user_token();
+    nya_win::shell::clipboard_cache_dir(token.as_ref().map(|t| t.0))
+        .or_else(|| nya_win::shell::clipboard_cache_dir(None))
+        .unwrap_or_else(|| std::env::temp_dir().join("NyaRemoteControl").join("clipboard"))
+}
+
 pub fn receive_dir() -> std::path::PathBuf {
     let token = console_user_token();
     nya_win::shell::receive_dir(token.as_ref().map(|t| t.0))

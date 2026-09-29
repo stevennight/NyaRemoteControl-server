@@ -117,6 +117,13 @@ pub fn run(mut commands: mpsc::UnboundedReceiver<HostCommand>, events: mpsc::Sen
             Cmd::ClipboardFiles(f) => {
                 let _ = clip_tx.send(clipboard::ClipCmd::SetFiles(f.paths));
             }
+            Cmd::ClipboardOffer(o) => {
+                let _ = clip_tx.send(clipboard::ClipCmd::Offer(o.transfer_id));
+            }
+            Cmd::ClipboardPasteDone(d) => {
+                let r = if d.error.is_empty() { Ok(d.paths) } else { Err(d.error) };
+                let _ = clip_tx.send(clipboard::ClipCmd::PasteDone(d.transfer_id, r));
+            }
             Cmd::MicAudio(m) => {
                 let _ = mic_tx.try_send(m.datagram);
             }

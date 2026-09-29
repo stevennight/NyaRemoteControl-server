@@ -23,7 +23,18 @@ message HostCommand {
     ClipboardImage clipboard_image = 13;
     ClipboardFiles clipboard_files = 14;
     MicAudio mic_audio = 15;
+    ClipboardOffer clipboard_offer = 16;
+    ClipboardPasteDone clipboard_paste_done = 17;
   }
+}
+
+// The client copied files: put them on the host clipboard (fetched when pasted).
+message ClipboardOffer { uint64 transfer_id = 1; }
+// Answer to ClipboardPaste: the files are local now (paths), or `error`.
+message ClipboardPasteDone {
+  uint64 transfer_id = 1;
+  repeated string paths = 2;
+  string error = 3;
 }
 
 // One MIC datagram from the client, unchanged.
@@ -57,8 +68,12 @@ message HostEvent {
     ClipboardImage clipboard_image = 10;
     ClipboardFiles clipboard_files = 11;
     nya.v1.GamepadRumble gamepad_rumble = 12;
+    ClipboardPaste clipboard_paste = 13;
   }
 }
+
+// Something is pasting the client's files on the host: fetch them.
+message ClipboardPaste { uint64 transfer_id = 1; }
 
 message VideoFrame {
   uint64 stream_id = 1;

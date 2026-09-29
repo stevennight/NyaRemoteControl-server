@@ -62,6 +62,11 @@ pub async fn bridge(pipe: NamedPipeServer, hub: &Arc<Hub>, commands: &mut mpsc::
 
 /// Helper process entry point.
 pub async fn run_helper(pipe: &str) -> Result<()> {
+    // Explorer (the logged-on user) calls into our clipboard data object when
+    // the client's files are pasted; this process runs as SYSTEM.
+    if let Err(e) = nya_win::clipboard_files::allow_interactive_callers() {
+        tracing::warn!("COM security for clipboard files: {e:#}");
+    }
     let path = pipe_path(pipe);
     let client = loop {
         match ClientOptions::new().open(&path) {
