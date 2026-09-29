@@ -133,6 +133,7 @@ fn display_infos(st: &State) -> Vec<pb::DisplayInfo> {
             primary: o.primary,
             gpu_index: o.adapter_index,
             is_virtual: virt.iter().any(|n| n.eq_ignore_ascii_case(&o.device_name)),
+            virtual_index: virt.iter().position(|n| n.eq_ignore_ascii_case(&o.device_name)).map_or(0, |i| i as u32 + 1),
             hdr: o.hdr,
         })
         .collect()
