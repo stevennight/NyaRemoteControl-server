@@ -48,7 +48,10 @@ message ClipboardFiles { repeated string paths = 1; }
 // Adaptive bitrate decided by the network side.
 message SetBitrate { uint32 kbps = 1; }
 
-message FrameSent { uint64 frame_id = 1; }
+message FrameSent {
+  uint64 frame_id = 1;
+  uint64 stream_id = 2;   // which pipeline (several run at once)
+}
 message ClientGone {}
 message Shutdown {}
 message SetAudio { bool enabled = 1; }
@@ -80,6 +83,7 @@ message VideoFrame {
   uint64 frame_id = 2;
   bytes header = 3;   // encoded VideoFrameHeader
   bytes data = 4;
+  uint32 slot = 5;      // client window the stream is for
 }
 
 message AudioDatagram { bytes datagram = 1; }

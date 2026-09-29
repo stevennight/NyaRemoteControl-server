@@ -96,11 +96,11 @@ pub fn run(mut commands: mpsc::UnboundedReceiver<HostCommand>, events: mpsc::Sen
             Cmd::StartStream(s) => {
                 let _ = video_tx.send(video::VideoCmd::Start(s));
             }
-            Cmd::StopStream(_) => {
-                let _ = video_tx.send(video::VideoCmd::Stop);
+            Cmd::StopStream(s) => {
+                let _ = video_tx.send(video::VideoCmd::Stop(s.slot));
             }
-            Cmd::RequestKeyframe(_) => {
-                let _ = video_tx.send(video::VideoCmd::Keyframe);
+            Cmd::RequestKeyframe(k) => {
+                let _ = video_tx.send(video::VideoCmd::Keyframe(k.slot));
             }
             Cmd::SetMode(m) => {
                 let mode = pb::StreamMode::try_from(m.mode).unwrap_or(pb::StreamMode::Office);
@@ -131,7 +131,7 @@ pub fn run(mut commands: mpsc::UnboundedReceiver<HostCommand>, events: mpsc::Sen
                 let _ = video_tx.send(video::VideoCmd::SetBitrate(b.kbps));
             }
             Cmd::FrameSent(f) => {
-                let _ = video_tx.send(video::VideoCmd::FrameSent(f.frame_id));
+                let _ = video_tx.send(video::VideoCmd::FrameSent(f.stream_id, f.frame_id));
             }
             Cmd::Input(i) => {
                 let _ = input_tx.send(input::InputCmd::Event(i));
@@ -143,7 +143,7 @@ pub fn run(mut commands: mpsc::UnboundedReceiver<HostCommand>, events: mpsc::Sen
                 let _ = audio_tx.send(a.enabled && cfg.audio);
             }
             Cmd::ClientGone(_) => {
-                let _ = video_tx.send(video::VideoCmd::Stop);
+                let _ = video_tx.send(video::VideoCmd::StopAll);
                 let _ = audio_tx.send(false);
                 let _ = input_tx.send(input::InputCmd::ReleaseAll);
                 let _ = input_tx.send(input::InputCmd::UnplugPads);

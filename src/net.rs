@@ -184,7 +184,8 @@ pub static SERVER_FP: std::sync::OnceLock<Fingerprint> = std::sync::OnceLock::ne
 #[derive(Default)]
 struct Replay {
     caps: Option<pb::ClientCaps>,
-    start: Option<pb::StartStream>,
+    /// Stream requests by slot (client window).
+    starts: std::collections::BTreeMap<u32, pb::StartStream>,
     audio: bool,
 }
 
@@ -219,8 +220,9 @@ async fn run_session(
     let written = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let video_task = tokio::spawn({
         let (conn, hub, written) = (conn.clone(), hub.clone(), written.clone());
+        let multi = neg.has(Feature::MultiStream);
         async move {
-            if let Err(e) = video_writer(conn, video_rx, hub, written).await {
+            if let Err(e) = video_writer(conn, video_rx, hub, written, multi).await {
                 tracing::warn!("video writer: {e:#}");
             }
         }
@@ -262,6 +264,10 @@ async fn run_session(
     };
 
     let mut replay = Replay::default();
+    // Several streams at once (one per client window).
+    let multi_on = neg.has(Feature::MultiStream);
+    // Configured bitrate of each running stream, by slot.
+    let mut stream_max: std::collections::BTreeMap<u32, u32> = Default::default();
     let mut generation = hub.generation.subscribe();
     generation.mark_unchanged();
     let audio_on = neg.has(Feature::Audio);
@@ -312,16 +318,28 @@ async fn run_session(
                             hub.send(Cmd::SetAudio(SetAudio { enabled: true }));
                         }
                     }
-                    Some(Msg::StartStream(s)) => {
-                        replay.start = Some(s.clone());
+                    Some(Msg::StartStream(mut s)) => {
+                        if !multi_on {
+                            s.slot = 0;
+                        }
+                        replay.starts.insert(s.slot, s.clone());
                         hub.send(Cmd::StartStream(s));
                     }
-                    Some(Msg::StopStream(s)) => {
-                        replay.start = None;
+                    Some(Msg::StopStream(mut s)) => {
+                        if !multi_on {
+                            s.slot = 0;
+                        }
+                        // Stopping the main window's stream stops them all.
+                        if s.slot == 0 {
+                            replay.starts.clear();
+                        } else {
+                            replay.starts.remove(&s.slot);
+                        }
+                        stream_max.remove(&s.slot);
                         hub.send(Cmd::StopStream(s));
                     }
                     Some(Msg::SetMode(m)) => {
-                        if let Some(s) = replay.start.as_mut() {
+                        for s in replay.starts.values_mut() {
                             s.config.get_or_insert_with(Default::default).mode = m.mode;
                         }
                         hub.send(Cmd::SetMode(m));
@@ -415,15 +433,22 @@ async fn run_session(
                     }
                     Some(Ev::SessionInfo(i)) => { let _ = ctl_tx.send(ctl(Msg::SessionInfo(i))).await; }
                     Some(Ev::StreamStarted(s)) => {
-                        let max = s.config.as_ref().map(|c| c.bitrate_kbps).unwrap_or(0);
-                        let requested = replay.start.as_ref().and_then(|r| r.config.as_ref()).map(|c| c.bitrate_policy).unwrap_or(0);
+                        // Adaptive bitrate works on the whole connection: its
+                        // ceiling is the sum of the streams' configured rates.
+                        stream_max.insert(s.slot, s.config.as_ref().map(|c| c.bitrate_kbps).unwrap_or(0));
+                        let max: u32 = stream_max.values().sum();
+                        let main = replay.starts.get(&0);
+                        let requested = main.and_then(|r| r.config.as_ref()).map(|c| c.bitrate_policy).unwrap_or(0);
                         let mode = s.config.as_ref().map(|c| c.mode).unwrap_or(0);
                         let policy = crate::abr::resolve(requested, mode);
                         abr = if max > 0 { crate::abr::Abr::new(max, policy, std::time::Instant::now()) } else { None };
-                        tracing::info!("bitrate policy: {} (max {max} kbps)", crate::abr::policy_name(policy));
+                        tracing::info!("bitrate policy: {} (max {max} kbps, {} stream(s))", crate::abr::policy_name(policy), stream_max.len());
                         if let Some(c) = &s.config {
                             let codec = pb::Codec::try_from(c.codec).map(|c| c.as_str_name()).unwrap_or("?");
-                            state.set_stream(format!("{}x{} {} fps · {codec} · {}", c.width, c.height, c.fps, s.encoder_name));
+                            let more = if stream_max.len() > 1 { format!(" · 共 {} 路画面", stream_max.len()) } else { String::new() };
+                            if s.slot == 0 || stream_max.len() > 1 {
+                                state.set_stream(format!("{}x{} {} fps · {codec} · {}{more}", c.width, c.height, c.fps, s.encoder_name));
+                            }
                         }
                         let _ = ctl_tx.send(ctl(Msg::StreamStarted(s))).await;
                     }
@@ -490,7 +515,7 @@ async fn run_session(
                 tracing::info!("host restarted; replaying stream request");
                 if let Some(c) = &replay.caps { hub.send(Cmd::ClientCaps(c.clone())); }
                 if replay.audio { hub.send(Cmd::SetAudio(SetAudio { enabled: true })); }
-                if let Some(s) = &replay.start { hub.send(Cmd::StartStream(s.clone())); }
+                for s in replay.starts.values() { hub.send(Cmd::StartStream(s.clone())); }
             }
             _ = att.kicked.notify.notified() => {
                 let reason = att.kicked.reason();
@@ -515,18 +540,23 @@ async fn run_session(
 
 /// Writes frames on one uni stream per video stream id; acknowledges each
 /// frame to the host once quinn accepted it (flow control, §6.2).
+/// One QUIC uni stream per video stream; with FEATURE_MULTI_STREAM several
+/// run at once (one per slot) and the prelude names the slot.
 async fn video_writer(
     conn: Connection,
     mut rx: mpsc::Receiver<crate::ipc_pb::VideoFrame>,
     hub: Arc<Hub>,
     written: Arc<std::sync::atomic::AtomicU64>,
+    multi: bool,
 ) -> Result<()> {
-    let mut current: Option<(u64, SendStream)> = None;
+    // slot -> (stream id, QUIC stream)
+    let mut open: std::collections::HashMap<u32, (u64, SendStream)> = Default::default();
     let (mut frames, mut bytes, mut since) = (0u64, 0u64, std::time::Instant::now());
     while let Some(f) = rx.recv().await {
-        if current.as_ref().map(|c| c.0) != Some(f.stream_id) {
-            tracing::info!("opening video stream {} to client (first frame {} bytes)", f.stream_id, f.data.len());
-            if let Some((_, mut old)) = current.take() {
+        let slot = if multi { f.slot } else { 0 };
+        if open.get(&slot).map(|c| c.0) != Some(f.stream_id) {
+            tracing::info!("opening video stream {} (slot {slot}) to client (first frame {} bytes)", f.stream_id, f.data.len());
+            if let Some((_, mut old)) = open.remove(&slot) {
                 let _ = old.finish();
             }
             let mut s = conn.open_uni().await?;
@@ -534,15 +564,18 @@ async fn video_writer(
             let mut prelude = Vec::new();
             encode_varint(stream_type::VIDEO, &mut prelude);
             encode_varint(f.stream_id, &mut prelude);
+            if multi {
+                encode_varint(slot as u64, &mut prelude);
+            }
             s.write_all(&prelude).await?;
-            current = Some((f.stream_id, s));
+            open.insert(slot, (f.stream_id, s));
         }
-        let s = &mut current.as_mut().unwrap().1;
+        let s = &mut open.get_mut(&slot).unwrap().1;
         let len = (f.header.len() + f.data.len()) as u32;
         s.write_all(&len.to_le_bytes()).await?;
         s.write_all(&f.header).await?;
         s.write_all(&f.data).await?;
-        hub.send(Cmd::FrameSent(FrameSent { frame_id: f.frame_id }));
+        hub.send(Cmd::FrameSent(FrameSent { frame_id: f.frame_id, stream_id: f.stream_id }));
         written.fetch_add(len as u64 + 4, std::sync::atomic::Ordering::Relaxed);
         frames += 1;
         bytes += len as u64;
@@ -739,7 +772,7 @@ mod tests {
                         let h = VideoFrameHeader { frame_id: i, width: 64, height: 64, codec: pb::Codec::H264 as u8, ..Default::default() };
                         let mut hb = Vec::new();
                         h.write(&mut hb);
-                        let f = VideoFrame { stream_id: 7, frame_id: i, header: hb, data: vec![i as u8; 1000] };
+                        let f = VideoFrame { stream_id: 7, frame_id: i, header: hb, data: vec![i as u8; 1000], slot: 0 };
                         hub.publish(HostEvent { ev: Some(Ev::Video(f)) }).await;
                     }
                 }
@@ -848,6 +881,7 @@ mod tests {
             }
         };
         assert_eq!(read_varint(&mut r).await.unwrap(), Some(7));
+        assert_eq!(read_varint(&mut r).await.unwrap(), Some(0), "slot (multi-stream client)");
         for i in 1..=3u64 {
             let mut len = [0u8; 4];
             r.read_exact(&mut len).await.unwrap();
@@ -894,6 +928,111 @@ mod tests {
             let m: pb::ControlMsg = expect_msg(&mut c.recv, MAX_MESSAGE_LEN).await.unwrap();
             if let Some(Msg::Bye(b)) = m.msg {
                 assert_eq!(b.reason, "管理员断开了连接");
+                break;
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A host that streams two frames per started slot and reports what it saw.
+    async fn multi_host(hub: Arc<Hub>, mut cmds: mpsc::UnboundedReceiver<HostCommand>, seen: mpsc::UnboundedSender<String>) {
+        while let Some(HostCommand { cmd: Some(c) }) = cmds.recv().await {
+            match c {
+                Cmd::StartStream(s) => {
+                    let stream_id = 100 + s.slot as u64;
+                    let started = pb::StreamStarted { display_id: s.display_id, stream_id, slot: s.slot, ..Default::default() };
+                    hub.publish(HostEvent { ev: Some(Ev::StreamStarted(started)) }).await;
+                    for i in 1..=2u64 {
+                        let h = VideoFrameHeader { frame_id: i, width: 64, height: 64, codec: pb::Codec::H264 as u8, ..Default::default() };
+                        let mut hb = Vec::new();
+                        h.write(&mut hb);
+                        let f = VideoFrame { stream_id, frame_id: i, header: hb, data: vec![s.slot as u8; 100], slot: s.slot };
+                        hub.publish(HostEvent { ev: Some(Ev::Video(f)) }).await;
+                    }
+                }
+                Cmd::FrameSent(f) => {
+                    let _ = seen.send(format!("sent {} {}", f.stream_id, f.frame_id));
+                }
+                Cmd::StopStream(s) => {
+                    let _ = seen.send(format!("stop {}", s.slot));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Two windows: two slots stream at once on separate QUIC streams whose
+    /// prelude names the slot; acknowledgements go to the right stream.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_streams_at_once() {
+        let dir = std::env::temp_dir().join(format!("nya-multi-test-{}", nya_proto::now_us()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let server_id = server_identity();
+        let server_fp = server_id.fingerprint();
+        let auth = Arc::new(AuthStore::open(&dir).unwrap());
+        let key = auth.key();
+        let (hub, cmd_rx) = Hub::new();
+        let (seen_tx, mut seen) = mpsc::unbounded_channel();
+        tokio::spawn(multi_host(hub.clone(), cmd_rx, seen_tx));
+        let ep = nya_transport::endpoint::server_endpoint("127.0.0.1:0".parse().unwrap(), &server_id).unwrap();
+        let addr = ep.local_addr().unwrap();
+        let state = State::new(cpb::Mode::Standalone, dir.clone(), Default::default(), server_fp.to_string(), auth, hub);
+        tokio::spawn(serve_endpoint(ep, state));
+        let client_id = Identity::generate().unwrap();
+        let (mut c, _) = connect(addr, &client_id, server_fp).await;
+        assert!(pair(&mut c, &client_id, server_fp, &key).await.ok);
+        c.conn.close(0u32.into(), b"");
+        let (mut c, w) = connect(addr, &client_id, server_fp).await;
+        assert!(w.features.contains(&(Feature::MultiStream as u32)));
+
+        for slot in [0u32, 1] {
+            let s = pb::StartStream { display_id: 1 + slot, slot, ..Default::default() };
+            write_msg(&mut c.send, &ctl(Msg::StartStream(s))).await.unwrap();
+        }
+        let mut started = std::collections::BTreeMap::new();
+        while started.len() < 2 {
+            let m: pb::ControlMsg = timeout(Duration::from_secs(5), expect_msg(&mut c.recv, MAX_MESSAGE_LEN)).await.unwrap().unwrap();
+            if let Some(Msg::StreamStarted(s)) = m.msg {
+                started.insert(s.slot, s.stream_id);
+            }
+        }
+        assert_eq!(started, [(0, 100), (1, 101)].into_iter().collect());
+
+        // Two video streams, each: stream id, slot, then its frames.
+        let mut got = std::collections::BTreeMap::new();
+        while got.len() < 2 {
+            let mut r = timeout(Duration::from_secs(5), c.conn.accept_uni()).await.unwrap().unwrap();
+            if read_varint(&mut r).await.unwrap() != Some(stream_type::VIDEO) {
+                continue;
+            }
+            let stream_id = read_varint(&mut r).await.unwrap().unwrap();
+            let slot = read_varint(&mut r).await.unwrap().unwrap() as u32;
+            let mut len = [0u8; 4];
+            r.read_exact(&mut len).await.unwrap();
+            let mut buf = vec![0u8; u32::from_le_bytes(len) as usize];
+            r.read_exact(&mut buf).await.unwrap();
+            let (_, payload) = VideoFrameHeader::parse(&buf).unwrap();
+            assert!(payload.iter().all(|&b| b == slot as u8), "frames of slot {slot} on its own stream");
+            got.insert(slot, stream_id);
+        }
+        assert_eq!(got, started);
+
+        // Every frame was acknowledged to its own pipeline.
+        let mut acks = std::collections::BTreeSet::new();
+        while acks.len() < 4 {
+            let s = timeout(Duration::from_secs(5), seen.recv()).await.unwrap().unwrap();
+            if s.starts_with("sent ") {
+                acks.insert(s);
+            }
+        }
+        assert!(acks.contains("sent 100 2") && acks.contains("sent 101 2"), "{acks:?}");
+
+        // Closing the extra window stops only its stream.
+        write_msg(&mut c.send, &ctl(Msg::StopStream(pb::StopStream { slot: 1 }))).await.unwrap();
+        loop {
+            let s = timeout(Duration::from_secs(5), seen.recv()).await.unwrap().unwrap();
+            if s.starts_with("stop") {
+                assert_eq!(s, "stop 1");
                 break;
             }
         }

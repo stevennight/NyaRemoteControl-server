@@ -1,5 +1,7 @@
 //! Video thread: owns the GPU topology, probes encoders, builds/rebuilds the
-//! pipeline and drives it.
+//! pipelines and drives them. One pipeline per stream slot (client window:
+//! slot 0 is the main window, others show further displays at the same
+//! time); they take turns in this thread.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -18,26 +20,53 @@ use crate::ipc_pb::host_event::Ev;
 
 pub enum VideoCmd {
     Start(pb::StartStream),
-    Stop,
-    Keyframe,
+    /// Stop one slot's stream.
+    Stop(u32),
+    /// The client left: stop everything.
+    StopAll,
+    Keyframe(u32),
     SetMode(pb::StreamMode),
     Caps(pb::ClientCaps),
-    FrameSent(u64),
+    /// (stream id, frame id) handed to the network.
+    FrameSent(u64, u64),
+    /// Total for all streams (adaptive bitrate); split between them.
     SetBitrate(u32),
     Shutdown,
+}
+
+/// One stream (client window).
+struct Slot {
+    req: pb::StartStream,
+    pipe: Option<Pipeline>,
+    retry_at: Option<Instant>,
+    /// Rebuild before the next step.
+    rebuild: bool,
+    /// Frame ids continue across rebuilds of the slot's pipeline.
+    frame_counter: u64,
+    /// Plans that opened fine but failed while encoding; skipped after two failures.
+    failed: HashMap<Plan, u32>,
+}
+
+impl Slot {
+    fn new(req: pb::StartStream) -> Self {
+        Self { req, pipe: None, retry_at: None, rebuild: true, frame_counter: 0, failed: HashMap::new() }
+    }
+
+    fn drop_pipe(&mut self) {
+        if let Some(p) = self.pipe.take() {
+            self.frame_counter = self.frame_counter.max(p.frame_id);
+        }
+    }
 }
 
 struct State {
     topo: Topology,
     probes: Vec<EncoderProbe>,
-    req: Option<pb::StartStream>,
     caps: Option<pb::ClientCaps>,
-    pipe: Option<Pipeline>,
-    retry_at: Option<Instant>,
-    frame_counter: u64,
+    slots: std::collections::BTreeMap<u32, Slot>,
     next_stream_id: u64,
-    /// Plans that opened fine but failed while encoding; skipped after two failures.
-    failed: HashMap<Plan, u32>,
+    /// Latest total bitrate from the network side.
+    bitrate_total: Option<u32>,
     /// The session's virtual display, if it asked for one.
     vd: Option<HostDisplays>,
     /// Client gone: remove the virtual display at this time unless it comes
@@ -136,13 +165,10 @@ pub fn thread(rx: Receiver<VideoCmd>, sink: Sink, input_tx: Sender<InputCmd>, cf
     let mut st = State {
         topo,
         probes,
-        req: None,
         caps: None,
-        pipe: None,
-        retry_at: None,
-        frame_counter: 0,
+        slots: Default::default(),
         next_stream_id: nya_proto::now_us(),
-        failed: HashMap::new(),
+        bitrate_total: None,
         vd: None,
         vd_release_at: None,
         vd_available: vdisplay::available(),
@@ -152,65 +178,80 @@ pub fn thread(rx: Receiver<VideoCmd>, sink: Sink, input_tx: Sender<InputCmd>, cf
 
     loop {
         // --- commands ---
-        let first = if st.pipe.is_some() {
+        let running = st.slots.values().any(|x| x.pipe.is_some());
+        let next_retry = st.slots.values().filter(|x| x.pipe.is_none()).filter_map(|x| x.retry_at).min();
+        let first = if running {
             rx.try_recv().ok()
-        } else if let Some(at) = st.retry_at {
-            match rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
-                Ok(c) => Some(c),
-                Err(RecvTimeoutError::Timeout) => None,
-                Err(RecvTimeoutError::Disconnected) => return,
-            }
         } else {
-            match rx.recv_timeout(Duration::from_secs(1)) {
+            let wait = match next_retry {
+                Some(at) => at.saturating_duration_since(Instant::now()),
+                None => Duration::from_secs(1),
+            };
+            match rx.recv_timeout(wait) {
                 Ok(c) => Some(c),
                 Err(RecvTimeoutError::Timeout) => None,
                 Err(RecvTimeoutError::Disconnected) => return,
             }
         };
-        let mut rebuild = false;
         for cmd in first.into_iter().chain(rx.try_iter()) {
             match cmd {
                 VideoCmd::Start(s) => {
-                    if apply_virtual_display(&mut st, &s, &sink) {
+                    // The display setup is the main window's business.
+                    if s.slot == 0 && apply_virtual_display(&mut st, &s, &sink) {
                         refresh_topology(&mut st, &sink, &cfg);
+                        for x in st.slots.values_mut() {
+                            x.drop_pipe();
+                            x.rebuild = true;
+                        }
                     }
-                    st.req = Some(s);
-                    rebuild = true;
-                }
-                VideoCmd::Stop => {
-                    drop_pipe(&mut st);
-                    st.req = None;
-                    st.retry_at = None;
-                    if st.vd.is_some() {
-                        st.vd_release_at = Some(Instant::now() + VD_GRACE);
+                    match st.slots.get_mut(&s.slot) {
+                        Some(x) => {
+                            x.req = s;
+                            x.rebuild = true;
+                        }
+                        None => {
+                            tracing::info!("stream slot {} started", s.slot);
+                            st.slots.insert(s.slot, Slot::new(s));
+                        }
                     }
+                    split_bitrate(&mut st);
                 }
-                VideoCmd::Keyframe => {
-                    if let Some(p) = st.pipe.as_mut() {
+                VideoCmd::Stop(slot) => {
+                    if let Some(mut x) = st.slots.remove(&slot) {
+                        x.drop_pipe();
+                        tracing::info!("stream slot {slot} stopped");
+                    }
+                    if slot == 0 {
+                        stop_all(&mut st);
+                    }
+                    split_bitrate(&mut st);
+                }
+                VideoCmd::StopAll => stop_all(&mut st),
+                VideoCmd::Keyframe(slot) => {
+                    if let Some(p) = st.slots.get_mut(&slot).and_then(|x| x.pipe.as_mut()) {
                         p.request_keyframe();
                     }
                 }
                 VideoCmd::SetMode(m) => {
-                    if let Some(r) = st.req.as_mut() {
-                        let c = r.config.get_or_insert_with(Default::default);
+                    for x in st.slots.values_mut() {
+                        let c = x.req.config.get_or_insert_with(Default::default);
                         if c.mode != m as i32 {
                             c.mode = m as i32;
                             // Let the server pick codec/chroma/bitrate/fps for the new mode.
                             c.chroma = 0;
                             c.fps = 0;
                             c.bitrate_kbps = 0;
-                            rebuild = true;
+                            x.rebuild = true;
                         }
                     }
                 }
                 VideoCmd::Caps(c) => st.caps = Some(c),
                 VideoCmd::SetBitrate(k) => {
-                    if let Some(p) = st.pipe.as_mut() {
-                        p.set_bitrate(k);
-                    }
+                    st.bitrate_total = Some(k);
+                    split_bitrate(&mut st);
                 }
-                VideoCmd::FrameSent(id) => {
-                    if let Some(p) = st.pipe.as_mut() {
+                VideoCmd::FrameSent(stream_id, id) => {
+                    if let Some(p) = st.slots.values_mut().filter_map(|x| x.pipe.as_mut()).find(|p| p.stream_id == stream_id) {
                         p.frame_sent(id);
                     }
                 }
@@ -238,49 +279,87 @@ pub fn thread(rx: Receiver<VideoCmd>, sink: Sink, input_tx: Sender<InputCmd>, cf
                     }
                 }
                 refresh_topology(&mut st, &sink, &cfg);
-                if st.pipe.is_some() {
-                    rebuild = true;
+                for x in st.slots.values_mut() {
+                    if x.pipe.is_some() {
+                        x.rebuild = true;
+                    }
                 }
             }
         }
 
         // --- (re)build ---
-        let retry_due = st.retry_at.is_some_and(|t| Instant::now() >= t);
-        if st.req.is_some() && (rebuild || (st.pipe.is_none() && (retry_due || st.retry_at.is_none()))) {
-            drop_pipe(&mut st);
-            match build(&mut st, &cfg, &mut desktop) {
+        let ids: Vec<u32> = st.slots.keys().copied().collect();
+        let mut built = false;
+        for id in &ids {
+            let x = &st.slots[id];
+            let retry_due = x.retry_at.map_or(true, |t| Instant::now() >= t);
+            if !(x.rebuild || (x.pipe.is_none() && retry_due)) {
+                continue;
+            }
+            let x = st.slots.get_mut(id).unwrap();
+            x.drop_pipe();
+            x.rebuild = false;
+            match build(&mut st, *id, &cfg, &mut desktop) {
                 Ok(p) => {
                     sink.send(Ev::StreamStarted(p.started.clone()));
-                    let _ = input_tx.send(InputCmd::SetRect(p.rect));
-                    st.pipe = Some(p);
-                    st.retry_at = None;
+                    let _ = input_tx.send(InputCmd::SetRect(*id, p.rect));
+                    let x = st.slots.get_mut(id).unwrap();
+                    x.pipe = Some(p);
+                    x.retry_at = None;
+                    built = true;
                 }
                 Err(msg) => {
-                    tracing::error!("cannot start stream: {msg}");
-                    sink.send(Ev::StreamError(pb::StreamError { message: msg }));
-                    st.retry_at = Some(Instant::now() + Duration::from_secs(3));
+                    tracing::error!("cannot start stream (slot {id}): {msg}");
+                    sink.send(Ev::StreamError(pb::StreamError { message: msg, slot: *id }));
+                    st.slots.get_mut(id).unwrap().retry_at = Some(Instant::now() + Duration::from_secs(3));
                 }
             }
         }
+        if built {
+            split_bitrate(&mut st);
+        }
 
         // --- run ---
-        if let Some(p) = st.pipe.as_mut() {
-            if let Step::Rebuild(why) = p.step(&sink, &mut desktop) {
-                tracing::warn!("rebuilding stream: {why}");
+        let n = st.slots.values().filter(|x| x.pipe.is_some()).count().max(1) as u32;
+        // Each pipeline may block this long waiting for its display.
+        let max_wait = Duration::from_millis((16 / n as u64).max(2));
+        let mut lost = false;
+        for x in st.slots.values_mut() {
+            let Some(p) = x.pipe.as_mut() else { continue };
+            if let Step::Rebuild(why) = p.step(&sink, &mut desktop, max_wait) {
+                tracing::warn!("rebuilding stream (slot {}): {why}", p.slot);
                 if why.starts_with("encode failed") {
-                    *st.failed.entry(p.plan.clone()).or_default() += 1;
+                    *x.failed.entry(p.plan.clone()).or_default() += 1;
                 }
-                drop_pipe(&mut st);
-                refresh_topology(&mut st, &sink, &cfg);
-                st.retry_at = Some(Instant::now() + Duration::from_millis(300));
+                x.drop_pipe();
+                x.retry_at = Some(Instant::now() + Duration::from_millis(300));
+                lost = true;
             }
+        }
+        if lost {
+            refresh_topology(&mut st, &sink, &cfg);
         }
     }
 }
 
-fn drop_pipe(st: &mut State) {
-    if let Some(p) = st.pipe.take() {
-        st.frame_counter = st.frame_counter.max(p.frame_id);
+/// The client left: all streams stop; the virtual display outlives it briefly.
+fn stop_all(st: &mut State) {
+    for (_, mut x) in std::mem::take(&mut st.slots) {
+        x.drop_pipe();
+    }
+    st.bitrate_total = None;
+    if st.vd.is_some() {
+        st.vd_release_at = Some(Instant::now() + VD_GRACE);
+    }
+}
+
+/// The adaptive bitrate is a total for the connection: share it between the
+/// streams (each still capped at its own configured rate).
+fn split_bitrate(st: &mut State) {
+    let Some(total) = st.bitrate_total else { return };
+    let n = st.slots.values().filter(|x| x.pipe.is_some()).count().max(1) as u32;
+    for p in st.slots.values_mut().filter_map(|x| x.pipe.as_mut()) {
+        p.set_bitrate(total / n);
     }
 }
 
@@ -292,7 +371,9 @@ fn refresh_topology(st: &mut State, sink: &Sink, cfg: &HostConfig) {
                 st.probes = select::probe_all(&t);
             }
             st.topo = t;
-            st.failed.clear();
+            for x in st.slots.values_mut() {
+                x.failed.clear();
+            }
             sink.send(Ev::DisplayChanged(pb::DisplayChanged { displays: display_infos(st) }));
             sink.send(Ev::SessionInfo(session_info(st, cfg)));
         }
@@ -309,8 +390,10 @@ fn apply_virtual_display(st: &mut State, req: &pb::StartStream, sink: &Sink) -> 
     if want == current {
         return false;
     }
-    // The pipeline captures a display that is about to change.
-    drop_pipe(st);
+    // The pipelines capture displays that are about to change.
+    for x in st.slots.values_mut() {
+        x.drop_pipe();
+    }
     if want.is_default() {
         st.vd = None;
         return true;
@@ -322,13 +405,19 @@ fn apply_virtual_display(st: &mut State, req: &pb::StartStream, sink: &Sink) -> 
     if let Err(e) = res {
         tracing::error!("virtual display: {e:#}");
         st.vd = None;
-        sink.send(Ev::StreamError(pb::StreamError { message: format!("虚拟显示器不可用，改用物理显示器：{e:#}") }));
+        sink.send(Ev::StreamError(pb::StreamError { message: format!("虚拟显示器不可用，改用物理显示器：{e:#}"), slot: 0 }));
     }
     true
 }
 
-fn build(st: &mut State, cfg: &HostConfig, desktop: &mut DesktopTracker) -> Result<Pipeline, String> {
-    let req = st.req.clone().unwrap();
+fn build(st: &mut State, slot: u32, cfg: &HostConfig, desktop: &mut DesktopTracker) -> Result<Pipeline, String> {
+    let req = st.slots[&slot].req.clone();
+    if slot != 0 {
+        // Extra windows show exactly the display they asked for.
+        if st.topo.output(req.display_id).is_none() {
+            return Err(format!("被控端没有这个显示器（{}），可能已被移除", req.display_id));
+        }
+    }
     let virtual_output = st
         .vd
         .as_ref()
@@ -345,7 +434,7 @@ fn build(st: &mut State, cfg: &HostConfig, desktop: &mut DesktopTracker) -> Resu
     let plans = select::plans(&st.probes, output.adapter_index, &req, st.caps.as_ref(), &cfg.encoder);
     let mut errors = Vec::new();
     for plan in plans {
-        if st.failed.get(&plan).copied().unwrap_or(0) >= 2 {
+        if st.slots[&slot].failed.get(&plan).copied().unwrap_or(0) >= 2 {
             tracing::info!("skipping plan that failed while encoding: {plan:?}");
             continue;
         }
@@ -358,8 +447,9 @@ fn build(st: &mut State, cfg: &HostConfig, desktop: &mut DesktopTracker) -> Resu
             st.caps.as_ref(),
             cfg,
             st.next_stream_id,
-            st.frame_counter,
+            st.slots[&slot].frame_counter,
             desktop,
+            slot,
         ) {
             Ok(p) => {
                 if !errors.is_empty() {

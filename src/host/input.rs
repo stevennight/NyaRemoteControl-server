@@ -7,7 +7,8 @@ use nya_win::input::{Button, DisplayRect, Injector};
 
 pub enum InputCmd {
     Event(pb::InputMsg),
-    SetRect(DisplayRect),
+    /// Display of a stream slot (absolute mouse coordinates are relative to it).
+    SetRect(u32, DisplayRect),
     ReleaseAll,
     /// Client gone: remove its virtual gamepads.
     UnplugPads,
@@ -31,6 +32,8 @@ pub fn thread(rx: Receiver<InputCmd>, sink: super::Sink) {
     let mut desktop = DesktopTracker::new();
     let mut last_sync = Instant::now() - Duration::from_secs(1);
     let (mut events, mut since) = (0u64, Instant::now());
+    let mut rects: std::collections::HashMap<u32, DisplayRect> = Default::default();
+    let mut current_slot: Option<u32> = None;
     for cmd in rx {
         if matches!(cmd, InputCmd::Event(_)) {
             events += 1;
@@ -52,7 +55,15 @@ pub fn thread(rx: Receiver<InputCmd>, sink: super::Sink) {
         }
         match cmd {
             InputCmd::Event(pb::InputMsg { ev: Some(ev) }) => match ev {
-                Ev::MouseAbs(m) => inj.mouse_abs(m.x, m.y),
+                Ev::MouseAbs(m) => {
+                    if current_slot != Some(m.slot) {
+                        if let Some(r) = rects.get(&m.slot) {
+                            inj.set_display_rect(*r);
+                            current_slot = Some(m.slot);
+                        }
+                    }
+                    inj.mouse_abs(m.x, m.y)
+                }
                 Ev::MouseRel(m) => inj.mouse_rel(m.dx, m.dy),
                 Ev::MouseButton(b) => {
                     if let Some(btn) = button(b.button) {
@@ -65,7 +76,13 @@ pub fn thread(rx: Receiver<InputCmd>, sink: super::Sink) {
                 Ev::Gamepad(g) => pads.update(&g),
             },
             InputCmd::Event(_) => {}
-            InputCmd::SetRect(r) => inj.set_display_rect(r),
+            InputCmd::SetRect(slot, r) => {
+                rects.insert(slot, r);
+                if current_slot.is_none() || current_slot == Some(slot) {
+                    inj.set_display_rect(r);
+                    current_slot = Some(slot);
+                }
+            }
             InputCmd::ReleaseAll => {
                 if inj.pressed_count() > 0 {
                     tracing::info!("releasing {} stuck keys/buttons", inj.pressed_count());

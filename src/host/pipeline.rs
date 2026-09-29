@@ -70,6 +70,8 @@ fn median(v: &mut [f32]) -> f32 {
 }
 
 pub struct Pipeline {
+    /// Client window this stream is for (0 = main window).
+    pub slot: u32,
     pub plan: Plan,
     pub stream_id: u64,
     pub started: pb::StreamStarted,
@@ -150,6 +152,7 @@ impl Pipeline {
         stream_id: u64,
         first_frame_id: u64,
         desktop: &mut DesktopTracker,
+        slot: u32,
     ) -> Result<Self> {
         let cap_info = topo.adapter(plan.capture_adapter).ok_or_else(|| anyhow!("capture GPU missing"))?;
         let capture = D3dDevice::for_adapter(&cap_info.adapter).context("capture device")?;
@@ -279,6 +282,7 @@ impl Pipeline {
             source_width: native.0,
             source_height: native.1,
             hdr_tonemapped: output.hdr,
+            slot,
         };
         tracing::info!(
             "stream {stream_id}: display {} {}x{} -> {w}x{h}@{fps} {} {:?} {} kbps{}",
@@ -292,6 +296,7 @@ impl Pipeline {
         );
         let now = Instant::now();
         Ok(Self {
+            slot,
             plan: plan.clone(),
             stream_id,
             started,
@@ -434,7 +439,9 @@ impl Pipeline {
         Ok(())
     }
 
-    pub fn step(&mut self, sink: &Sink, desktop: &mut DesktopTracker) -> Step {
+    /// One round: wait up to `max_wait` for a desktop update, encode when due.
+    /// With several pipelines in one thread, `max_wait` keeps them all moving.
+    pub fn step(&mut self, sink: &Sink, desktop: &mut DesktopTracker, max_wait: Duration) -> Step {
         let now = Instant::now();
         // Before any early return, so a capture loop that never gets an image is visible.
         self.log_capture_status(desktop);
@@ -483,7 +490,7 @@ impl Pipeline {
             }
         }
 
-        let wait_ms = next_due.saturating_duration_since(now).min(Duration::from_millis(16)).as_millis().max(1) as u32;
+        let wait_ms = next_due.saturating_duration_since(now).min(max_wait).as_millis().max(1) as u32;
         let dup = self.dup.as_mut().unwrap();
         match dup.acquire(wait_ms) {
             Ok(Some(frame)) => {
@@ -507,7 +514,10 @@ impl Pipeline {
                 }
                 let mut msgs = Vec::new();
                 self.cursor.update(frame.pointer, &mut msgs);
-                for m in msgs {
+                for mut m in msgs {
+                    if let Some(pb::cursor_msg::Msg::State(st)) = m.msg.as_mut() {
+                        st.slot = self.slot;
+                    }
                     sink.send(Ev::Cursor(m));
                 }
             }
@@ -624,7 +634,7 @@ impl Pipeline {
             let mut hb = Vec::with_capacity(VideoFrameHeader::LEN_V1);
             header.write(&mut hb);
             self.stats.bytes += p.data.len() as u64;
-            sink.send(Ev::Video(VideoFrame { stream_id: self.stream_id, frame_id: self.frame_id, header: hb, data: p.data }));
+            sink.send(Ev::Video(VideoFrame { stream_id: self.stream_id, frame_id: self.frame_id, header: hb, data: p.data, slot: self.slot }));
             self.inflight += 1;
         }
         if key && self.keyframe_pending {
@@ -686,6 +696,7 @@ impl Pipeline {
             bitrate_kbps: (s.bytes as f32 * 8.0 / 1000.0 / secs) as u32,
             target_kbps: self.encoder.config().bitrate_kbps,
             bitrate_note: String::new(),
+            slot: self.slot,
         }));
         self.stats.since = Some(Instant::now());
     }

@@ -50,7 +50,7 @@ impl CursorTracker {
             self.raw_pos = Some(pos);
         }
         let (Some((id, hx, hy)), Some((x, y, visible))) = (self.shape, self.raw_pos) else { return };
-        let state = pb::CursorState { shape_id: id, visible, x: x + hx, y: y + hy };
+        let state = pb::CursorState { shape_id: id, visible, x: x + hx, y: y + hy, slot: 0 };
         if self.last_state.as_ref() != Some(&state) {
             self.last_state = Some(state.clone());
             out.push(pb::CursorMsg { msg: Some(Msg::State(state)) });
