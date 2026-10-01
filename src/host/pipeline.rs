@@ -195,7 +195,8 @@ impl Pipeline {
         } else if configured > 0 {
             configured
         } else {
-            select::auto_bitrate(w, h, fps, game, plan.yuv444)
+            // 10-bit HDR needs a little more for the same look.
+            select::auto_bitrate(w, h, fps, game, plan.yuv444) * if plan.hdr { 5 } else { 4 } / 4
         };
 
         let enc_cfg = EncoderConfig {
@@ -207,6 +208,7 @@ impl Pipeline {
             fps,
             bitrate_kbps: bitrate,
             game_mode: game,
+            hdr: plan.hdr,
         };
         let raw = encode_dev.as_ref().map(|d| d.device_raw_owned()).unwrap_or(std::ptr::null_mut());
         let mut encoder = VideoEncoder::open(&enc_cfg, raw).with_context(|| format!("open {:?}", plan))?;
@@ -214,6 +216,7 @@ impl Pipeline {
             InputFormat::Nv12 | InputFormat::CpuNv12 => TargetFormat::Nv12,
             InputFormat::Bgra => TargetFormat::Bgra,
             InputFormat::Ayuv => TargetFormat::Ayuv,
+            InputFormat::P010 => TargetFormat::P010,
         };
         let cpu = encoder.input_format() == InputFormat::CpuNv12;
         let mut converter = Converter::new(&capture)?;
@@ -268,6 +271,7 @@ impl Pipeline {
                 mode: if game { pb::StreamMode::Game } else { pb::StreamMode::Office } as i32,
                 bitrate_policy: sc.bitrate_policy,
                 video_transport: sc.video_transport,
+                hdr: plan.hdr,
             }),
             stream_id,
             encoder_name: encoder.name().to_owned(),
@@ -276,7 +280,7 @@ impl Pipeline {
             cross_gpu: cross,
             source_width: native.0,
             source_height: native.1,
-            hdr_tonemapped: output.hdr,
+            hdr_tonemapped: output.hdr && !plan.hdr,
             slot,
         };
         tracing::info!(
@@ -378,7 +382,8 @@ impl Pipeline {
             // FP16 = scRGB image of an HDR desktop: tone-map it to SDR.
             let hdr = (desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT).then(|| {
                 let nits = display_config::sdr_white_nits(&self.output_name).unwrap_or(80.0);
-                tracing::info!("{}: HDR desktop, SDR white {nits:.0} nits; tone-mapping to SDR", self.output_name);
+                let how = if self.plan.hdr { "streaming HDR10" } else { "tone-mapping to SDR" };
+                tracing::info!("{}: HDR desktop, SDR white {nits:.0} nits; {how}", self.output_name);
                 nits
             });
             self.converter.set_hdr(hdr);

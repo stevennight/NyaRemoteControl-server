@@ -446,7 +446,7 @@ fn build(st: &mut State, slot: u32, cfg: &HostConfig, desktop: &mut DesktopTrack
         .ok_or_else(|| "没有可用的显示器".to_string())?
         .clone();
     check_capture(&st.topo, &output, desktop)?;
-    let plans = select::plans(&st.probes, output.adapter_index, &req, st.caps.as_ref(), &cfg.encoder);
+    let plans = select::plans(&st.probes, output.adapter_index, &req, st.caps.as_ref(), &cfg.encoder, output.hdr);
     let mut errors = Vec::new();
     for plan in plans {
         if st.slots[&slot].failed.get(&plan).copied().unwrap_or(0) >= 2 {

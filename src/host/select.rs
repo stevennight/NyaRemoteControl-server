@@ -74,6 +74,7 @@ pub fn probe_all(topo: &Topology) -> Vec<EncoderProbe> {
                     fps: 60,
                     bitrate_kbps: 5000,
                     game_mode: false,
+                    hdr: false,
                 };
                 match VideoEncoder::open(&cfg, dev.device_raw_owned()) {
                     Ok(_) => caps.push((codec, yuv444)),
@@ -96,6 +97,15 @@ pub struct Plan {
     pub backend: Backend,
     pub codec: VideoCodec,
     pub yuv444: bool,
+    /// HDR10 (10-bit, PQ) from an HDR desktop.
+    pub hdr: bool,
+}
+
+/// The client decodes 10-bit 4:2:0 `codec` (HDR10).
+fn client_decodes_10bit(caps: Option<&pb::ClientCaps>, codec: VideoCodec) -> bool {
+    caps.is_some_and(|c| {
+        c.decoders.iter().any(|d| from_pb_codec(d.codec) == Some(codec) && d.chroma == pb::Chroma::Yuv420 as i32 && d.ten_bit)
+    })
 }
 
 /// What the client says it can decode. `None` = unknown: assume 4:2:0 H.264/HEVC in hardware.
@@ -119,6 +129,7 @@ pub fn plans(
     req: &pb::StartStream,
     caps: Option<&pb::ClientCaps>,
     preference: &str,
+    source_hdr: bool,
 ) -> Vec<Plan> {
     let cfg = req.config.clone().unwrap_or_default();
     let mode_game = cfg.mode == pb::StreamMode::Game as i32;
@@ -156,6 +167,22 @@ pub fn plans(
     }
 
     let mut out = Vec::new();
+    // HDR10 first when both ends are HDR: HEVC Main10 on the capture GPU
+    // (P010 can't cross GPUs here). The SDR plans below are the fallback.
+    if cfg.hdr && source_hdr && pref_backend != Some(Backend::Software) && client_decodes_10bit(caps, VideoCodec::Hevc) {
+        for p in gpus.iter().filter(|p| p.adapter_index == capture_adapter) {
+            if p.backend.supports_hdr(VideoCodec::Hevc) && p.has(VideoCodec::Hevc, false) {
+                out.push(Plan {
+                    capture_adapter,
+                    encode_adapter: Some(p.adapter_index),
+                    backend: p.backend,
+                    codec: VideoCodec::Hevc,
+                    yuv444: false,
+                    hdr: true,
+                });
+            }
+        }
+    }
     if pref_backend != Some(Backend::Software) {
         // Without a 4:4:4 wish, 4:4:4 hardware plans still rank above the
         // software encoder (the client can decode 4:4:4 in software).
@@ -175,6 +202,7 @@ pub fn plans(
                         backend: p.backend,
                         codec,
                         yuv444,
+                        hdr: false,
                     });
                 }
             }
@@ -187,6 +215,7 @@ pub fn plans(
             backend: Backend::Software,
             codec: VideoCodec::H264,
             yuv444: false,
+            hdr: false,
         });
     }
     out
@@ -244,13 +273,30 @@ mod tests {
 
     #[test]
     fn same_gpu_444_preferred() {
-        let p = plans(&laptop(true), 0, &office(), Some(&hevc_caps(true)), "auto");
-        assert_eq!(p[0], Plan { capture_adapter: 0, encode_adapter: Some(0), backend: Backend::Qsv, codec: Hevc, yuv444: true });
+        let p = plans(&laptop(true), 0, &office(), Some(&hevc_caps(true)), "auto", false);
+        assert_eq!(p[0], Plan { capture_adapter: 0, encode_adapter: Some(0), backend: Backend::Qsv, codec: Hevc, yuv444: true, hdr: false });
+    }
+
+    #[test]
+    fn hdr10_first_when_both_ends_are_hdr() {
+        let mut caps = hevc_caps(true);
+        caps.decoders.push(pb::CodecCap { codec: pb::Codec::Hevc as i32, chroma: pb::Chroma::Yuv420 as i32, ten_bit: true, ..Default::default() });
+        let mut req = office();
+        req.config.as_mut().unwrap().hdr = true;
+        let p = plans(&laptop(true), 0, &req, Some(&caps), "auto", true);
+        assert_eq!(p[0], Plan { capture_adapter: 0, encode_adapter: Some(0), backend: Backend::Qsv, codec: Hevc, yuv444: false, hdr: true });
+        // Only on the capture GPU; SDR plans follow as the fallback.
+        assert_eq!(p.iter().filter(|x| x.hdr).count(), 1);
+        assert!(p[1..].iter().all(|x| !x.hdr));
+        // An SDR desktop, a client without 10-bit decoding, or no request: no HDR plan.
+        assert!(plans(&laptop(true), 0, &req, Some(&caps), "auto", false).iter().all(|x| !x.hdr));
+        assert!(plans(&laptop(true), 0, &req, Some(&hevc_caps(true)), "auto", true).iter().all(|x| !x.hdr));
+        assert!(plans(&laptop(true), 0, &office(), Some(&caps), "auto", true).iter().all(|x| !x.hdr));
     }
 
     #[test]
     fn other_gpu_when_capture_gpu_lacks_444() {
-        let p = plans(&laptop(false), 0, &office(), Some(&hevc_caps(true)), "auto");
+        let p = plans(&laptop(false), 0, &office(), Some(&hevc_caps(true)), "auto", false);
         assert_eq!(p[0].encode_adapter, Some(1));
         assert_eq!(p[0].backend, Backend::Nvenc);
         assert!(p[0].yuv444);
@@ -263,19 +309,19 @@ mod tests {
     fn game_mode_uses_420_on_capture_gpu() {
         let mut req = office();
         req.config.as_mut().unwrap().mode = pb::StreamMode::Game as i32;
-        let p = plans(&laptop(true), 0, &req, Some(&hevc_caps(true)), "auto");
-        assert_eq!(p[0], Plan { capture_adapter: 0, encode_adapter: Some(0), backend: Backend::Qsv, codec: Hevc, yuv444: false });
+        let p = plans(&laptop(true), 0, &req, Some(&hevc_caps(true)), "auto", false);
+        assert_eq!(p[0], Plan { capture_adapter: 0, encode_adapter: Some(0), backend: Backend::Qsv, codec: Hevc, yuv444: false, hdr: false });
     }
 
     #[test]
     fn preference_forces_nvenc() {
-        let p = plans(&laptop(true), 0, &office(), Some(&hevc_caps(true)), "nvenc");
+        let p = plans(&laptop(true), 0, &office(), Some(&hevc_caps(true)), "nvenc", false);
         assert_eq!(p[0].backend, Backend::Nvenc);
     }
 
     #[test]
     fn no_444_when_client_only_decodes_in_software() {
-        let p = plans(&laptop(true), 0, &office(), Some(&hevc_caps(false)), "auto");
+        let p = plans(&laptop(true), 0, &office(), Some(&hevc_caps(false)), "auto", false);
         assert!(!p[0].yuv444);
     }
 
@@ -284,19 +330,19 @@ mod tests {
     #[test]
     fn hardware_444_before_software_encoder() {
         let probes = vec![probe(0, Backend::Nvenc, &[(H264, true), (Hevc, true)])];
-        let p = plans(&probes, 0, &office(), Some(&hevc_caps(false)), "auto");
-        assert_eq!(p[0], Plan { capture_adapter: 0, encode_adapter: Some(0), backend: Backend::Nvenc, codec: Hevc, yuv444: true });
+        let p = plans(&probes, 0, &office(), Some(&hevc_caps(false)), "auto", false);
+        assert_eq!(p[0], Plan { capture_adapter: 0, encode_adapter: Some(0), backend: Backend::Nvenc, codec: Hevc, yuv444: true, hdr: false });
         assert_eq!(p.last().unwrap().backend, Backend::Software);
         // Explicit 4:2:0 request never gets 4:4:4.
         let mut req = office();
         req.config.as_mut().unwrap().chroma = pb::Chroma::Yuv420 as i32;
-        let p = plans(&probes, 0, &req, Some(&hevc_caps(false)), "auto");
+        let p = plans(&probes, 0, &req, Some(&hevc_caps(false)), "auto", false);
         assert!(p.iter().all(|x| !x.yuv444));
     }
 
     #[test]
     fn software_only_when_no_gpu() {
-        let p = plans(&[], 0, &office(), None, "auto");
+        let p = plans(&[], 0, &office(), None, "auto", false);
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].backend, Backend::Software);
     }

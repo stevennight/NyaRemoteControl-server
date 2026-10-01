@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use nya_media::encoder::{EncoderConfig, VideoEncoder};
+use nya_media::VideoCodec;
 use nya_win::d3d::{tex_desc, D3dDevice};
 use nya_win::desktop::DesktopTracker;
 use nya_win::duplication::Duplicator;
@@ -142,12 +143,31 @@ fn body(r: &mut String) {
                 fps: 60,
                 bitrate_kbps: 15_000,
                 game_mode: false,
+                hdr: false,
             };
             match encode_benchmark(&dev, &cfg) {
                 Ok((ms, input)) => {
                     out!(r, "[{}] {:?} {:?} 444={yuv444}: {ms:.2} ms/帧（输入 {input:?}）", p.adapter_index, p.backend, codec)
                 }
                 Err(e) => out!(r, "[{}] {:?} {:?} 444={yuv444}: !! {e:#}", p.adapter_index, p.backend, codec),
+            }
+        }
+        // HDR10 passthrough (HEVC Main10 from P010 surfaces).
+        if p.backend.supports_hdr(VideoCodec::Hevc) {
+            let cfg = EncoderConfig {
+                backend: p.backend,
+                codec: VideoCodec::Hevc,
+                yuv444: false,
+                width: 1920,
+                height: 1080,
+                fps: 60,
+                bitrate_kbps: 15_000,
+                game_mode: false,
+                hdr: true,
+            };
+            match encode_benchmark(&dev, &cfg) {
+                Ok((ms, _)) => out!(r, "[{}] {:?} HDR10（HEVC Main10）: {ms:.2} ms/帧", p.adapter_index, p.backend),
+                Err(e) => out!(r, "[{}] {:?} HDR10（HEVC Main10）: 不可用 {e:#}", p.adapter_index, p.backend),
             }
         }
     }
@@ -219,10 +239,10 @@ fn Command(cmd: &str, args: &[&str]) -> String {
 
 fn format_support(dev: &D3dDevice) -> String {
     use windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC;
-    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_AYUV, DXGI_SAMPLE_DESC};
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_AYUV, DXGI_FORMAT_P010, DXGI_SAMPLE_DESC};
     const RT: u32 = 0x4000; // D3D11_FORMAT_SUPPORT_RENDER_TARGET
     let mut parts = Vec::new();
-    for (name, fmt) in [("NV12", DXGI_FORMAT_NV12), ("AYUV", DXGI_FORMAT_AYUV)] {
+    for (name, fmt) in [("NV12", DXGI_FORMAT_NV12), ("AYUV", DXGI_FORMAT_AYUV), ("P010", DXGI_FORMAT_P010)] {
         let flags = unsafe { dev.device.CheckFormatSupport(fmt) }.unwrap_or(0);
         let try_create = |array: u32| {
             let desc = D3D11_TEXTURE2D_DESC {
