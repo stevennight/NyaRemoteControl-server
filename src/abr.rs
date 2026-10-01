@@ -97,7 +97,11 @@ pub struct Abr {
     last_bad: Instant,
     last_decrease: Instant,
     last_increase: Instant,
+    /// The last adjustment and why (also logged).
     pub note: String,
+    note_at: Option<Instant>,
+    /// Backlog of the latest sample, in ms at the current target.
+    backlog_now_ms: u64,
 }
 
 const DECREASE_GAP: Duration = Duration::from_secs(1);
@@ -129,7 +133,9 @@ impl Abr {
             last_bad: now - Duration::from_secs(60),
             last_decrease: now - Duration::from_secs(60),
             last_increase: now,
-            note: format!("{}，目标 {:.1} Mbps", policy_name(policy), max as f64 / 1000.0),
+            note: String::new(),
+            note_at: None,
+            backlog_now_ms: 0,
         })
     }
 
@@ -153,6 +159,7 @@ impl Abr {
             }
         }
         let backlog_ms = s.backlog_bytes * 8 / self.target.max(1) as u64;
+        self.backlog_now_ms = backlog_ms;
         if backlog_ms > self.p.backlog_ms {
             return Some(format!("发送积压 {backlog_ms} ms"));
         }
@@ -173,6 +180,16 @@ impl Abr {
         None
     }
 
+    /// For the statistics panel: live state, then the last adjustment and
+    /// how long ago it was (the reason it gives is from that moment).
+    pub fn summary(&self, now: Instant) -> String {
+        let mut out = format!("{}，目标 {:.1} Mbps，当前积压 {} ms", policy_name(self.policy), self.target as f64 / 1000.0, self.backlog_now_ms);
+        if let Some(at) = self.note_at {
+            out += &format!("；{} 秒前：{}", (now - at).as_secs(), self.note);
+        }
+        out
+    }
+
     /// Feed one sample; returns the new target when it moved by 5 % or more.
     pub fn update(&mut self, s: Sample) -> Option<u32> {
         match self.congestion(&s) {
@@ -186,12 +203,8 @@ impl Abr {
                     self.target = (next as u32).clamp(self.min, self.max);
                     self.last_decrease = s.now;
                     self.bad_streak = 0;
-                    self.note = format!(
-                        "{}：{why}，实际 {:.1} Mbps → 目标 {:.1} Mbps",
-                        policy_name(self.policy),
-                        self.rate_kbps / 1000.0,
-                        self.target as f64 / 1000.0
-                    );
+                    self.note = format!("{why}，实际 {:.1} Mbps → 降到 {:.1} Mbps", self.rate_kbps / 1000.0, self.target as f64 / 1000.0);
+                    self.note_at = Some(s.now);
                 }
             }
             None => {
@@ -202,7 +215,8 @@ impl Abr {
                 {
                     self.target = ((self.target as f64 * INCREASE) as u32).min(self.max);
                     self.last_increase = s.now;
-                    self.note = format!("{}：网络恢复，目标 {:.1} Mbps", policy_name(self.policy), self.target as f64 / 1000.0);
+                    self.note = format!("网络恢复 → 升到 {:.1} Mbps", self.target as f64 / 1000.0);
+                    self.note_at = Some(s.now);
                 }
             }
         }

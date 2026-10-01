@@ -456,7 +456,7 @@ async fn run_session(
                     Some(Ev::DisplayChanged(d)) => { let _ = ctl_tx.send(ctl(Msg::DisplayChanged(d))).await; }
                     Some(Ev::Stats(mut s)) => {
                         s.bitrate_note = match &abr {
-                            Some(a) => a.note.clone(),
+                            Some(a) => a.summary(std::time::Instant::now()),
                             None => "固定码率".into(),
                         };
                         let _ = ctl_tx.try_send(ctl(Msg::ServerStats(s)));
