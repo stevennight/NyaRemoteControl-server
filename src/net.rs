@@ -238,15 +238,19 @@ async fn run_session(
     // Keyframes asked for by a watching client (rate-limited: they cost the operator bandwidth).
     let mut last_keyframe = Instant::now() - Duration::from_secs(10);
 
+    // Video as datagrams + FEC (game mode by default) or on a stream.
+    let dgram_on = neg.has(Feature::VideoDatagram);
+    let dgram = Arc::new(DgramState::default());
+
     // Video / cursor writer tasks.
     let (video_tx, video_rx) = mpsc::channel::<crate::ipc_pb::VideoFrame>(4);
     let (cursor_tx, cursor_rx) = mpsc::channel::<pb::CursorMsg>(256);
     let written = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let video_task = tokio::spawn({
-        let (conn, hub, written, controlling) = (conn.clone(), hub.clone(), written.clone(), controlling.clone());
+        let (conn, hub, written, controlling, dgram) = (conn.clone(), hub.clone(), written.clone(), controlling.clone(), dgram.clone());
         let multi = neg.has(Feature::MultiStream);
         async move {
-            if let Err(e) = video_writer(conn, video_rx, hub, written, multi, controlling).await {
+            if let Err(e) = video_writer(conn, video_rx, hub, written, multi, controlling, dgram).await {
                 tracing::warn!("video writer: {e:#}");
             }
         }
@@ -358,6 +362,8 @@ async fn run_session(
                         if in_control {
                             hub.send(Cmd::StartStream(s));
                         }
+                        // A (re)started stream begins with a keyframe anyway.
+                        choose_transport(&dgram, dgram_on, &replay, None);
                     }
                     Some(Msg::StopStream(mut s)) => {
                         if !multi_on {
@@ -381,6 +387,7 @@ async fn run_session(
                         if in_control {
                             hub.send(Cmd::SetMode(m));
                         }
+                        choose_transport(&dgram, dgram_on, &replay, in_control.then_some(&**hub));
                     }
                     Some(Msg::RequestKeyframe(k)) => {
                         if in_control || last_keyframe.elapsed() >= Duration::from_secs(1) {
@@ -449,7 +456,20 @@ async fn run_session(
                     Some(Msg::Ping(p)) => {
                         let _ = ctl_tx.try_send(ctl(Msg::Pong(pb::Pong { t_us: p.t_us, server_t_us: nya_proto::now_us() })));
                     }
-                    Some(Msg::ClientStats(s)) => tracing::debug!("client stats: {s:?}"),
+                    Some(Msg::ClientStats(s)) => {
+                        tracing::debug!("client stats: {s:?}");
+                        if dgram.on.load(Ordering::Relaxed) {
+                            let cur = dgram.fec.load(Ordering::Relaxed);
+                            let next = nya_transport::videodgram::next_fec_percent(cur, s.video_shards_received, s.video_shards_lost, s.video_frames_lost);
+                            if next != cur {
+                                tracing::info!(
+                                    "video FEC {cur}% -> {next}% (shards {} received / {} lost, frames {} recovered / {} lost)",
+                                    s.video_shards_received, s.video_shards_lost, s.video_frames_recovered, s.video_frames_lost
+                                );
+                                dgram.fec.store(next, Ordering::Relaxed);
+                            }
+                        }
+                    }
                     Some(Msg::ClipboardText(c)) if clipboard_on && in_control => hub.send(Cmd::Clipboard(c)),
                     Some(Msg::SendSas(_)) if neg.has(Feature::Sas) && in_control => {
                         if let Err(e) = crate::winutil::send_sas() {
@@ -521,6 +541,7 @@ async fn run_session(
                     Some(Ev::StreamError(e)) => { let _ = ctl_tx.send(ctl(Msg::StreamError(e))).await; }
                     Some(Ev::DisplayChanged(d)) => { let _ = ctl_tx.send(ctl(Msg::DisplayChanged(d))).await; }
                     Some(Ev::Stats(mut s)) => {
+                        s.fec_percent = if dgram.on.load(Ordering::Relaxed) { dgram.fec.load(Ordering::Relaxed) } else { 0 };
                         s.bitrate_note = match &abr {
                             Some(a) => a.summary(std::time::Instant::now()),
                             None => "固定码率".into(),
@@ -634,10 +655,45 @@ fn backlog_estimate(written: u64, udp_tx: u64, baseline: &mut i64) -> u64 {
     }
 }
 
-/// Writes frames on one uni stream per video stream id; acknowledges each
-/// frame to the host once quinn accepted it (flow control, §6.2).
-/// One QUIC uni stream per video stream; with FEATURE_MULTI_STREAM several
-/// run at once (one per slot) and the prelude names the slot.
+/// How this connection's video travels (FEATURE_VIDEO_DATAGRAM).
+struct DgramState {
+    /// Frames go out as datagrams + FEC instead of on a stream.
+    on: AtomicBool,
+    /// Parity percentage, adapted to the loss the client reports.
+    fec: std::sync::atomic::AtomicU32,
+}
+
+impl Default for DgramState {
+    fn default() -> Self {
+        Self { on: AtomicBool::new(false), fec: nya_transport::videodgram::DEFAULT_FEC_PERCENT.into() }
+    }
+}
+
+/// Datagrams or a stream, from the main window's request and the mode. A
+/// switch asks for keyframes: frames on the two paths may arrive out of order.
+fn choose_transport(d: &DgramState, supported: bool, replay: &Replay, hub: Option<&Hub>) {
+    let Some(cfg) = replay.starts.get(&0).and_then(|s| s.config.as_ref()) else { return };
+    let game = cfg.mode == pb::StreamMode::Game as i32;
+    let on = supported
+        && match pb::VideoTransport::try_from(cfg.video_transport) {
+            Ok(pb::VideoTransport::Datagram) => true,
+            Ok(pb::VideoTransport::Stream) => false,
+            _ => game,
+        };
+    if d.on.swap(on, Ordering::Relaxed) != on {
+        tracing::info!("video now {}", if on { "as datagrams with FEC" } else { "on a stream" });
+        if let Some(hub) = hub {
+            for &slot in replay.starts.keys() {
+                hub.send(Cmd::RequestKeyframe(pb::RequestKeyframe { slot }));
+            }
+        }
+    }
+}
+
+/// Writes frames on one uni stream per video stream id, or as datagrams with
+/// FEC; acknowledges each frame to the host once quinn accepted it (flow
+/// control, §6.2). With FEATURE_MULTI_STREAM several streams run at once
+/// (one per slot) and the prelude (or the datagram header) names the slot.
 async fn video_writer(
     conn: Connection,
     mut rx: mpsc::Receiver<crate::ipc_pb::VideoFrame>,
@@ -645,12 +701,44 @@ async fn video_writer(
     written: Arc<std::sync::atomic::AtomicU64>,
     multi: bool,
     controlling: Arc<AtomicBool>,
+    dgram: Arc<DgramState>,
 ) -> Result<()> {
     // slot -> (stream id, QUIC stream)
     let mut open: std::collections::HashMap<u32, (u64, SendStream)> = Default::default();
     let (mut frames, mut bytes, mut since) = (0u64, 0u64, std::time::Instant::now());
+    let mut warned = false;
     while let Some(f) = rx.recv().await {
         let slot = if multi { f.slot } else { 0 };
+        let max = conn.max_datagram_size().filter(|&m| m >= nya_transport::videodgram::HEADER_LEN + 64);
+        if let (true, Some(max)) = (dgram.on.load(Ordering::Relaxed), max) {
+            let mut frame = Vec::with_capacity(f.header.len() + f.data.len());
+            frame.extend_from_slice(&f.header);
+            frame.extend_from_slice(&f.data);
+            let fec = dgram.fec.load(Ordering::Relaxed);
+            let shards = nya_transport::videodgram::split(slot as u8, f.stream_id, f.frame_id, &frame, max, fec)?;
+            let mut len = 0u64;
+            for d in shards {
+                len += d.len() as u64;
+                // Waits while quinn's datagram buffer is full (congestion).
+                if let Err(e) = conn.send_datagram_wait(d.into()).await {
+                    match e {
+                        quinn::SendDatagramError::ConnectionLost(e) => return Err(e.into()),
+                        e if !warned => {
+                            warned = true;
+                            tracing::warn!("video datagram: {e}");
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if controlling.load(Ordering::Relaxed) {
+                hub.send(Cmd::FrameSent(FrameSent { frame_id: f.frame_id, stream_id: f.stream_id }));
+            }
+            written.fetch_add(len, std::sync::atomic::Ordering::Relaxed);
+            frames += 1;
+            bytes += len;
+            continue;
+        }
         if open.get(&slot).map(|c| c.0) != Some(f.stream_id) {
             tracing::info!("opening video stream {} (slot {slot}) to client (first frame {} bytes)", f.stream_id, f.data.len());
             if let Some((_, mut old)) = open.remove(&slot) {
@@ -1200,6 +1288,102 @@ mod tests {
 
     async fn next_seen(seen: &mut mpsc::UnboundedReceiver<String>) -> String {
         timeout(Duration::from_secs(5), seen.recv()).await.unwrap().unwrap()
+    }
+
+    /// A host sending large frames: three when a stream starts, one per keyframe request.
+    async fn big_frame_host(hub: Arc<Hub>, mut cmds: mpsc::UnboundedReceiver<HostCommand>) {
+        let mut next = 1u64;
+        let send = |hub: Arc<Hub>, n: u64| async move {
+            let h = VideoFrameHeader { frame_id: n, width: 64, height: 64, codec: pb::Codec::H264 as u8, ..Default::default() };
+            let mut hb = Vec::new();
+            h.write(&mut hb);
+            let data: Vec<u8> = (0..60_000u32).map(|i| (i as u64 * 7 + n) as u8).collect();
+            hub.publish(HostEvent { ev: Some(Ev::Video(VideoFrame { stream_id: 5, frame_id: n, header: hb, data, slot: 0 })) }).await;
+        };
+        while let Some(HostCommand { cmd: Some(c) }) = cmds.recv().await {
+            match c {
+                Cmd::StartStream(s) => {
+                    let started = pb::StreamStarted { display_id: s.display_id, stream_id: 5, ..Default::default() };
+                    hub.publish(HostEvent { ev: Some(Ev::StreamStarted(started)) }).await;
+                    for _ in 0..3 {
+                        send(hub.clone(), next).await;
+                        next += 1;
+                    }
+                }
+                Cmd::RequestKeyframe(_) => {
+                    send(hub.clone(), next).await;
+                    next += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Game mode with FEATURE_VIDEO_DATAGRAM: frames arrive as FEC datagrams
+    /// and rebuild intact; switching to office mode moves them to a stream.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn game_mode_video_travels_as_datagrams() {
+        let dir = std::env::temp_dir().join(format!("nya-dgram-test-{}", nya_proto::now_us()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let server_id = server_identity();
+        let server_fp = server_id.fingerprint();
+        let auth = Arc::new(AuthStore::open(&dir).unwrap());
+        let key = auth.key();
+        let (hub, cmd_rx) = Hub::new();
+        tokio::spawn(big_frame_host(hub.clone(), cmd_rx));
+        let ep = nya_transport::endpoint::server_endpoint("127.0.0.1:0".parse().unwrap(), &server_id).unwrap();
+        let addr = ep.local_addr().unwrap();
+        let state = State::new(cpb::Mode::Standalone, dir.clone(), Default::default(), server_fp.to_string(), auth, hub);
+        tokio::spawn(serve_endpoint(ep, state));
+        let client_id = Identity::generate().unwrap();
+        let (mut c, _) = connect(addr, &client_id, server_fp).await;
+        assert!(pair(&mut c, &client_id, server_fp, &key).await.ok);
+        c.conn.close(0u32.into(), b"");
+        let (mut c, w) = connect(addr, &client_id, server_fp).await;
+        assert!(w.features.contains(&(Feature::VideoDatagram as u32)));
+
+        let config = pb::StreamConfig { mode: pb::StreamMode::Game as i32, ..Default::default() };
+        let s = pb::StartStream { display_id: 1, config: Some(config), ..Default::default() };
+        write_msg(&mut c.send, &ctl(Msg::StartStream(s))).await.unwrap();
+
+        let mut re = nya_transport::videodgram::Reassembler::new(nya_proto::MAX_VIDEO_FRAME_LEN);
+        let mut frames = Vec::new();
+        while frames.len() < 3 {
+            let d = timeout(Duration::from_secs(5), c.conn.read_datagram()).await.unwrap().unwrap();
+            assert_eq!(d[0], nya_proto::frame::datagram_type::VIDEO);
+            frames.extend(re.push(&d));
+        }
+        for (i, f) in frames.iter().enumerate() {
+            let n = i as u64 + 1;
+            let (h, payload) = VideoFrameHeader::parse(&f.data).unwrap();
+            assert_eq!((f.stream_id, f.frame_id, h.frame_id), (5, n, n));
+            assert_eq!(payload.len(), 60_000);
+            assert!(payload.iter().enumerate().all(|(i, &b)| b == (i as u64 * 7 + n) as u8));
+        }
+        let st = re.take_stats();
+        assert!(st.frames_completed == 3 && st.shards_received >= 3 * 40, "{st:?}");
+        assert_eq!(st.frames_lost, 0);
+
+        // The client reports loss: the host adds parity, and says so.
+        let report = pb::ClientStats { video_shards_received: 900, video_shards_lost: 100, ..Default::default() };
+        write_msg(&mut c.send, &ctl(Msg::ClientStats(report))).await.unwrap();
+
+        // Office mode: back to a stream, starting with a fresh keyframe.
+        write_msg(&mut c.send, &ctl(Msg::SetMode(pb::SetMode { mode: pb::StreamMode::Office as i32 }))).await.unwrap();
+        let mut r = loop {
+            let mut r = timeout(Duration::from_secs(5), c.conn.accept_uni()).await.unwrap().unwrap();
+            if read_varint(&mut r).await.unwrap() == Some(stream_type::VIDEO) {
+                break r;
+            }
+        };
+        assert_eq!(read_varint(&mut r).await.unwrap(), Some(5));
+        assert_eq!(read_varint(&mut r).await.unwrap(), Some(0));
+        let mut len = [0u8; 4];
+        r.read_exact(&mut len).await.unwrap();
+        let mut buf = vec![0u8; u32::from_le_bytes(len) as usize];
+        r.read_exact(&mut buf).await.unwrap();
+        assert_eq!(VideoFrameHeader::parse(&buf).unwrap().0.frame_id, 4);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Two clients: the first operates the host, the second watches the

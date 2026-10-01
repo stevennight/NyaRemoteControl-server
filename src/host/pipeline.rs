@@ -267,6 +267,7 @@ impl Pipeline {
                 bitrate_kbps: bitrate,
                 mode: if game { pb::StreamMode::Game } else { pb::StreamMode::Office } as i32,
                 bitrate_policy: sc.bitrate_policy,
+                video_transport: sc.video_transport,
             }),
             stream_id,
             encoder_name: encoder.name().to_owned(),
@@ -692,6 +693,7 @@ impl Pipeline {
             bitrate_kbps: (s.bytes as f32 * 8.0 / 1000.0 / secs) as u32,
             target_kbps: self.encoder.config().bitrate_kbps,
             bitrate_note: String::new(),
+            fec_percent: 0, // filled in by the network side
             slot: self.slot,
         }));
         self.stats.since = Some(Instant::now());
