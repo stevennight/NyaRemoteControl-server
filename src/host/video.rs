@@ -176,6 +176,7 @@ pub fn thread(rx: Receiver<VideoCmd>, sink: Sink, input_tx: Sender<InputCmd>, cf
     };
     sink.send(Ev::SessionInfo(session_info(&st, &cfg)));
     let mut last_topo_check = Instant::now();
+    let mut last_vd_check = Instant::now();
 
     loop {
         // --- commands ---
@@ -285,6 +286,19 @@ pub fn thread(rx: Receiver<VideoCmd>, sink: Sink, input_tx: Sender<InputCmd>, cf
                         x.rebuild = true;
                     }
                 }
+            }
+        }
+
+        // --- virtual display driver installed / removed in the manager ---
+        // The helper outlives client sessions, and new clients get the last
+        // SessionInfo: without this they would keep hearing "not installed".
+        if last_vd_check.elapsed() > Duration::from_secs(5) {
+            last_vd_check = Instant::now();
+            let now = vdisplay::available();
+            if now != st.vd_available {
+                tracing::info!("virtual display driver {}", if now { "installed" } else { "removed" });
+                st.vd_available = now;
+                sink.send(Ev::SessionInfo(session_info(&st, &cfg)));
             }
         }
 
