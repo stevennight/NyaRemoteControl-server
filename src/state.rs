@@ -37,6 +37,8 @@ pub struct State {
     /// Re-bind the network endpoint (port / address changed).
     pub rebind: Notify,
     pub updates: crate::update::Updates,
+    /// Finished print jobs, for the operating client's session (FEATURE_PRINT).
+    pub prints: tokio::sync::broadcast::Sender<PathBuf>,
 }
 
 impl State {
@@ -56,6 +58,7 @@ impl State {
             restart_host: Notify::new(),
             rebind: Notify::new(),
             updates: Default::default(),
+            prints: tokio::sync::broadcast::channel(16).0,
         })
     }
 

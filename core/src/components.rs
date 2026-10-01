@@ -14,6 +14,7 @@ pub enum Id {
     Vigem,
     Vdd,
     Winfsp,
+    Printer,
 }
 
 pub const VIGEM: Package = Package {
@@ -52,6 +53,65 @@ const CABLE_HWID: &str = "VBAudioVACWDM";
 /// Where the virtual display driver reads its settings.
 pub const VDD_SETTINGS_DIR: &str = "C:\\VirtualDisplayDriver";
 
+/// The printer that sends print jobs to the client (Windows' own PDF driver).
+pub const PRINTER_NAME: &str = "打印到 NyaRemoteControl 客户端";
+const PDF_DRIVER: &str = "Microsoft Print To PDF";
+
+/// Where the printer writes its jobs (`%ProgramData%\NyaRemoteControl\print`).
+pub fn print_spool_dir() -> std::path::PathBuf {
+    crate::paths::service_dir().join("print")
+}
+
+/// The printer's port: the file each job is written to.
+pub fn print_port() -> std::path::PathBuf {
+    print_spool_dir().join("job.pdf")
+}
+
+/// Whether the printer exists.
+pub fn printer_installed() -> bool {
+    use windows::core::HSTRING;
+    use windows::Win32::System::Registry::{RegCloseKey, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ};
+    let key = HSTRING::from(format!("SYSTEM\\CurrentControlSet\\Control\\Print\\Printers\\{PRINTER_NAME}"));
+    let mut h = HKEY::default();
+    // SAFETY: opening and closing a registry key.
+    unsafe {
+        if RegOpenKeyExW(HKEY_LOCAL_MACHINE, &key, 0, KEY_READ, &mut h).is_ok() {
+            let _ = RegCloseKey(h);
+            return true;
+        }
+    }
+    false
+}
+
+fn install_printer() -> Result<Installed> {
+    let dir = print_spool_dir();
+    std::fs::create_dir_all(&dir).context("创建打印文件夹")?;
+    // The spooler may write the job as the printing user: let users write here.
+    let system32 = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into())).join("System32");
+    let d = dir.to_string_lossy().into_owned();
+    package::run_hidden(&system32.join("icacls.exe"), &[&d, "/grant", "*S-1-5-32-545:(OI)(CI)M"])?;
+    let script = format!(
+        "$ErrorActionPreference='Stop'; $port='{port}'; $name='{name}'; \
+         if (-not (Get-PrinterDriver -Name '{driver}' -ErrorAction SilentlyContinue)) {{ exit 3 }}; \
+         if (-not (Get-PrinterPort -Name $port -ErrorAction SilentlyContinue)) {{ Add-PrinterPort -Name $port }}; \
+         if (-not (Get-Printer -Name $name -ErrorAction SilentlyContinue)) {{ Add-Printer -Name $name -DriverName '{driver}' -PortName $port }}; \
+         exit 0",
+        port = print_port().to_string_lossy(),
+        name = PRINTER_NAME,
+        driver = PDF_DRIVER,
+    );
+    let ps = system32.join("WindowsPowerShell").join("v1.0").join("powershell.exe");
+    let code = package::run_hidden(&ps, &["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &script])?;
+    match code {
+        0 if printer_installed() => Ok(Installed {
+            reboot: false,
+            note: "在被控端的程序里选择这台打印机，打印内容会发给正在操作的客户端".into(),
+        }),
+        3 => bail!("Windows 的“Microsoft Print to PDF”功能没有打开（控制面板 → 启用或关闭 Windows 功能）"),
+        c => bail!("添加打印机失败（PowerShell 返回 {c}）"),
+    }
+}
+
 /// Outcome of a successful install.
 pub struct Installed {
     pub reboot: bool,
@@ -66,7 +126,16 @@ pub fn install(id: Id, status: &mut dyn FnMut(String)) -> Result<Installed> {
         Id::Vigem => VIGEM,
         Id::Vdd => VDD,
         Id::Winfsp => WINFSP,
+        Id::Printer => unreachable!("not a package"),
     };
+    if id == Id::Printer {
+        status("添加打印机…".into());
+        let r = install_printer();
+        if let Err(e) = &r {
+            tracing::warn!("printer install failed: {e:#}");
+        }
+        return r;
+    }
     status("准备安装包…".into());
     let file = package::obtain(&pkg, &mut |done, total| {
         status(match total {
@@ -84,6 +153,7 @@ pub fn install(id: Id, status: &mut dyn FnMut(String)) -> Result<Installed> {
         }),
         Id::Cable => install_cable(&file),
         Id::Vdd => install_vdd(&file),
+        Id::Printer => unreachable!("not a package"),
         Id::Winfsp => {
             let msiexec = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into()))
                 .join("System32")

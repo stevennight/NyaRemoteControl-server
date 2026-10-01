@@ -60,6 +60,7 @@ async fn serve_all(dir: PathBuf, port: Option<u16>, mode: HostMode) -> Result<()
         }
         HostMode::Helper { session_changed } => {
             tokio::spawn(helper_manager(state.clone(), cmd_rx, session_changed));
+            tokio::spawn(crate::print::watch(state.clone()));
         }
     }
     listen(state, identity).await

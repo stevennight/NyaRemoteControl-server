@@ -18,6 +18,7 @@ pub mod host;
 pub mod hub;
 pub mod ipc;
 pub mod net;
+pub mod print;
 pub mod service;
 pub mod state;
 pub mod update;

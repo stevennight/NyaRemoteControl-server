@@ -67,6 +67,7 @@ fn component_id(id: &str) -> Option<(components::Id, &'static str)> {
         "vigem" => (components::Id::Vigem, "手柄"),
         "usbip" => (components::Id::Usbip, "USB 透传"),
         "winfsp" => (components::Id::Winfsp, "文件夹挂载"),
+        "printer" => (components::Id::Printer, "打印到客户端"),
         _ => return None,
     })
 }
@@ -141,6 +142,16 @@ fn detect_components() -> Vec<Component> {
             status: winfsp,
             url: "https://github.com/winfsp/winfsp/releases",
             note: "免费开源（GPLv3，含开源软件例外）；客户端在“连接设置 → 共享文件夹”里选择文件夹",
+        },
+        Component {
+            id: "printer",
+            name: "打印到客户端",
+            product: "Windows 自带的 Microsoft Print to PDF",
+            purpose: "被控端添加一台打印机“打印到 NyaRemoteControl 客户端”：打印的内容以 PDF 发给正在操作的客户端，用客户端的打印机打出来",
+            installed: components::printer_installed(),
+            status: components::printer_installed().then(|| components::PRINTER_NAME.to_owned()),
+            url: "https://learn.microsoft.com/windows/client-management/",
+            note: "不需要下载；需要服务模式。客户端可以选择直接打印、打开 PDF 或只保存",
         },
     ]
 }

@@ -343,6 +343,8 @@ async fn run_session(
 
     let mut replay = Replay::default();
     let folders_on = neg.has(Feature::FolderMount);
+    let print_on = neg.has(Feature::Print);
+    let mut prints = state.prints.subscribe();
     let mount: FolderMount = Default::default();
     // Several streams at once (one per client window).
     let multi_on = neg.has(Feature::MultiStream);
@@ -668,6 +670,14 @@ async fn run_session(
                 if !role.controlling && was && replay.folders.as_ref().is_some_and(|f| !f.folders.is_empty()) {
                     // Someone else operates now: their files, not ours, belong on the host.
                     apply_folders(&mount, pb::SharedFolders::default(), conn, client_name, &ctl_tx);
+                }
+            }
+            p = prints.recv() => {
+                // The operating client prints what the host prints.
+                if let Ok(path) = p {
+                    if print_on && controlling.load(Ordering::Relaxed) {
+                        tokio::spawn(crate::print::send(conn.clone(), path));
+                    }
                 }
             }
             _ = generation.changed(), if controlling.load(Ordering::Relaxed) => {
@@ -1425,6 +1435,60 @@ mod tests {
                 break;
             }
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A finished print job goes to the operating client as a PRINT file and
+    /// is deleted on the host.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn print_jobs_reach_the_operating_client() {
+        let dir = std::env::temp_dir().join(format!("nya-print-test-{}", nya_proto::now_us()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let server_id = server_identity();
+        let server_fp = server_id.fingerprint();
+        let auth = Arc::new(AuthStore::open(&dir).unwrap());
+        let key = auth.key();
+        let (hub, cmd_rx) = Hub::new();
+        tokio::spawn(big_frame_host(hub.clone(), cmd_rx));
+        let ep = nya_transport::endpoint::server_endpoint("127.0.0.1:0".parse().unwrap(), &server_id).unwrap();
+        let addr = ep.local_addr().unwrap();
+        let state = State::new(cpb::Mode::Standalone, dir.clone(), Default::default(), server_fp.to_string(), auth, hub);
+        tokio::spawn(serve_endpoint(ep, state.clone()));
+        let client_id = Identity::generate().unwrap();
+        let (mut c, _) = connect(addr, &client_id, server_fp).await;
+        assert!(pair(&mut c, &client_id, server_fp, &key).await.ok);
+        c.conn.close(0u32.into(), b"");
+        let (mut c, w) = connect(addr, &client_id, server_fp).await;
+        assert!(w.features.contains(&(Feature::Print as u32)));
+        // Wait until the session runs (it answers a ping), then "print".
+        write_msg(&mut c.send, &ctl(Msg::Ping(pb::Ping { t_us: 1 }))).await.unwrap();
+        loop {
+            let m: pb::ControlMsg = timeout(Duration::from_secs(5), expect_msg(&mut c.recv, MAX_MESSAGE_LEN)).await.unwrap().unwrap();
+            if matches!(m.msg, Some(Msg::Pong(_))) {
+                break;
+            }
+        }
+        let job = dir.join("被控端打印 test.pdf");
+        std::fs::write(&job, b"%PDF-1.4 fake").unwrap();
+        state.prints.send(job.clone()).unwrap();
+        let mut r = loop {
+            let mut r = timeout(Duration::from_secs(5), c.conn.accept_uni()).await.unwrap().unwrap();
+            if read_varint(&mut r).await.unwrap() == Some(stream_type::FILE) {
+                break r;
+            }
+        };
+        let h = nya_transport::files::read_header(&mut r).await.unwrap();
+        assert_eq!(h.purpose, pb::FilePurpose::Print as i32);
+        assert_eq!(h.name, "被控端打印 test.pdf");
+        let body = nya_transport::files::receive_to_vec(&mut r, &h, 1 << 20).await.unwrap();
+        assert_eq!(body, b"%PDF-1.4 fake");
+        for _ in 0..50 {
+            if !job.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!job.exists(), "sent jobs are deleted");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
