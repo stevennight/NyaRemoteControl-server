@@ -12,7 +12,7 @@ use nya_win::d3d::{tex_desc, D3dDevice};
 use nya_win::desktop::DesktopTracker;
 use nya_win::duplication::Duplicator;
 use nya_win::topology::Topology;
-use nya_win::transfer::CrossGpuCopy;
+use nya_win::transfer12::GpuToGpu;
 use windows::Win32::Graphics::Direct3D11::D3D11_BIND_RENDER_TARGET;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_NV12;
 
@@ -198,16 +198,19 @@ fn body(r: &mut String) {
 
     let hw: Vec<_> = topo.hardware_adapters().collect();
     if hw.len() > 1 {
-        out!(r, "\n-- 跨显卡传输（NV12，内存中转）--");
+        out!(r, "\n-- 跨显卡传输（NV12；T1 = 内存中转，T2 = D3D12 跨适配器共享）--");
         for src in &hw {
             for dst in &hw {
                 if src.index == dst.index {
                     continue;
                 }
                 for (w, h) in [(1920u32, 1080u32), (2560, 1440), (3840, 2160)] {
-                    match cross_benchmark(&src.adapter, &dst.adapter, w, h) {
-                        Ok(ms) => out!(r, "[{}]→[{}] {w}x{h}: {ms:.2} ms/帧", src.index, dst.index),
-                        Err(e) => out!(r, "[{}]→[{}] {w}x{h}: !! {e:#}", src.index, dst.index),
+                    for t2 in [false, true] {
+                        let t = if t2 { "T2" } else { "T1" };
+                        match cross_benchmark(&src.adapter, &dst.adapter, w, h, t2) {
+                            Ok(ms) => out!(r, "[{}]→[{}] {w}x{h} {t}: {ms:.2} ms/帧", src.index, dst.index),
+                            Err(e) => out!(r, "[{}]→[{}] {w}x{h} {t}: !! {e:#}", src.index, dst.index),
+                        }
                     }
                 }
             }
@@ -292,12 +295,16 @@ fn cross_benchmark(
     dst: &windows::Win32::Graphics::Dxgi::IDXGIAdapter1,
     w: u32,
     h: u32,
+    t2: bool,
 ) -> Result<f64> {
     let s = D3dDevice::for_adapter(src)?;
     let d = D3dDevice::for_adapter(dst)?;
     let src_tex = s.texture(&tex_desc(w, h, DXGI_FORMAT_NV12, D3D11_BIND_RENDER_TARGET))?;
     let dst_tex = d.texture(&tex_desc(w, h, DXGI_FORMAT_NV12, D3D11_BIND_RENDER_TARGET))?;
-    let mut x = CrossGpuCopy::new(&s, &d, DXGI_FORMAT_NV12, w, h)?;
+    let mut x = if t2 { GpuToGpu::new(&s, &d, DXGI_FORMAT_NV12, w, h)? } else { GpuToGpu::t1(&s, &d, DXGI_FORMAT_NV12, w, h)? };
+    if t2 && x.kind() != "T2" {
+        anyhow::bail!("T2 不可用（见日志）");
+    }
     x.copy(&src_tex, &dst_tex, 0)?;
     let t = Instant::now();
     for _ in 0..20 {

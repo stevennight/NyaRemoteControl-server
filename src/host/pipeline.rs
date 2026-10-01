@@ -3,7 +3,7 @@
 //! ```text
 //! DXGI duplication ─► desktop copy (BGRA, capture GPU)
 //!    ─► colour convert ─┬─ same GPU ───────────────► encoder pool texture ─► encode
-//!                       ├─ other GPU ─ CrossGpuCopy ─► encoder pool texture ─► encode
+//!                       ├─ other GPU ─ GpuToGpu (T2 / T1) ─► encoder pool texture ─► encode
 //!                       └─ software ── Readback ────► CPU NV12 ────────────► OpenH264
 //! ```
 
@@ -20,7 +20,8 @@ use nya_win::display_config;
 use nya_win::duplication::{DupError, Duplicator};
 use nya_win::input::DisplayRect;
 use nya_win::topology::{OutputInfo, Topology};
-use nya_win::transfer::{CrossGpuCopy, Readback};
+use nya_win::transfer::Readback;
+use nya_win::transfer12::GpuToGpu;
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11ShaderResourceView, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
@@ -83,7 +84,7 @@ pub struct Pipeline {
     converter: Converter,
     target: TargetFormat,
     intermediate: Option<ID3D11Texture2D>,
-    xcopy: Option<CrossGpuCopy>,
+    xcopy: Option<GpuToGpu>,
     readback: Option<Readback>,
     cpu_buf: Vec<u8>,
     /// Software path reads back BGRA and converts to NV12 on the CPU.
@@ -244,7 +245,7 @@ impl Pipeline {
             None
         };
         let xcopy = match (&encode_dev, cross) {
-            (Some(dst), true) => Some(CrossGpuCopy::new(&capture, dst, target.dxgi(), w, h)?),
+            (Some(dst), true) => Some(GpuToGpu::new(&capture, dst, target.dxgi(), w, h)?),
             _ => None,
         };
         let readback = if cpu { Some(Readback::new(&capture, target.dxgi(), w, h)?) } else { None };
