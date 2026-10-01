@@ -283,19 +283,14 @@ async fn run_session(
             _ = abr_tick.tick() => {
                 if let Some(a) = abr.as_mut() {
                     let st = conn.stats();
-                    let app = written.load(std::sync::atomic::Ordering::Relaxed) as i64;
-                    let mut backlog = app - (st.udp_tx.bytes as i64 - baseline);
-                    if backlog < 0 {
-                        baseline += backlog; // re-anchor: overhead makes the estimate drift low
-                        backlog = 0;
-                    }
+                    let backlog = backlog_estimate(written.load(std::sync::atomic::Ordering::Relaxed), st.udp_tx.bytes, &mut baseline);
                     let sample = crate::abr::Sample {
                         now: std::time::Instant::now(),
                         rtt: st.path.rtt,
                         lost_packets: st.path.lost_packets,
                         sent_packets: st.path.sent_packets,
                         sent_bytes: st.udp_tx.bytes,
-                        backlog_bytes: backlog as u64,
+                        backlog_bytes: backlog,
                     };
                     if let Some(k) = a.update(sample) {
                         tracing::info!("adaptive bitrate -> {k} kbps ({}; rtt {} ms)", a.note, st.path.rtt.as_millis());
@@ -538,6 +533,21 @@ async fn run_session(
     outcome
 }
 
+/// Video bytes handed to QUIC but not yet on the wire: `written` (video
+/// accepted by QUIC) minus `udp_tx` (everything sent) plus `baseline`, the
+/// non-video share of `udp_tx`. Overhead (control, audio, headers,
+/// retransmissions) makes the estimate drift low; when it goes negative the
+/// baseline is moved so that it reads 0.
+fn backlog_estimate(written: u64, udp_tx: u64, baseline: &mut i64) -> u64 {
+    let backlog = written as i64 - (udp_tx as i64 - *baseline);
+    if backlog < 0 {
+        *baseline -= backlog;
+        0
+    } else {
+        backlog as u64
+    }
+}
+
 /// Writes frames on one uni stream per video stream id; acknowledges each
 /// frame to the host once quinn accepted it (flow control, §6.2).
 /// One QUIC uni stream per video stream; with FEATURE_MULTI_STREAM several
@@ -750,6 +760,25 @@ async fn client_streams(conn: Connection, hub: Arc<Hub>, ctx: FileCtx) -> Result
 mod tests {
     //! Loopback integration test of the whole network protocol with a fake
     //! host (no GPU involved).
+
+    #[test]
+    fn backlog_estimate_reanchors_without_running_away() {
+        // Overhead only (audio, acks, headers): sent grows faster than video
+        // written, for an hour of 250 ms ticks. The estimate stays 0, and the
+        // baseline tracks the overhead instead of doubling until it wraps.
+        let mut baseline = 1_000;
+        let (mut written, mut sent) = (0u64, 1_000u64);
+        for _ in 0..14_400 {
+            written += 100_000;
+            sent += 103_000;
+            assert_eq!(super::backlog_estimate(written, sent, &mut baseline), 0);
+        }
+        assert_eq!(baseline, (sent - written) as i64);
+        // Then 2 MB of video queues up: reported as such.
+        written += 2_000_000;
+        sent += 50_000;
+        assert_eq!(super::backlog_estimate(written, sent, &mut baseline), 1_950_000);
+    }
 
     use super::*;
     use std::net::SocketAddr;
