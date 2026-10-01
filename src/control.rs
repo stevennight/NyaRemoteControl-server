@@ -74,12 +74,23 @@ async fn serve_at(state: Arc<State>, path: String) {
     }
 }
 
-async fn handle(mut pipe: NamedPipeServer, state: &State) -> Result<()> {
+async fn handle(mut pipe: NamedPipeServer, state: &Arc<State>) -> Result<()> {
     let mut admin = None;
     while let Some(req) = read_msg::<cpb::Request, _>(&mut pipe, MAX_MSG).await? {
         // Impersonation only works once the client has written something.
         let admin = *admin.get_or_insert_with(|| state.mode == Mode::Standalone || crate::winutil::pipe_client_is_admin(&pipe));
-        let resp = dispatch(state, admin, req.req);
+        let resp = match req.req {
+            // Talks to GitHub; anyone may ask (the answer is in the public status too).
+            Some(Req::CheckUpdate(_)) => {
+                crate::update::check(state).await;
+                Resp::Status(state.status(admin))
+            }
+            Some(Req::ApplyUpdate(_)) if admin => match crate::update::apply(state) {
+                Ok(m) => done(m),
+                Err(e) => err(Code::Invalid, format!("{e:#}")),
+            },
+            other => dispatch(state, admin, other),
+        };
         write_msg(&mut pipe, &cpb::Response { id: req.id, resp: Some(resp) }).await?;
     }
     Ok(())
@@ -140,6 +151,9 @@ fn dispatch(state: &State, admin: bool, req: Option<Req>) -> Resp {
                 err(Code::NotFound, "当前没有连接")
             }
         }
+        // Answered in `handle` (async / needs the shared state).
+        Req::CheckUpdate(_) => Resp::Status(state.status(admin)),
+        Req::ApplyUpdate(_) => err(Code::Internal, "ApplyUpdate is handled by the connection"),
         Req::TailLog(t) => {
             if !LOG_NAMES.contains(&t.name.as_str()) {
                 return err(Code::Invalid, format!("没有名为 {:?} 的日志", t.name));
@@ -190,6 +204,9 @@ fn set_config(state: &State, new: ServerConfig) -> Result<cpb::SetConfigReply> {
         }
         state.rebind.notify_one();
         notes.push(format!("已改为监听 [{}]:{}，当前连接会断开", new.bind, new.port));
+    }
+    if new.check_updates && !old.check_updates {
+        state.updates.wake.notify_one();
     }
     let needs_restart = new.log_level != old.log_level;
     if needs_restart {

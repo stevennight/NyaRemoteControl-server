@@ -20,6 +20,7 @@ pub mod ipc;
 pub mod net;
 pub mod service;
 pub mod state;
+pub mod update;
 pub mod usb;
 pub mod winutil;
 

@@ -17,7 +17,8 @@ syntax = "proto3";
 package nya.control;
 
 // `control_version` in Hello / HelloReply is bumped when requests are added
-// (1: initial set), so a tool can tell what the other side knows.
+// (1: initial set; 2: CheckUpdate, ApplyUpdate), so a tool can tell what the
+// other side knows.
 
 message Request {
   uint64 id = 1;  // echoed in the Response
@@ -32,6 +33,8 @@ message Request {
     RemoveClient remove_client = 9;
     Disconnect disconnect = 10;
     TailLog tail_log = 11;
+    CheckUpdate check_update = 12;   // since 2
+    ApplyUpdate apply_update = 13;   // since 2 (admin)
   }
 }
 
@@ -102,7 +105,38 @@ message Status {
   string data_dir = 11;         // admin only
   string exe = 12;              // service executable
   repeated Session viewers = 13;  // clients watching (not operating)
+  UpdateStatus update = 14;       // since 2
 }
+
+// ---- updates -----------------------------------------------------------------
+
+// The service checks GitHub Releases for a newer version (every 12 hours
+// unless Config.no_update_check, and on CheckUpdate). ApplyUpdate downloads
+// and verifies the installer, then hands over to an updater process that
+// runs it, checks the new service answers and rolls back if not.
+message UpdateStatus {
+  enum State {
+    IDLE = 0;          // not checked yet
+    CHECKING = 1;
+    UP_TO_DATE = 2;
+    AVAILABLE = 3;     // `latest` can be installed
+    DOWNLOADING = 4;   // `progress` percent
+    INSTALLING = 5;    // the updater runs; the service is about to restart
+    FAILED = 6;        // `message` says why
+    UNAVAILABLE = 7;   // not here (standalone mode, not installed by the installer)
+  }
+  State state = 1;
+  string current = 2;      // this service's version
+  string latest = 3;       // newest release ('' = unknown)
+  string notes = 4;        // its release notes (Markdown)
+  string page = 5;         // its web page
+  uint32 progress = 6;
+  string message = 7;      // error, or the outcome of the last update
+  uint64 checked_unix = 8; // last successful check (0 = never)
+}
+
+message CheckUpdate {}
+message ApplyUpdate {}
 
 message Host {
   bool running = 1;            // helper connected / in-process host alive
@@ -157,6 +191,7 @@ message Config {
   uint32 max_fps = 7;
   bool audio = 8;
   string log_level = 9;
+  bool no_update_check = 10;  // since 2; inverted so older tools keep the checks on
 }
 
 // Replaces the whole config; the service validates, saves and applies it.

@@ -25,6 +25,8 @@ pub struct ServerConfig {
     pub audio: bool,
     /// tracing filter, e.g. "info" or "nya_server=debug"
     pub log_level: String,
+    /// Look for new versions on GitHub Releases (installing is always manual).
+    pub check_updates: bool,
 }
 
 impl Default for ServerConfig {
@@ -39,6 +41,7 @@ impl Default for ServerConfig {
             max_fps: 144,
             audio: true,
             log_level: "info".into(),
+            check_updates: true,
         }
     }
 }

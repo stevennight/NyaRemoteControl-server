@@ -233,6 +233,24 @@ fn event_kind(k: i32) -> &'static str {
     }
 }
 
+fn update_json(u: &cpb::UpdateStatus) -> Value {
+    use cpb::update_status::State as St;
+    let state = match St::try_from(u.state).unwrap_or(St::Idle) {
+        St::Idle => "idle",
+        St::Checking => "checking",
+        St::UpToDate => "up_to_date",
+        St::Available => "available",
+        St::Downloading => "downloading",
+        St::Installing => "installing",
+        St::Failed => "failed",
+        St::Unavailable => "unavailable",
+    };
+    json!({
+        "state": state, "current": u.current, "latest": u.latest, "notes": u.notes, "page": u.page,
+        "progress": u.progress, "message": u.message, "checked_unix": u.checked_unix,
+    })
+}
+
 fn status_json(s: &cpb::Status) -> Value {
     json!({
         "server_version": s.server_version,
@@ -278,6 +296,8 @@ struct Model {
     load_error: Option<String>,
     busy: Option<&'static str>,
     install_job: Option<Arc<Mutex<InstallJob>>>,
+    /// Update status found by this program (no service that checks itself).
+    local_update: Arc<Mutex<Option<cpb::UpdateStatus>>>,
     /// Last snapshot sent to the page (to push only changes).
     sent: String,
 }
@@ -299,6 +319,7 @@ impl Model {
             load_error: None,
             busy: None,
             install_job: None,
+            local_update: Default::default(),
             sent: String::new(),
         };
         m.svc = service_state();
@@ -377,6 +398,7 @@ impl Model {
             "live": self.live(),
             "points_here": self.points_here,
             "status": self.status.as_ref().map(status_json),
+            "update": self.update_status().as_ref().map(update_json),
             "code": self.code,
             "fingerprint": self.fingerprint,
             "config": self.cfg,
@@ -386,6 +408,18 @@ impl Model {
             "busy": self.busy,
             "log_dir": self.dir.join("logs"),
         })
+    }
+
+    /// The service's update status when it updates itself, else this program's check.
+    fn update_status(&self) -> Option<cpb::UpdateStatus> {
+        let service = self.backend.as_ref().is_some_and(|b| b.service_updates());
+        match &self.status {
+            Some(s) if service => s.update.clone(),
+            _ => self.local_update.lock().unwrap().clone().map(|mut u| {
+                u.current = crate::VERSION_PLAIN.into();
+                u
+            }),
+        }
     }
 
     fn install_json(&self) -> Value {
@@ -473,6 +507,36 @@ impl App {
             "diag" => {
                 let out = m.dir.join("logs").join("nya-diag.txt");
                 return self.job(id, "诊断", move || run_diag(&out));
+            }
+            "update_check" => {
+                let local = m.local_update.clone();
+                return self.job(id, "检查更新", move || {
+                    let mut b = Backend::service("nya-server gui")?;
+                    let s = b.check_update()?;
+                    let msg = if s.state == cpb::update_status::State::Available as i32 {
+                        format!("有新版本 {}", s.latest)
+                    } else {
+                        format!("已经是最新版本（{}）", s.latest)
+                    };
+                    if !b.service_updates() {
+                        *local.lock().unwrap() = Some(s);
+                    }
+                    Ok(msg)
+                });
+            }
+            "update_apply" => {
+                return self.job(id, "安装更新", move || {
+                    let mut b = Backend::service("nya-server gui")?;
+                    let (msg, exit) = b.apply_update()?;
+                    if exit {
+                        // The installer replaces this program: get out of its way.
+                        std::thread::spawn(|| {
+                            std::thread::sleep(Duration::from_millis(1500));
+                            std::process::exit(0);
+                        });
+                    }
+                    Ok(msg)
+                });
             }
             "reset_code" => m.with_backend(|b| b.reset_pairing_code()).map_err(|e| format!("{e:#}")).map(|p| {
                 m.code = p.code;
@@ -609,7 +673,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::JobDone(id, label, r) => {
                 self.model.busy = None;
                 self.model.svc_checked = Instant::now() - Duration::from_secs(10);
-                if label != "诊断" {
+                if !matches!(label, "诊断" | "检查更新" | "安装更新") {
                     // The service was (un)installed / started / stopped.
                     self.model.svc = service_state();
                     self.model.reload();

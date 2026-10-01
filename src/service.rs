@@ -49,6 +49,7 @@ async fn serve_all(dir: PathBuf, port: Option<u16>, mode: HostMode) -> Result<()
     let state = State::new(pb_mode, dir, cfg.clone(), identity.fingerprint().to_string(), auth.clone(), hub);
     state.event(Kind::Service, format!("被控端已启动（版本 {}）", crate::version()));
     tokio::spawn(control::serve(state.clone()));
+    tokio::spawn(crate::update::run(state.clone()));
 
     match mode {
         HostMode::InProcess => {

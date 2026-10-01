@@ -156,4 +156,33 @@ impl Backend {
             Backend::Offline(d) => Ok(logging::tail(d, name, lines as usize)),
         }
     }
+
+    /// Does the running service update itself (else this program installs updates)?
+    pub fn service_updates(&self) -> bool {
+        matches!(self, Backend::Live(c) if self_updates(c))
+    }
+
+    /// Look for a newer release: through the service, or from here.
+    pub fn check_update(&mut self) -> Result<cpb::UpdateStatus> {
+        match self {
+            Backend::Live(c) if self_updates(c) => c.check_update(),
+            _ => crate::updater::check_here().map(|(s, _)| s),
+        }
+    }
+
+    /// Install the newer release: the service hands over to its updater
+    /// (stop, install, check, roll back if needed). Without a service that
+    /// can, this program downloads the installer and starts it with its
+    /// window; returns `true` then (the caller should exit so the installer
+    /// can replace it).
+    pub fn apply_update(&mut self) -> Result<(String, bool)> {
+        match self {
+            Backend::Live(c) if self_updates(c) => c.apply_update().map(|m| (m, false)),
+            _ => crate::updater::install_here().map(|m| (m, true)),
+        }
+    }
+}
+
+fn self_updates(c: &ControlClient) -> bool {
+    c.has_updates() && c.hello.mode == Mode::Service as i32
 }

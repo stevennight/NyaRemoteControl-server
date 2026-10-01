@@ -16,7 +16,7 @@ use crate::control_pb::{self as cpb, error::Code, request::Req, response::Resp, 
 pub const SERVICE_PIPE: &str = "NyaRemoteControl.control";
 pub const STANDALONE_PIPE: &str = "NyaRemoteControl.control.standalone";
 /// Bumped when requests are added (see control.proto).
-pub const CONTROL_VERSION: u32 = 1;
+pub const CONTROL_VERSION: u32 = 2;
 pub const MAX_MSG: usize = 1 << 20;
 /// Log files the control pipe may return.
 pub const LOG_NAMES: [&str; 4] = ["service", "helper", "standalone", "gui"];
@@ -37,6 +37,7 @@ pub fn config_to_pb(c: &ServerConfig) -> cpb::Config {
         max_fps: c.max_fps,
         audio: c.audio,
         log_level: c.log_level.clone(),
+        no_update_check: !c.check_updates,
     }
 }
 
@@ -52,6 +53,7 @@ pub fn config_from_pb(c: cpb::Config) -> ServerConfig {
         max_fps: c.max_fps,
         audio: c.audio,
         log_level: c.log_level,
+        check_updates: !c.no_update_check,
     }
 }
 
@@ -218,6 +220,27 @@ impl ControlClient {
     pub fn tail_log(&mut self, name: &str, lines: u32) -> Result<String> {
         match self.call(Req::TailLog(cpb::TailLog { name: name.into(), lines }))? {
             Resp::Log(l) => Ok(l.text),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Does the host know the update requests (control version 2)?
+    pub fn has_updates(&self) -> bool {
+        self.hello.control_version >= 2
+    }
+
+    /// Check for a newer release now (waits for the answer from GitHub).
+    pub fn check_update(&mut self) -> Result<cpb::UpdateStatus> {
+        match self.call(Req::CheckUpdate(cpb::CheckUpdate {}))? {
+            Resp::Status(s) => Ok(s.update.unwrap_or_default()),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Download and install the newer release; the service restarts.
+    pub fn apply_update(&mut self) -> Result<String> {
+        match self.call(Req::ApplyUpdate(cpb::ApplyUpdate {}))? {
+            Resp::Done(d) => Ok(d.message),
             other => Err(unexpected(other)),
         }
     }

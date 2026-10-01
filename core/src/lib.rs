@@ -15,6 +15,7 @@ pub mod control;
 pub mod install;
 pub mod logging;
 pub mod paths;
+pub mod updater;
 pub mod win;
 
 pub mod control_pb {

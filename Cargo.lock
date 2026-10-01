@@ -1738,6 +1738,7 @@ dependencies = [
  "prost-build",
  "protox",
  "serde",
+ "serde_json",
  "toml 0.8.2",
  "tracing",
  "tracing-appender",
@@ -1800,6 +1801,8 @@ name = "nya-win"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "serde",
+ "serde_json",
  "sha2",
  "thiserror 2.0.21",
  "tracing",

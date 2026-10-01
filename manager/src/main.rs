@@ -63,6 +63,23 @@ enum Cmd {
     },
     /// 断开当前的远程连接
     Disconnect,
+    /// 检查新版本；加 --install 下载并安装（服务会自动停止、更新、重启，失败时恢复旧版本）
+    Update {
+        #[arg(long)]
+        install: bool,
+    },
+    /// 更新程序本身（由服务启动，见 nya_server_core::updater）
+    #[command(hide = true)]
+    ApplyUpdate {
+        #[arg(long)]
+        installer: std::path::PathBuf,
+        #[arg(long)]
+        install_dir: std::path::PathBuf,
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+    },
     /// 诊断：显卡、显示器、编码器、截屏与音频（由 nya-server-svc.exe 执行）
     Diag {
         /// 把结果另存到文件
@@ -135,6 +152,20 @@ fn real_main(cli: Cli) -> Result<()> {
             println!("{}", b.disconnect("")?);
             Ok(())
         }
+        Cmd::Update { install } => {
+            let mut b = Backend::service(TOOL)?;
+            let s = b.check_update()?;
+            println!("当前版本 {}，最新版本 {}", s.current, if s.latest.is_empty() { "未知" } else { &s.latest });
+            use nya_server_core::control_pb::update_status::State as St;
+            match St::try_from(s.state) {
+                Ok(St::Available) if install => println!("{}", b.apply_update()?.0),
+                Ok(St::Available) => println!("有新版本，运行 nya-server update --install 安装（{}）", s.page),
+                Ok(St::Failed) => bail!("{}", s.message),
+                _ => println!("已经是最新版本"),
+            }
+            Ok(())
+        }
+        Cmd::ApplyUpdate { installer, install_dir, from, to } => nya_server_core::updater::apply(&installer, &install_dir, &from, &to),
         Cmd::Diag { out } => {
             let exe = paths::service_exe()?;
             let mut cmd = std::process::Command::new(&exe);
@@ -238,6 +269,8 @@ pub fn format_unix(t: u64) -> String {
     }
     format!("{:02}-{:02} {:02}:{:02}:{:02}", local.wMonth, local.wDay, local.wHour, local.wMinute, local.wSecond)
 }
+
+pub const VERSION_PLAIN: &str = env!("CARGO_PKG_VERSION");
 
 /// Version for display: `0.2.0 (1a2b3c4d)` (commit id from build.rs; `+` = uncommitted changes).
 pub fn version() -> String {

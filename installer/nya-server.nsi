@@ -96,6 +96,13 @@ FunctionEnd
 ; Ask the user to close the management program (it holds its files open).
 !macro EnsureManagerClosed UN
 Function ${UN}EnsureManagerClosed
+  ; Silent (automatic update): nobody to ask; close it (the updater runs as nya-updater.exe).
+  ${If} ${Silent}
+    nsExec::Exec 'taskkill /F /IM ${MANAGER_EXE}'
+    Pop $0
+    Sleep 500
+    Return
+  ${EndIf}
   ${Do}
     !insertmacro IsRunning "${MANAGER_EXE}"
     Pop $0
@@ -146,6 +153,12 @@ FunctionEnd
 
 Section "-程序文件" SecFiles
   SectionIn RO
+  ; Shortcuts for every user (an automatic update runs as SYSTEM); 0.2.0
+  ; put them in the installing user's Start menu.
+  Delete "$SMPROGRAMS\NyaRemoteControl\NyaRemoteControl 被控端管理.lnk"
+  Delete "$SMPROGRAMS\NyaRemoteControl\卸载 NyaRemoteControl 被控端.lnk"
+  RMDir "$SMPROGRAMS\NyaRemoteControl"
+  SetShellVarContext all
   Call EnsureManagerClosed
   DetailPrint "停止被控端服务…"
   Call StopHost
@@ -185,6 +198,14 @@ Function .onInit
     Abort
   ${EndIf}
   SetRegView 64
+  ; Upgrade into the existing directory (InstallDirRegKey reads the 32-bit
+  ; registry view, so look again in the 64-bit one); /D= still wins.
+  ${If} $INSTDIR == "$PROGRAMFILES64\NyaRemoteControl\Server"
+    ReadRegStr $0 HKLM "${UNINST_KEY}" "InstallLocation"
+    ${If} $0 != ""
+      StrCpy $INSTDIR $0
+    ${EndIf}
+  ${EndIf}
   ; Upgrading a machine that has the service: it must come back (selected, read-only).
   nsExec::Exec 'sc query ${SERVICE}'
   Pop $ServiceExisted
@@ -203,6 +224,11 @@ Section "Uninstall"
   Pop $0
   Call un.StopHost
 
+  ; 0.2.0 put the shortcuts in the installing user's Start menu, later versions in everybody's.
+  Delete "$SMPROGRAMS\NyaRemoteControl\NyaRemoteControl 被控端管理.lnk"
+  Delete "$SMPROGRAMS\NyaRemoteControl\卸载 NyaRemoteControl 被控端.lnk"
+  RMDir "$SMPROGRAMS\NyaRemoteControl"
+  SetShellVarContext all
   Delete "$SMPROGRAMS\NyaRemoteControl\NyaRemoteControl 被控端管理.lnk"
   Delete "$SMPROGRAMS\NyaRemoteControl\卸载 NyaRemoteControl 被控端.lnk"
   RMDir "$SMPROGRAMS\NyaRemoteControl"

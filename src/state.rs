@@ -36,6 +36,7 @@ pub struct State {
     pub restart_host: Notify,
     /// Re-bind the network endpoint (port / address changed).
     pub rebind: Notify,
+    pub updates: crate::update::Updates,
 }
 
 impl State {
@@ -54,6 +55,7 @@ impl State {
             events: Mutex::new(VecDeque::new()),
             restart_host: Notify::new(),
             rebind: Notify::new(),
+            updates: Default::default(),
         })
     }
 
@@ -156,6 +158,7 @@ impl State {
             data_dir: if admin { self.dir.display().to_string() } else { String::new() },
             exe: std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default(),
             viewers,
+            update: Some(self.updates.status()),
         }
     }
 }
