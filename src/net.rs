@@ -73,6 +73,11 @@ async fn handshake(
     };
 
     let paired = auth.is_paired(&client_fp);
+    if paired {
+        if let Err(e) = auth.update_name(&client_fp, &hello.client_name) {
+            tracing::warn!("update client name: {e:#}");
+        }
+    }
     if !paired && auth.locked_out() {
         state.event(Kind::Rejected, format!("拒绝 {}（{remote}）：配对失败次数过多", hello.client_name));
         let reject = pb::Reject {

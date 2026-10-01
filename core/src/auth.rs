@@ -126,6 +126,23 @@ impl AuthStore {
         Self::save_list(&self.dir, list.clone())
     }
 
+    /// A paired client connected under a new name (renamed on the client):
+    /// keep the list showing the current one.
+    pub fn update_name(&self, fp: &Fingerprint, name: &str) -> Result<()> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Ok(());
+        }
+        let mut list = self.clients.lock().unwrap();
+        *list = Self::read_clients(&self.dir);
+        let hex = fp.to_hex();
+        match list.iter_mut().find(|c| c.fingerprint == hex) {
+            Some(c) if c.name != name => c.name = name.to_owned(),
+            _ => return Ok(()),
+        }
+        Self::save_list(&self.dir, list.clone())
+    }
+
     /// Too many wrong pairing attempts recently?
     pub fn locked_out(&self) -> bool {
         let mut f = self.failures.lock().unwrap();
