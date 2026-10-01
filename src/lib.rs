@@ -22,6 +22,7 @@ pub mod service;
 pub mod state;
 pub mod update;
 pub mod usb;
+pub mod winfsp;
 pub mod winutil;
 
 pub mod ipc_pb {

@@ -66,6 +66,7 @@ fn component_id(id: &str) -> Option<(components::Id, &'static str)> {
         "cable" => (components::Id::Cable, "虚拟声卡"),
         "vigem" => (components::Id::Vigem, "手柄"),
         "usbip" => (components::Id::Usbip, "USB 透传"),
+        "winfsp" => (components::Id::Winfsp, "文件夹挂载"),
         _ => return None,
     })
 }
@@ -83,6 +84,7 @@ fn detect_components() -> Vec<Component> {
         }
     });
     let usbip = components::usbip_exe().map(|p| p.display().to_string());
+    let winfsp = components::winfsp_dll().map(|p| p.display().to_string());
     vec![
         Component {
             id: "vdd",
@@ -129,6 +131,16 @@ fn detect_components() -> Vec<Component> {
             status: usbip,
             url: "https://github.com/vadimgrn/usbip-win2/releases",
             note: "客户端另需 usbipd-win（客户端工具条“USB 设备”里可一键安装）",
+        },
+        Component {
+            id: "winfsp",
+            name: "文件夹挂载",
+            product: "WinFsp 2025 (2.1)",
+            purpose: "客户端共享的文件夹出现在被控端的一个盘符里，被控端的程序可以直接打开、保存客户端的文件",
+            installed: winfsp.is_some(),
+            status: winfsp,
+            url: "https://github.com/winfsp/winfsp/releases",
+            note: "免费开源（GPLv3，含开源软件例外）；客户端在“连接设置 → 共享文件夹”里选择文件夹",
         },
     ]
 }

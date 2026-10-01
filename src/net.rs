@@ -166,7 +166,7 @@ async fn handle(conn: Connection, state: &State) -> Result<()> {
         },
     );
     state.event(Kind::Connected, format!("{} 已连接（{remote}）", hello.client_name));
-    let result = run_session(&conn, send, recv, hub, att, &neg, state).await;
+    let result = run_session(&conn, send, recv, hub, att, &neg, state, &hello.client_name).await;
     hub.detach(token);
     state.session_ended(token);
     let why = match &result {
@@ -194,6 +194,47 @@ struct Replay {
     /// Stream requests by slot (client window).
     starts: std::collections::BTreeMap<u32, pb::StartStream>,
     audio: bool,
+    /// Folders the client wants on the host as a drive (FOLDER_MOUNT).
+    folders: Option<pb::SharedFolders>,
+}
+
+/// The drive showing the client's shared folders, if mounted.
+type FolderMount = Arc<tokio::sync::Mutex<Option<crate::winfsp::Mount>>>;
+
+/// Mount, keep or unmount the client's folders to match `want`, and tell
+/// the client how it went.
+fn apply_folders(mount: &FolderMount, want: pb::SharedFolders, conn: &Connection, client: &str, ctl_tx: &mpsc::Sender<pb::ControlMsg>) {
+    let (mount, conn, client, ctl_tx) = (mount.clone(), conn.clone(), client.to_owned(), ctl_tx.clone());
+    tokio::spawn(async move {
+        let mut m = mount.lock().await;
+        let status = if want.folders.is_empty() {
+            if let Some(old) = m.take() {
+                let point = old.point.clone();
+                let _ = tokio::task::spawn_blocking(move || drop(old)).await;
+                tracing::info!("client folders unmounted from {point}");
+            }
+            pb::FolderMountStatus { mounted: false, mount_point: String::new(), message: String::new() }
+        } else if let Some(cur) = m.as_ref() {
+            // The client answers the listing itself: a changed list shows at once.
+            pb::FolderMountStatus { mounted: true, mount_point: cur.point.clone(), message: String::new() }
+        } else {
+            let rt = tokio::runtime::Handle::current();
+            let r = tokio::task::spawn_blocking(move || crate::winfsp::Mount::start(conn, rt, &client)).await;
+            match r.map_err(anyhow::Error::from).and_then(|r| r) {
+                Ok(new) => {
+                    tracing::info!("client folders mounted on {} ({} folder(s))", new.point, want.folders.len());
+                    let point = new.point.clone();
+                    *m = Some(new);
+                    pb::FolderMountStatus { mounted: true, mount_point: point, message: String::new() }
+                }
+                Err(e) => {
+                    tracing::warn!("mount client folders: {e:#}");
+                    pb::FolderMountStatus { mounted: false, mount_point: String::new(), message: format!("{e:#}") }
+                }
+            }
+        };
+        let _ = ctl_tx.send(ctl(Msg::FolderMountStatus(status))).await;
+    });
 }
 
 async fn run_session(
@@ -204,6 +245,7 @@ async fn run_session(
     mut att: crate::hub::Attachment,
     neg: &Negotiated,
     state: &State,
+    client_name: &str,
 ) -> Result<()> {
     // Control writer task.
     let (ctl_tx, mut ctl_rx) = mpsc::channel::<pb::ControlMsg>(64);
@@ -300,6 +342,8 @@ async fn run_session(
     };
 
     let mut replay = Replay::default();
+    let folders_on = neg.has(Feature::FolderMount);
+    let mount: FolderMount = Default::default();
     // Several streams at once (one per client window).
     let multi_on = neg.has(Feature::MultiStream);
     // Configured bitrate of each running stream, by slot.
@@ -393,6 +437,15 @@ async fn run_session(
                         if in_control || last_keyframe.elapsed() >= Duration::from_secs(1) {
                             last_keyframe = Instant::now();
                             hub.send(Cmd::RequestKeyframe(k));
+                        }
+                    }
+                    Some(Msg::SharedFolders(f)) if folders_on => {
+                        replay.folders = Some(f.clone());
+                        if in_control {
+                            apply_folders(&mount, f, conn, client_name, &ctl_tx);
+                        } else {
+                            let message = "正在观看，接管操作后才会挂载共享文件夹".to_string();
+                            let _ = ctl_tx.send(ctl(Msg::FolderMountStatus(pb::FolderMountStatus { message, ..Default::default() }))).await;
                         }
                     }
                     Some(Msg::TakeControl(t)) if roles_on => {
@@ -610,6 +663,11 @@ async fn run_session(
                     if let Some(c) = &replay.caps { hub.send(Cmd::ClientCaps(c.clone())); }
                     if replay.audio { hub.send(Cmd::SetAudio(SetAudio { enabled: true })); }
                     for s in replay.starts.values() { hub.send(Cmd::StartStream(s.clone())); }
+                    if let Some(f) = &replay.folders { apply_folders(&mount, f.clone(), conn, client_name, &ctl_tx); }
+                }
+                if !role.controlling && was && replay.folders.as_ref().is_some_and(|f| !f.folders.is_empty()) {
+                    // Someone else operates now: their files, not ours, belong on the host.
+                    apply_folders(&mount, pb::SharedFolders::default(), conn, client_name, &ctl_tx);
                 }
             }
             _ = generation.changed(), if controlling.load(Ordering::Relaxed) => {
@@ -629,8 +687,11 @@ async fn run_session(
         }
     };
 
-    // Give attached USB devices back to the client.
+    // Give attached USB devices back to the client, take its folders off the host.
     let _ = timeout(Duration::from_secs(8), async { usb.lock().await.detach_all().await }).await;
+    if let Some(m) = mount.lock().await.take() {
+        let _ = timeout(Duration::from_secs(12), tokio::task::spawn_blocking(move || drop(m))).await;
+    }
     drop(ctl_tx);
     video_task.abort();
     mic_task.abort();
@@ -1317,6 +1378,54 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    /// Shared folders without WinFsp on the host: the client hears why, the
+    /// session goes on. (Skipped where WinFsp is installed: it would mount a drive.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shared_folders_report_a_missing_winfsp() {
+        if nya_server_core::components::winfsp_dll().is_some() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("nya-folders-test-{}", nya_proto::now_us()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let server_id = server_identity();
+        let server_fp = server_id.fingerprint();
+        let auth = Arc::new(AuthStore::open(&dir).unwrap());
+        let key = auth.key();
+        let (hub, cmd_rx) = Hub::new();
+        tokio::spawn(big_frame_host(hub.clone(), cmd_rx));
+        let ep = nya_transport::endpoint::server_endpoint("127.0.0.1:0".parse().unwrap(), &server_id).unwrap();
+        let addr = ep.local_addr().unwrap();
+        let state = State::new(cpb::Mode::Standalone, dir.clone(), Default::default(), server_fp.to_string(), auth, hub);
+        tokio::spawn(serve_endpoint(ep, state));
+        let client_id = Identity::generate().unwrap();
+        let (mut c, _) = connect(addr, &client_id, server_fp).await;
+        assert!(pair(&mut c, &client_id, server_fp, &key).await.ok);
+        c.conn.close(0u32.into(), b"");
+        let (mut c, w) = connect(addr, &client_id, server_fp).await;
+        assert!(w.features.contains(&(Feature::FolderMount as u32)));
+
+        let f = pb::SharedFolders { folders: vec![pb::SharedFolder { name: "文档".into(), read_only: false }] };
+        write_msg(&mut c.send, &ctl(Msg::SharedFolders(f))).await.unwrap();
+        loop {
+            let m: pb::ControlMsg = timeout(Duration::from_secs(5), expect_msg(&mut c.recv, MAX_MESSAGE_LEN)).await.unwrap().unwrap();
+            if let Some(Msg::FolderMountStatus(s)) = m.msg {
+                assert!(!s.mounted);
+                assert!(s.message.contains("WinFsp"), "{}", s.message);
+                break;
+            }
+        }
+        // Still alive.
+        write_msg(&mut c.send, &ctl(Msg::Ping(pb::Ping { t_us: 7 }))).await.unwrap();
+        loop {
+            let m: pb::ControlMsg = timeout(Duration::from_secs(5), expect_msg(&mut c.recv, MAX_MESSAGE_LEN)).await.unwrap().unwrap();
+            if let Some(Msg::Pong(p)) = m.msg {
+                assert_eq!(p.t_us, 7);
+                break;
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Game mode with FEATURE_VIDEO_DATAGRAM: frames arrive as FEC datagrams

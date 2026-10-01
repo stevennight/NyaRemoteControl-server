@@ -13,6 +13,7 @@ pub enum Id {
     Usbip,
     Vigem,
     Vdd,
+    Winfsp,
 }
 
 pub const VIGEM: Package = Package {
@@ -31,6 +32,12 @@ pub const VDD: Package = Package {
     file: "VirtualDisplayDriver-x86.Driver.Only.zip",
     url: "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/download/25.7.23/VirtualDisplayDriver-x86.Driver.Only.zip",
     sha256: "e24210692b442b39af763536330ce78b423f19342b7a7792c26de3944e418b3a",
+};
+
+pub const WINFSP: Package = Package {
+    file: "winfsp-2.1.25156.msi",
+    url: "https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi",
+    sha256: "073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a",
 };
 
 /// Not redistributable: always downloaded from vb-audio.com.
@@ -58,6 +65,7 @@ pub fn install(id: Id, status: &mut dyn FnMut(String)) -> Result<Installed> {
         Id::Usbip => USBIP,
         Id::Vigem => VIGEM,
         Id::Vdd => VDD,
+        Id::Winfsp => WINFSP,
     };
     status("准备安装包…".into());
     let file = package::obtain(&pkg, &mut |done, total| {
@@ -76,6 +84,16 @@ pub fn install(id: Id, status: &mut dyn FnMut(String)) -> Result<Installed> {
         }),
         Id::Cable => install_cable(&file),
         Id::Vdd => install_vdd(&file),
+        Id::Winfsp => {
+            let msiexec = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into()))
+                .join("System32")
+                .join("msiexec.exe");
+            let msi = file.to_string_lossy().into_owned();
+            setup(&msiexec, &["/i", &msi, "/qn", "/norestart"]).map(|mut r| {
+                r.note = "客户端在“连接设置 → 共享文件夹”里选择要共享的文件夹，连接后出现在被控端的一个盘符里".into();
+                r
+            })
+        }
     };
     match &r {
         Ok(i) => tracing::info!("{id:?} installed (reboot needed: {})", i.reboot),
@@ -127,6 +145,35 @@ pub const CABLE_NAMES: [&str; 2] = ["CABLE Input", "VB-Audio Virtual Cable"];
 /// VB-Cable's playback device, if installed (COM initialised on this thread).
 pub fn cable_device_name() -> Option<String> {
     CABLE_NAMES.iter().find_map(|n| nya_win::audio::find_render_device(n).map(|(_, name)| name))
+}
+
+/// WinFsp's 64-bit DLL, if WinFsp is installed (folder mounting).
+pub fn winfsp_dll() -> Option<std::path::PathBuf> {
+    use windows::core::w;
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
+    let mut buf = [0u16; 520];
+    let mut len = (buf.len() * 2) as u32;
+    // SAFETY: valid buffer and length; the value is a REG_SZ.
+    let r = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            w!("SOFTWARE\\WOW6432Node\\WinFsp"),
+            w!("InstallDir"),
+            RRF_RT_REG_SZ,
+            None,
+            Some(buf.as_mut_ptr().cast()),
+            Some(&mut len),
+        )
+    };
+    let dir = if r == ERROR_SUCCESS {
+        let n = (len as usize / 2).saturating_sub(1).min(buf.len());
+        std::path::PathBuf::from(String::from_utf16_lossy(&buf[..n]))
+    } else {
+        std::path::PathBuf::from(r"C:\Program Files (x86)\WinFsp")
+    };
+    let dll = dir.join("bin").join("winfsp-x64.dll");
+    dll.exists().then_some(dll)
 }
 
 /// usbip-win2's command-line tool, if installed.
