@@ -66,6 +66,8 @@ impl Kick {
 struct Subscriber {
     token: u64,
     name: String,
+    /// The client's certificate fingerprint: one client, one session.
+    client: String,
     tx: mpsc::Sender<HostEvent>,
     kicked: Arc<Kick>,
     role: watch::Sender<Role>,
@@ -132,8 +134,10 @@ impl Hub {
 
     /// Attach a client session. With `shared` (the client can watch) it
     /// operates the host only if nobody does; otherwise it replaces every
-    /// attached session.
-    pub fn attach(&self, name: &str, shared: bool) -> Attachment {
+    /// attached session. A client reconnecting (`client`: its fingerprint)
+    /// replaces its own previous session, which may not have noticed the
+    /// connection loss yet, and keeps its role.
+    pub fn attach(&self, name: &str, client: &str, shared: bool) -> Attachment {
         let (tx, rx) = mpsc::channel(256);
         let kicked = Arc::new(Kick::default());
         let video_dropped = Arc::new(AtomicBool::new(false));
@@ -149,8 +153,29 @@ impl Hub {
                 s.kicked.fire("另一个客户端已连接");
             }
         }
-        c.subs.push(Subscriber { token, name: name.to_owned(), tx, kicked: kicked.clone(), role: role_tx, video_dropped: video_dropped.clone() });
-        if !shared || c.controller.is_none() {
+        let mut was_controller = false;
+        if !client.is_empty() {
+            let controller = c.controller;
+            c.subs.retain(|s| {
+                if s.client != client {
+                    return true;
+                }
+                s.kicked.fire("同一客户端已重新连接");
+                was_controller |= Some(s.token) == controller;
+                false
+            });
+        }
+        c.subs.push(Subscriber {
+            token,
+            name: name.to_owned(),
+            client: client.to_owned(),
+            tx,
+            kicked: kicked.clone(),
+            role: role_tx,
+            video_dropped: video_dropped.clone(),
+        });
+        let controller_gone = c.controller.is_none_or(|t| !c.subs.iter().any(|s| s.token == t));
+        if !shared || was_controller || controller_gone {
             c.controller = Some(token);
         }
         c.broadcast();
@@ -292,8 +317,8 @@ mod tests {
     #[tokio::test]
     async fn one_operates_the_others_watch() {
         let (hub, mut cmds) = Hub::new();
-        let a = hub.attach("A", true);
-        let b = hub.attach("B", true);
+        let a = hub.attach("A", "a", true);
+        let b = hub.attach("B", "b", true);
         assert!(role(&a).controlling && !role(&b).controlling);
         assert_eq!((role(&b).controller.as_str(), role(&b).viewers.clone()), ("A", vec!["B".to_string()]));
 
@@ -313,21 +338,40 @@ mod tests {
     #[tokio::test]
     async fn kick_and_old_clients() {
         let (hub, _cmds) = Hub::new();
-        let a = hub.attach("A", true);
-        let b = hub.attach("B", true);
+        let a = hub.attach("A", "a", true);
+        let b = hub.attach("B", "b", true);
         hub.take_control(b.token, true);
         assert_eq!(a.kicked.reason(), "B 接管了被控端并断开了你的连接");
         // A client that cannot watch replaces everyone.
-        let c = hub.attach("old", false);
+        let c = hub.attach("old", "c", false);
         assert_eq!(b.kicked.reason(), "另一个客户端已连接");
         assert!(role(&c).controlling);
     }
 
     #[tokio::test]
+    async fn reconnecting_client_replaces_its_old_session() {
+        let (hub, mut cmds) = Hub::new();
+        let a = hub.attach("A", "a", true);
+        let b = hub.attach("B", "b", true);
+        // A's network dropped; it reconnects before the old session noticed.
+        let a2 = hub.attach("A", "a", true);
+        assert_eq!(a.kicked.reason(), "同一客户端已重新连接");
+        assert!(role(&a2).controlling && !role(&b).controlling, "A keeps operating");
+        assert_eq!(role(&b).viewers, vec!["B".to_string()]);
+        // The old session ending later changes nothing.
+        hub.detach(a.token);
+        assert!(role(&a2).controlling);
+        assert!(cmds.try_recv().is_err());
+        // A watcher reconnecting stays a watcher.
+        let b2 = hub.attach("B", "b", true);
+        assert!(!role(&b2).controlling && role(&a2).controlling);
+    }
+
+    #[tokio::test]
     async fn watchers_never_stall_the_host() {
         let (hub, _cmds) = Hub::new();
-        let mut a = hub.attach("A", true);
-        let b = hub.attach("B", true);
+        let mut a = hub.attach("A", "a", true);
+        let b = hub.attach("B", "b", true);
         let frame = || HostEvent { ev: Some(Ev::Video(Default::default())) };
         // More frames than B's queue holds, while A keeps reading.
         for _ in 0..300 {

@@ -152,9 +152,9 @@ async fn handle(conn: Connection, state: &State) -> Result<()> {
 
     let hub = &state.hub;
     // Clients that can watch join next to a running session; older ones replace it.
-    let att = hub.attach(&hello.client_name, neg.has(Feature::MultiClient));
-    let token = att.token;
     let fingerprint = peer_fingerprint(&conn).map(|f| f.to_hex()).unwrap_or_default();
+    let att = hub.attach(&hello.client_name, &fingerprint, neg.has(Feature::MultiClient));
+    let token = att.token;
     state.session_started(
         token,
         cpb::Session {
