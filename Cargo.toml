@@ -10,7 +10,7 @@ resolver = "2"
 [package]
 name = "nya-server"
 description = "NyaRemoteControl host: Windows service, per-session helper and standalone mode (nya-server-svc.exe)"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 publish = false
