@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# The workspace mirrors the local layout: server/, common/ (latest main; a
+# release pins it with COMMON_REF instead) and third_party/ side by side.
+jobs:
+  build-test:
+    name: Build and test
+    runs-on: windows-2022
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out server
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: server
+          persist-credentials: false
+
+      - name: Check out common
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: stevennight/NyaRemoteControl-common
+          path: common
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: common/web/package-lock.json
+
+      - name: Set up Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update; rustup default stable
+
+      - name: Cache third-party downloads
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: third_party
+          key: third-party-${{ hashFiles('common/scripts/fetch-*.ps1') }}
+
+      - name: Fetch FFmpeg, ViGEmClient and drivers
+        run: |
+          if (-not (Test-Path third_party/ffmpeg/bin)) { ./common/scripts/fetch-ffmpeg.ps1 }
+          if (-not (Test-Path third_party/ViGEmClient/src/ViGEmClient.cpp)) { ./common/scripts/fetch-vigem.ps1 }
+          ./common/scripts/fetch-drivers.ps1
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: server -> ../target
+
+      - name: Check version
+        working-directory: server
+        run: |
+          . ../common/scripts/release-lib.ps1
+          Test-NyaVersion (Get-Location).Path @('Cargo.toml', 'core/Cargo.toml', 'manager/Cargo.toml')
+
+      - name: Test
+        working-directory: server
+        # Not --locked: common main may be ahead of this Cargo.lock (releases build with --locked).
+        run: cargo test --release
+
+      - name: Package (no installer)
+        working-directory: server
+        run: ./scripts/build-release.ps1 -SkipInstaller
+
+      - name: Upload package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nya-server-${{ github.sha }}
+          path: server/release/*.zip
+          if-no-files-found: error
+          retention-days: 14

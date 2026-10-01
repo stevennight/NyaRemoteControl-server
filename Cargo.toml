@@ -10,7 +10,7 @@ resolver = "2"
 [package]
 name = "nya-server"
 description = "NyaRemoteControl host: Windows service, per-session helper and standalone mode (nya-server-svc.exe)"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -59,6 +59,7 @@ features = [
 cc = "1"
 prost-build = "0.13"
 protox = "0.7"
+winresource = "0.1.31"
 
 [profile.release]
 debug = "line-tables-only"

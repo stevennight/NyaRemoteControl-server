@@ -40,7 +40,7 @@ fn body(r: &mut String) {
     nya_win::com_init();
     nya_media::init_log_level();
     out!(r, "== NyaRemoteControl 诊断 ==");
-    out!(r, "版本 {} / 协议 {}.{}", env!("CARGO_PKG_VERSION"), nya_proto::PROTO_MAJOR, nya_proto::PROTO_MINOR);
+    out!(r, "版本 {} / 协议 {}.{}", crate::version(), nya_proto::PROTO_MAJOR, nya_proto::PROTO_MINOR);
     let (c, u) = nya_media::ffmpeg_versions();
     out!(r, "FFmpeg avcodec {c} / avutil {u}  {}", match nya_media::check_runtime_versions() {
         Ok(()) => "OK".to_string(),

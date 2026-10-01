@@ -143,7 +143,7 @@ impl State {
             }
         }
         cpb::Status {
-            server_version: env!("CARGO_PKG_VERSION").into(),
+            server_version: crate::version(),
             mode: self.mode as i32,
             started_unix: self.started_unix,
             server_name: self.server_name(),

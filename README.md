@@ -121,6 +121,14 @@ cargo build --release      # 会自动用 npm 构建管理界面（../common/web
 
 管理界面是 `../common/web` 里的 Svelte 页面（manager.html），编译时嵌入 `nya-server.exe`。
 
+### 安装包、版本和发布
+
+- **版本号**：`VERSION` 文件（`主.次.修订`，可带 `-beta.1` 这样的后缀），和三个 `Cargo.toml` 的版本保持一致。被控端和客户端各自独立编号，不需要同时升级。显示的版本带提交号，例如 `0.2.0 (5b67ace0)`（`+` 表示有未提交的改动）；exe 的“属性 → 详细信息”里也能看到版本。
+- **本地打安装包**：`.\scripts\build-release.ps1`（需要 NSIS：`winget install NSIS.NSIS`），在 `release\` 生成安装包 `NyaRemoteControl-Server_<版本>_x64-setup.exe`、便携版 zip 和对应的 `.sha256`。缺少的 FFmpeg、ViGEmClient、驱动安装包会自动下载。
+- **发布新版本**：`.\scripts\release.ps1 0.2.1`：改 `VERSION` 和 `Cargo.toml`，把当前 common 的提交记到 `COMMON_REF`（发布构建用这个版本的 common；common 要先推送），提交并打 tag `v0.2.1`。再 `git push origin HEAD v0.2.1`（或加 `-Push`），GitHub Actions 会构建安装包并发布到 Releases；带后缀的版本发布为预发布版。
+- **CI**：推送到 main 或提 PR 时，`.github/workflows/ci.yml` 用最新的 common 编译、运行测试并打一个便携 zip（在 Actions 的构建产物里）。
+- 安装包：装到 `C:\Program Files\NyaRemoteControl\Server`，默认安装并启动服务（升级时自动停止旧服务、替换文件、重新启动，配对信息保留）；卸载时删除服务，可选同时删除 `C:\ProgramData\NyaRemoteControl`。
+
 本仓库是一个 Cargo workspace：
 
 | 目录 | 包 | 产物 |

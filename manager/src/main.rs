@@ -15,7 +15,7 @@ use nya_server_core::config::ServerConfig;
 use nya_server_core::{install, paths};
 
 #[derive(Parser)]
-#[command(name = "nya-server", version, about = "NyaRemoteControl 被控端管理（不带参数运行打开图形界面）")]
+#[command(name = "nya-server", version = concat!(env!("CARGO_PKG_VERSION"), " ", env!("NYA_GIT_HASH")), about = "NyaRemoteControl 被控端管理（不带参数运行打开图形界面）")]
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -237,4 +237,12 @@ pub fn format_unix(t: u64) -> String {
         }
     }
     format!("{:02}-{:02} {:02}:{:02}:{:02}", local.wMonth, local.wDay, local.wHour, local.wMinute, local.wSecond)
+}
+
+/// Version for display: `0.2.0 (1a2b3c4d)` (commit id from build.rs; `+` = uncommitted changes).
+pub fn version() -> String {
+    match env!("NYA_GIT_HASH") {
+        "" => env!("CARGO_PKG_VERSION").to_owned(),
+        h => format!("{} ({h})", env!("CARGO_PKG_VERSION")),
+    }
 }

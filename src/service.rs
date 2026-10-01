@@ -47,7 +47,7 @@ async fn serve_all(dir: PathBuf, port: Option<u16>, mode: HostMode) -> Result<()
         HostMode::Helper { .. } => Mode::Service,
     };
     let state = State::new(pb_mode, dir, cfg.clone(), identity.fingerprint().to_string(), auth.clone(), hub);
-    state.event(Kind::Service, format!("被控端已启动（版本 {}）", env!("CARGO_PKG_VERSION")));
+    state.event(Kind::Service, format!("被控端已启动（版本 {}）", crate::version()));
     tokio::spawn(control::serve(state.clone()));
 
     match mode {
@@ -273,7 +273,7 @@ fn service_body(dir: PathBuf) -> Result<()> {
         ServiceState::Running,
         ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN | ServiceControlAccept::SESSION_CHANGE,
     );
-    tracing::info!("service started (version {})", env!("CARGO_PKG_VERSION"));
+    tracing::info!("service started (version {})", crate::version());
 
     let rt = tokio::runtime::Runtime::new()?;
     let result = rt.block_on(async {

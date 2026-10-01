@@ -372,7 +372,7 @@ impl Model {
         json!({
             "elevated": self.elevated,
             "computer": winutil::computer_name(),
-            "version": env!("CARGO_PKG_VERSION"),
+            "version": crate::version(),
             "svc": self.svc.key(),
             "live": self.live(),
             "points_here": self.points_here,

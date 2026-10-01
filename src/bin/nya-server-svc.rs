@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 use nya_server::{diag, ipc, logging, paths, service};
 
 #[derive(Parser)]
-#[command(name = "nya-server-svc", version, about = "NyaRemoteControl 被控端服务程序（管理请用 nya-server.exe）")]
+#[command(name = "nya-server-svc", version = concat!(env!("CARGO_PKG_VERSION"), " ", env!("NYA_GIT_HASH")), about = "NyaRemoteControl 被控端服务程序（管理请用 nya-server.exe）")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,

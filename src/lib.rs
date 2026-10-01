@@ -26,3 +26,11 @@ pub mod winutil;
 pub mod ipc_pb {
     include!(concat!(env!("OUT_DIR"), "/nya.ipc.rs"));
 }
+
+/// Version for display: `0.2.0 (1a2b3c4d)` (commit id from build.rs; `+` = uncommitted changes).
+pub fn version() -> String {
+    match env!("NYA_GIT_HASH") {
+        "" => env!("CARGO_PKG_VERSION").to_owned(),
+        h => format!("{} ({h})", env!("CARGO_PKG_VERSION")),
+    }
+}

@@ -95,7 +95,7 @@ async fn handshake(
         proto_major: negotiated.major,
         proto_minor: negotiated.minor,
         server_name: state.server_name(),
-        server_version: env!("CARGO_PKG_VERSION").to_owned(),
+        server_version: crate::version(),
         features: negotiated.features.iter().copied().collect(),
         needs_pairing: !paired,
     };
