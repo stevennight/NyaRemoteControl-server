@@ -159,8 +159,8 @@ fn remove_client(state: &State, prefix: &str) -> Resp {
     match state.auth.remove(&c.fingerprint) {
         Ok(_) => {
             state.event(cpb::event::Kind::Service, format!("已移除客户端 {}", c.name));
-            if state.session_fingerprint().as_deref() == Some(c.fingerprint.as_str()) {
-                state.hub.kick("此客户端已被被控端移除，需要重新配对");
+            for token in state.sessions_of(&c.fingerprint) {
+                state.hub.kick_one(token, "此客户端已被被控端移除，需要重新配对");
             }
             done(format!("已移除 {}", c.name))
         }

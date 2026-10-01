@@ -243,6 +243,10 @@ fn status_json(s: &cpb::Status) -> Value {
             "client_name": c.client_name, "client_version": c.client_version,
             "remote_addr": c.remote_addr, "since_unix": c.since_unix,
         })),
+        "viewers": s.viewers.iter().map(|c| json!({
+            "client_name": c.client_name, "client_version": c.client_version,
+            "remote_addr": c.remote_addr, "since_unix": c.since_unix,
+        })).collect::<Vec<_>>(),
         "recent": s.recent.iter().rev().take(30).map(|e| json!({ "unix": e.unix, "kind": event_kind(e.kind), "text": e.text })).collect::<Vec<_>>(),
     })
 }

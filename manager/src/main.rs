@@ -204,6 +204,9 @@ fn status() -> Result<()> {
         }
         None => println!("当前连接：无"),
     }
+    for v in &s.viewers {
+        println!("正在观看：{} {}  {}", v.client_name, v.client_version, v.remote_addr);
+    }
     if !s.recent.is_empty() {
         println!("最近事件：");
         for e in s.recent.iter().rev().take(15).rev() {

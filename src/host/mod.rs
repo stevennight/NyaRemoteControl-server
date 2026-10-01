@@ -142,6 +142,11 @@ pub fn run(mut commands: mpsc::UnboundedReceiver<HostCommand>, events: mpsc::Sen
             Cmd::SetAudio(a) => {
                 let _ = audio_tx.send(a.enabled && cfg.audio);
             }
+            Cmd::ControllerChanged(_) => {
+                // Keys and buttons held by the previous operator.
+                let _ = input_tx.send(input::InputCmd::ReleaseAll);
+                let _ = input_tx.send(input::InputCmd::UnplugPads);
+            }
             Cmd::ClientGone(_) => {
                 let _ = video_tx.send(video::VideoCmd::StopAll);
                 let _ = audio_tx.send(false);

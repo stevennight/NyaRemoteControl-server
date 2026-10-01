@@ -97,10 +97,11 @@ message Status {
   string listen_error = 6;  // why it is not listening
   string fingerprint = 7;   // our certificate
   Host host = 8;
-  Session session = 9;          // absent = nobody connected
+  Session session = 9;          // the operating client; absent = nobody connected
   repeated Event recent = 10;   // newest last; admin only
   string data_dir = 11;         // admin only
   string exe = 12;              // service executable
+  repeated Session viewers = 13;  // clients watching (not operating)
 }
 
 message Host {

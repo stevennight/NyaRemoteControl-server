@@ -1,8 +1,9 @@
 //! Network side of the host: accept QUIC connections, run the handshake
 //! (version negotiation + pairing), then bridge the client with the hub.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use nya_proto::frame::stream_type;
@@ -150,7 +151,8 @@ async fn handle(conn: Connection, state: &State) -> Result<()> {
     );
 
     let hub = &state.hub;
-    let att = hub.attach();
+    // Clients that can watch join next to a running session; older ones replace it.
+    let att = hub.attach(&hello.client_name, neg.has(Feature::MultiClient));
     let token = att.token;
     let fingerprint = peer_fingerprint(&conn).map(|f| f.to_hex()).unwrap_or_default();
     state.session_started(
@@ -219,15 +221,32 @@ async fn run_session(
         let _ = ctl_tx.send(ctl(Msg::SessionInfo(info))).await;
     }
 
+    // Only the operating client's requests reach the host (FEATURE_MULTI_CLIENT).
+    let roles_on = neg.has(Feature::MultiClient);
+    let controlling = Arc::new(AtomicBool::new(att.role.borrow().controlling));
+    if !controlling.load(Ordering::Relaxed) {
+        // Joining a running session to watch: the picture as it is.
+        let (streams, displays) = hub.picture();
+        if let Some(d) = displays {
+            let _ = ctl_tx.send(ctl(Msg::DisplayChanged(d))).await;
+        }
+        for s in streams {
+            hub.send(Cmd::RequestKeyframe(pb::RequestKeyframe { slot: s.slot }));
+            let _ = ctl_tx.send(ctl(Msg::StreamStarted(s))).await;
+        }
+    }
+    // Keyframes asked for by a watching client (rate-limited: they cost the operator bandwidth).
+    let mut last_keyframe = Instant::now() - Duration::from_secs(10);
+
     // Video / cursor writer tasks.
     let (video_tx, video_rx) = mpsc::channel::<crate::ipc_pb::VideoFrame>(4);
     let (cursor_tx, cursor_rx) = mpsc::channel::<pb::CursorMsg>(256);
     let written = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let video_task = tokio::spawn({
-        let (conn, hub, written) = (conn.clone(), hub.clone(), written.clone());
+        let (conn, hub, written, controlling) = (conn.clone(), hub.clone(), written.clone(), controlling.clone());
         let multi = neg.has(Feature::MultiStream);
         async move {
-            if let Err(e) = video_writer(conn, video_rx, hub, written, multi).await {
+            if let Err(e) = video_writer(conn, video_rx, hub, written, multi, controlling).await {
                 tracing::warn!("video writer: {e:#}");
             }
         }
@@ -235,10 +254,10 @@ async fn run_session(
     let cursor_task = tokio::spawn(cursor_writer(conn.clone(), cursor_rx));
     let mic_on = neg.has(Feature::Microphone);
     let mic_task = tokio::spawn({
-        let (conn, hub) = (conn.clone(), hub.clone());
+        let (conn, hub, controlling) = (conn.clone(), hub.clone(), controlling.clone());
         async move {
             while let Ok(d) = conn.read_datagram().await {
-                if mic_on && d.first() == Some(&nya_proto::frame::datagram_type::MIC) {
+                if mic_on && controlling.load(Ordering::Relaxed) && d.first() == Some(&nya_proto::frame::datagram_type::MIC) {
                     hub.send(Cmd::MicAudio(crate::ipc_pb::MicAudio { datagram: d.to_vec() }));
                 }
             }
@@ -254,7 +273,15 @@ async fn run_session(
     let input_task = tokio::spawn(client_streams(
         conn.clone(),
         hub.clone(),
-        FileCtx { ctl_tx: ctl_tx.clone(), files_on, images_on, clip_files_on, incoming: incoming.clone(), batches: Default::default() },
+        FileCtx {
+            ctl_tx: ctl_tx.clone(),
+            files_on,
+            images_on,
+            clip_files_on,
+            incoming: incoming.clone(),
+            batches: Default::default(),
+            controlling: controlling.clone(),
+        },
     ));
     // Files copied on the host and offered to the client.
     let mut offers = nya_transport::clipfiles::Outgoing::default();
@@ -297,7 +324,7 @@ async fn run_session(
                         sent_bytes: st.udp_tx.bytes,
                         backlog_bytes: backlog,
                     };
-                    if let Some(k) = a.update(sample) {
+                    if let Some(k) = a.update(sample).filter(|_| controlling.load(Ordering::Relaxed)) {
                         tracing::info!("adaptive bitrate -> {k} kbps ({}; rtt {} ms)", a.note, st.path.rtt.as_millis());
                         hub.send(Cmd::SetBitrate(crate::ipc_pb::SetBitrate { kbps: k }));
                     }
@@ -309,13 +336,18 @@ async fn run_session(
                     Ok(None) => break Ok(()),
                     Err(e) => break Err(e.into()),
                 };
+                // A watching client's requests are kept (for when it takes
+                // over) but do not reach the host.
+                let in_control = controlling.load(Ordering::Relaxed);
                 match m.msg {
                     Some(Msg::ClientCaps(c)) => {
                         replay.caps = Some(c.clone());
-                        hub.send(Cmd::ClientCaps(c));
-                        if audio_on {
-                            replay.audio = true;
-                            hub.send(Cmd::SetAudio(SetAudio { enabled: true }));
+                        replay.audio = audio_on;
+                        if in_control {
+                            hub.send(Cmd::ClientCaps(c));
+                            if audio_on {
+                                hub.send(Cmd::SetAudio(SetAudio { enabled: true }));
+                            }
                         }
                     }
                     Some(Msg::StartStream(mut s)) => {
@@ -323,7 +355,9 @@ async fn run_session(
                             s.slot = 0;
                         }
                         replay.starts.insert(s.slot, s.clone());
-                        hub.send(Cmd::StartStream(s));
+                        if in_control {
+                            hub.send(Cmd::StartStream(s));
+                        }
                     }
                     Some(Msg::StopStream(mut s)) => {
                         if !multi_on {
@@ -335,16 +369,33 @@ async fn run_session(
                         } else {
                             replay.starts.remove(&s.slot);
                         }
-                        stream_max.remove(&s.slot);
-                        hub.send(Cmd::StopStream(s));
+                        if in_control {
+                            stream_max.remove(&s.slot);
+                            hub.send(Cmd::StopStream(s));
+                        }
                     }
                     Some(Msg::SetMode(m)) => {
                         for s in replay.starts.values_mut() {
                             s.config.get_or_insert_with(Default::default).mode = m.mode;
                         }
-                        hub.send(Cmd::SetMode(m));
+                        if in_control {
+                            hub.send(Cmd::SetMode(m));
+                        }
                     }
-                    Some(Msg::RequestKeyframe(k)) => hub.send(Cmd::RequestKeyframe(k)),
+                    Some(Msg::RequestKeyframe(k)) => {
+                        if in_control || last_keyframe.elapsed() >= Duration::from_secs(1) {
+                            last_keyframe = Instant::now();
+                            hub.send(Cmd::RequestKeyframe(k));
+                        }
+                    }
+                    Some(Msg::TakeControl(t)) if roles_on => {
+                        tracing::info!("client takes over the host{}", if t.kick { " (disconnecting the previous operator)" } else { "" });
+                        hub.take_control(att.token, t.kick);
+                    }
+                    Some(Msg::UsbAttach(a)) if usb_on && !in_control => {
+                        let message = "正在观看，接管操作后才能透传 USB 设备".to_string();
+                        let _ = ctl_tx.send(ctl(Msg::UsbStatus(pb::UsbStatus { busid: a.busid, attached: false, message }))).await;
+                    }
                     Some(Msg::UsbAttach(a)) if usb_on => {
                         let (usb, tx) = (usb.clone(), ctl_tx.clone());
                         tokio::spawn(async move {
@@ -385,7 +436,7 @@ async fn run_session(
                             }
                         }
                     }
-                    Some(Msg::FileOffer(o)) if clip_files_on => {
+                    Some(Msg::FileOffer(o)) if clip_files_on && in_control => {
                         tracing::info!("client copied {} item(s) (offer {:016x})", o.files.len(), o.transfer_id);
                         incoming.register(&o, &clip_cache);
                         hub.send(Cmd::ClipboardOffer(crate::ipc_pb::ClipboardOffer { transfer_id: o.transfer_id }));
@@ -399,8 +450,8 @@ async fn run_session(
                         let _ = ctl_tx.try_send(ctl(Msg::Pong(pb::Pong { t_us: p.t_us, server_t_us: nya_proto::now_us() })));
                     }
                     Some(Msg::ClientStats(s)) => tracing::debug!("client stats: {s:?}"),
-                    Some(Msg::ClipboardText(c)) if clipboard_on => hub.send(Cmd::Clipboard(c)),
-                    Some(Msg::SendSas(_)) if neg.has(Feature::Sas) => {
+                    Some(Msg::ClipboardText(c)) if clipboard_on && in_control => hub.send(Cmd::Clipboard(c)),
+                    Some(Msg::SendSas(_)) if neg.has(Feature::Sas) && in_control => {
                         if let Err(e) = crate::winutil::send_sas() {
                             tracing::warn!("SendSAS: {e:#}");
                         }
@@ -416,9 +467,24 @@ async fn run_session(
             ev = att.events.recv() => {
                 let Some(ev) = ev else { break Ok(()) };
                 match ev.ev {
-                    Some(Ev::Video(f)) => {
+                    Some(Ev::Video(f)) if controlling.load(Ordering::Relaxed) => {
                         if video_tx.send(f).await.is_err() {
                             break Err(anyhow!("video writer stopped"));
+                        }
+                    }
+                    // Watching shows the main picture only (the operator's extra
+                    // windows have no window on this client, which would stop the stream).
+                    Some(Ev::Video(f)) if f.slot != 0 => {}
+                    Some(Ev::Video(f)) => {
+                        // Watching: never hold up the host; after a loss, ask for a keyframe.
+                        let slot = f.slot;
+                        if video_tx.try_send(f).is_err() {
+                            att.video_dropped.store(true, Ordering::Relaxed);
+                        }
+                        if att.video_dropped.load(Ordering::Relaxed) && last_keyframe.elapsed() >= Duration::from_secs(1) {
+                            att.video_dropped.store(false, Ordering::Relaxed);
+                            last_keyframe = Instant::now();
+                            hub.send(Cmd::RequestKeyframe(pb::RequestKeyframe { slot }));
                         }
                     }
                     Some(Ev::Cursor(c)) => {
@@ -510,7 +576,22 @@ async fn run_session(
                     None => {}
                 }
             }
-            _ = generation.changed() => {
+            _ = att.role.changed() => {
+                let role = att.role.borrow_and_update().clone();
+                let was = controlling.swap(role.controlling, Ordering::SeqCst);
+                state.set_controlling(att.token, role.controlling);
+                if roles_on {
+                    let _ = ctl_tx.send(ctl(Msg::SessionRole(role.to_pb()))).await;
+                }
+                if role.controlling && !was {
+                    // Taking over: the host follows this client's requests now.
+                    tracing::info!("client operates the host now; applying its stream requests");
+                    if let Some(c) = &replay.caps { hub.send(Cmd::ClientCaps(c.clone())); }
+                    if replay.audio { hub.send(Cmd::SetAudio(SetAudio { enabled: true })); }
+                    for s in replay.starts.values() { hub.send(Cmd::StartStream(s.clone())); }
+                }
+            }
+            _ = generation.changed(), if controlling.load(Ordering::Relaxed) => {
                 // The helper restarted (session switch): replay the client's requests.
                 tracing::info!("host restarted; replaying stream request");
                 if let Some(c) = &replay.caps { hub.send(Cmd::ClientCaps(c.clone())); }
@@ -563,6 +644,7 @@ async fn video_writer(
     hub: Arc<Hub>,
     written: Arc<std::sync::atomic::AtomicU64>,
     multi: bool,
+    controlling: Arc<AtomicBool>,
 ) -> Result<()> {
     // slot -> (stream id, QUIC stream)
     let mut open: std::collections::HashMap<u32, (u64, SendStream)> = Default::default();
@@ -590,7 +672,10 @@ async fn video_writer(
         s.write_all(&len.to_le_bytes()).await?;
         s.write_all(&f.header).await?;
         s.write_all(&f.data).await?;
-        hub.send(Cmd::FrameSent(FrameSent { frame_id: f.frame_id, stream_id: f.stream_id }));
+        // The host paces itself on the operating client only.
+        if controlling.load(Ordering::Relaxed) {
+            hub.send(Cmd::FrameSent(FrameSent { frame_id: f.frame_id, stream_id: f.stream_id }));
+        }
         written.fetch_add(len as u64 + 4, std::sync::atomic::Ordering::Relaxed);
         frames += 1;
         bytes += len as u64;
@@ -657,6 +742,8 @@ struct FileCtx {
     incoming: nya_transport::clipfiles::Incoming,
     /// transfer id -> files received so far
     batches: Arc<std::sync::Mutex<std::collections::HashMap<u64, Vec<String>>>>,
+    /// This client operates the host (input and files are taken only then).
+    controlling: Arc<AtomicBool>,
 }
 
 /// A FILE stream from the client: save an upload, or apply a clipboard image.
@@ -736,6 +823,9 @@ async fn client_streams(conn: Connection, hub: Arc<Hub>, ctx: FileCtx) -> Result
         let ctx = ctx.clone();
         tokio::spawn(async move {
             match read_varint(&mut r).await {
+                Ok(Some(stream_type::FILE)) if !ctx.controlling.load(Ordering::Relaxed) => {
+                    let _ = r.stop(0u32.into());
+                }
                 Ok(Some(stream_type::FILE)) => {
                     if let Err(e) = receive_file(r, hub, ctx).await {
                         tracing::warn!("file stream: {e:#}");
@@ -743,7 +833,11 @@ async fn client_streams(conn: Connection, hub: Arc<Hub>, ctx: FileCtx) -> Result
                 }
                 Ok(Some(stream_type::INPUT)) => loop {
                     match read_msg::<pb::InputMsg, _>(&mut r, MAX_MESSAGE_LEN).await {
-                        Ok(Some(m)) => hub.send(Cmd::Input(m)),
+                        Ok(Some(m)) => {
+                            if ctx.controlling.load(Ordering::Relaxed) {
+                                hub.send(Cmd::Input(m));
+                            }
+                        }
                         Ok(None) => break,
                         Err(e) => {
                             tracing::debug!("input stream: {e}");
@@ -1070,6 +1164,104 @@ mod tests {
                 break;
             }
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A host that reports the requests reaching it.
+    async fn role_host(hub: Arc<Hub>, mut cmds: mpsc::UnboundedReceiver<HostCommand>, seen: mpsc::UnboundedSender<String>) {
+        while let Some(HostCommand { cmd: Some(c) }) = cmds.recv().await {
+            match c {
+                Cmd::StartStream(s) => {
+                    let _ = seen.send(format!("start {}", s.display_id));
+                    let started = pb::StreamStarted { display_id: s.display_id, stream_id: s.display_id as u64, ..Default::default() };
+                    hub.publish(HostEvent { ev: Some(Ev::StreamStarted(started)) }).await;
+                }
+                Cmd::RequestKeyframe(k) => {
+                    let _ = seen.send(format!("keyframe {}", k.slot));
+                }
+                Cmd::ControllerChanged(_) => {
+                    let _ = seen.send("controller".into());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    async fn next_ctl(c: &mut Client, mut want: impl FnMut(&Msg) -> bool) -> Msg {
+        loop {
+            let m: pb::ControlMsg = timeout(Duration::from_secs(5), expect_msg(&mut c.recv, MAX_MESSAGE_LEN)).await.unwrap().unwrap();
+            if let Some(m) = m.msg {
+                if want(&m) {
+                    return m;
+                }
+            }
+        }
+    }
+
+    async fn next_seen(seen: &mut mpsc::UnboundedReceiver<String>) -> String {
+        timeout(Duration::from_secs(5), seen.recv()).await.unwrap().unwrap()
+    }
+
+    /// Two clients: the first operates the host, the second watches the
+    /// running picture (its requests ignored) until it takes over.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn second_client_watches_then_takes_over() {
+        let dir = std::env::temp_dir().join(format!("nya-roles-test-{}", nya_proto::now_us()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let server_id = server_identity();
+        let server_fp = server_id.fingerprint();
+        let auth = Arc::new(AuthStore::open(&dir).unwrap());
+        let key = auth.key();
+        let (hub, cmd_rx) = Hub::new();
+        let (seen_tx, mut seen) = mpsc::unbounded_channel();
+        tokio::spawn(role_host(hub.clone(), cmd_rx, seen_tx));
+        let ep = nya_transport::endpoint::server_endpoint("127.0.0.1:0".parse().unwrap(), &server_id).unwrap();
+        let addr = ep.local_addr().unwrap();
+        let state = State::new(cpb::Mode::Standalone, dir.clone(), Default::default(), server_fp.to_string(), auth, hub);
+        tokio::spawn(serve_endpoint(ep, state.clone()));
+        let (a_id, b_id) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+        for id in [&a_id, &b_id] {
+            let (mut c, _) = connect(addr, id, server_fp).await;
+            assert!(pair(&mut c, id, server_fp, &key).await.ok);
+            c.conn.close(0u32.into(), b"");
+        }
+        // Until the pairing connections are gone (they attach like any session).
+        for _ in 0..100 {
+            let st = state.status(true);
+            if st.session.is_none() && st.viewers.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        while seen.try_recv().is_ok() {}
+
+        // A operates and streams display 1.
+        let (mut a, w) = connect(addr, &a_id, server_fp).await;
+        assert!(w.features.contains(&(Feature::MultiClient as u32)));
+        let Msg::SessionRole(r) = next_ctl(&mut a, |m| matches!(m, Msg::SessionRole(_))).await else { unreachable!() };
+        assert!(r.controlling);
+        write_msg(&mut a.send, &ctl(Msg::StartStream(pb::StartStream { display_id: 1, ..Default::default() }))).await.unwrap();
+        assert_eq!(next_seen(&mut seen).await, "start 1");
+
+        // B joins: it watches, gets the running stream and a fresh keyframe.
+        let (mut b, _) = connect(addr, &b_id, server_fp).await;
+        let Msg::StreamStarted(s) = next_ctl(&mut b, |m| matches!(m, Msg::StreamStarted(_))).await else { unreachable!() };
+        assert_eq!(s.display_id, 1);
+        assert_eq!(next_seen(&mut seen).await, "keyframe 0");
+        let Msg::SessionRole(r) = next_ctl(&mut b, |m| matches!(m, Msg::SessionRole(_))).await else { unreachable!() };
+        assert!(!r.controlling);
+        assert_eq!(r.viewers.len(), 1);
+        let Msg::SessionRole(r) = next_ctl(&mut a, |m| matches!(m, Msg::SessionRole(_))).await else { unreachable!() };
+        assert!(r.controlling && r.viewers.len() == 1, "A sees its viewer");
+        assert_eq!(state.status(true).viewers.len(), 1);
+
+        // B's own request is kept but does not reach the host until it takes over.
+        write_msg(&mut b.send, &ctl(Msg::StartStream(pb::StartStream { display_id: 2, ..Default::default() }))).await.unwrap();
+        write_msg(&mut b.send, &ctl(Msg::TakeControl(pb::TakeControl { kick: false }))).await.unwrap();
+        assert_eq!(next_seen(&mut seen).await, "controller");
+        assert_eq!(next_seen(&mut seen).await, "start 2");
+        let Msg::SessionRole(r) = next_ctl(&mut a, |m| matches!(m, Msg::SessionRole(_))).await else { unreachable!() };
+        assert!(!r.controlling, "A watches now");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

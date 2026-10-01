@@ -29,7 +29,8 @@ pub struct State {
     /// Bound address, or why binding failed.
     listen: Mutex<Result<String, String>>,
     host: Mutex<cpb::Host>,
-    session: Mutex<Option<(u64, cpb::Session)>>,
+    /// Connected clients by hub token, oldest first.
+    sessions: Mutex<Vec<(u64, cpb::Session)>>,
     events: Mutex<VecDeque<cpb::Event>>,
     /// Restart the host (helper) so it picks up new settings.
     pub restart_host: Notify,
@@ -49,7 +50,7 @@ impl State {
             cfg: Mutex::new(cfg),
             listen: Mutex::new(Err("尚未开始监听".into())),
             host: Mutex::new(cpb::Host::default()),
-            session: Mutex::new(None),
+            sessions: Mutex::new(Vec::new()),
             events: Mutex::new(VecDeque::new()),
             restart_host: Notify::new(),
             rebind: Notify::new(),
@@ -94,20 +95,30 @@ impl State {
     }
 
     pub fn session_started(&self, token: u64, s: cpb::Session) {
-        *self.session.lock().unwrap() = Some((token, s));
+        self.sessions.lock().unwrap().push((token, s));
     }
 
     pub fn session_ended(&self, token: u64) {
-        let mut s = self.session.lock().unwrap();
-        if s.as_ref().is_some_and(|(t, _)| *t == token) {
-            *s = None;
+        let mut s = self.sessions.lock().unwrap();
+        s.retain(|(t, _)| *t != token);
+        if s.is_empty() {
             self.host.lock().unwrap().stream.clear();
         }
     }
 
-    /// Fingerprint (hex) of the connected client, if any.
-    pub fn session_fingerprint(&self) -> Option<String> {
-        self.session.lock().unwrap().as_ref().map(|(_, s)| s.fingerprint.clone())
+    /// The client `token` operates the host now (or watches).
+    pub fn set_controlling(&self, token: u64, on: bool) {
+        if on {
+            let who = self.sessions.lock().unwrap().iter().find(|(t, _)| *t == token).map(|(_, s)| s.client_name.clone());
+            if let Some(who) = who {
+                self.event(Kind::Connected, format!("{who} 正在操作被控端"));
+            }
+        }
+    }
+
+    /// Hub tokens of the connected sessions of the client with this fingerprint (hex).
+    pub fn sessions_of(&self, fingerprint: &str) -> Vec<u64> {
+        self.sessions.lock().unwrap().iter().filter(|(_, s)| s.fingerprint.eq_ignore_ascii_case(fingerprint)).map(|(t, _)| *t).collect()
     }
 
     /// Status for the control pipe; `admin` includes the sensitive parts.
@@ -116,11 +127,19 @@ impl State {
             Ok(a) => (a.clone(), String::new()),
             Err(e) => (String::new(), e.clone()),
         };
-        let mut session = self.session.lock().unwrap().as_ref().map(|(_, s)| s.clone());
-        if !admin {
-            if let Some(s) = session.as_mut() {
+        let controller = self.hub.controller();
+        let mut session = None;
+        let mut viewers = Vec::new();
+        for (t, s) in self.sessions.lock().unwrap().iter() {
+            let mut s = s.clone();
+            if !admin {
                 s.fingerprint.clear();
                 s.remote_addr.clear();
+            }
+            if Some(*t) == controller {
+                session = Some(s);
+            } else {
+                viewers.push(s);
             }
         }
         cpb::Status {
@@ -136,6 +155,7 @@ impl State {
             recent: if admin { self.events.lock().unwrap().iter().cloned().collect() } else { Vec::new() },
             data_dir: if admin { self.dir.display().to_string() } else { String::new() },
             exe: std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default(),
+            viewers,
         }
     }
 }

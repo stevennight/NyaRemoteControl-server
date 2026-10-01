@@ -25,8 +25,12 @@ message HostCommand {
     MicAudio mic_audio = 15;
     ClipboardOffer clipboard_offer = 16;
     ClipboardPasteDone clipboard_paste_done = 17;
+    ControllerChanged controller_changed = 18;
   }
 }
+
+// Another client operates the host now: release what the previous one held.
+message ControllerChanged {}
 
 // The client copied files: put them on the host clipboard (fetched when pasted).
 message ClipboardOffer { uint64 transfer_id = 1; }
