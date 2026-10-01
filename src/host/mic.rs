@@ -2,16 +2,17 @@
 //! input side of a virtual audio cable (VB-Cable "CABLE Input"). Applications
 //! on the host then use "CABLE Output" as their microphone.
 
-use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use nya_media::audio::OpusDecoder;
+use nya_media::jitter::JitterBuffer;
 use nya_proto::frame::AudioPacket;
 use nya_win::audio::{find_render_device, AudioRenderer};
 pub use nya_server_core::components::{cable_device_name, CABLE_NAMES};
 
-const SAMPLES_PER_MS: usize = 48 * 2;
+/// Keep roughly this much queued in the cable.
+const DEVICE_TARGET_MS: usize = 30;
 
 /// The audio thread captures the default device's plain loopback (no
 /// process exclusion). If that device is the cable itself, playing the
@@ -31,8 +32,10 @@ pub fn thread(rx: Receiver<Vec<u8>>) {
     };
     let mut renderer: Option<AudioRenderer> = None;
     let mut retry_at = Instant::now();
-    let mut buf: VecDeque<f32> = VecDeque::new();
-    let mut scratch = Vec::new();
+    let mut jb = JitterBuffer::new();
+    let mut chunk = Vec::new();
+    let epoch = Instant::now();
+    let now_us = || epoch.elapsed().as_micros() as u64;
     let mut warned = false;
     let mut last_packet = Instant::now() - Duration::from_secs(10);
 
@@ -42,10 +45,9 @@ pub fn thread(rx: Receiver<Vec<u8>>) {
                 last_packet = Instant::now();
                 for d in std::iter::once(d).chain(rx.try_iter()) {
                     if let Some(p) = AudioPacket::decode_any(&d) {
-                        scratch.clear();
-                        if decoder.decode(&p.data, &mut scratch).is_ok() {
-                            buf.extend(scratch.iter().copied());
-                        }
+                        jb.push(p.seq, p.capture_ts_us, now_us(), |out| {
+                            let _ = decoder.decode(&p.data, out);
+                        });
                     }
                 }
             }
@@ -54,14 +56,19 @@ pub fn thread(rx: Receiver<Vec<u8>>) {
         }
         // Idle: release the device so other apps see a quiet cable.
         if last_packet.elapsed() > Duration::from_secs(3) {
-            renderer = None;
-            buf.clear();
+            if renderer.take().is_some() {
+                let s = jb.stats();
+                tracing::info!(
+                    "microphone idle; buffer target {:.0} ms, jitter {:.0} ms, underruns {}, dropped {} ms, concealed {} ms",
+                    s.target_ms,
+                    s.jitter_ms,
+                    s.underruns,
+                    s.dropped_ms,
+                    s.concealed_ms
+                );
+            }
+            jb.reset();
             continue;
-        }
-        // Keep latency low: at most 120 ms queued.
-        if buf.len() > 120 * SAMPLES_PER_MS {
-            let excess = buf.len() - 40 * SAMPLES_PER_MS;
-            buf.drain(..excess - excess % 2);
         }
         if renderer.is_none() && Instant::now() >= retry_at && would_echo() {
             tracing::warn!("default playback device is the virtual cable: microphone muted to avoid echo; set the speakers as default playback device");
@@ -90,7 +97,10 @@ pub fn thread(rx: Receiver<Vec<u8>>) {
                 }
             }
         }
-        let Some(r) = renderer.as_mut() else { continue };
+        let Some(r) = renderer.as_mut() else {
+            jb.reset(); // nowhere to play: don't pile up audio
+            continue;
+        };
         let queued = match r.queued_frames() {
             Ok(q) => q,
             Err(_) => {
@@ -98,19 +108,18 @@ pub fn thread(rx: Receiver<Vec<u8>>) {
                 continue;
             }
         };
-        let target = 30 * 48;
-        if queued >= target || buf.is_empty() {
+        let queued = queued as usize;
+        let target = DEVICE_TARGET_MS * 48;
+        if queued >= target {
             continue;
         }
-        let want = ((target - queued) as usize * 2).min(buf.len());
-        let chunk: Vec<f32> = buf.drain(..want - want % 2).collect();
-        match r.write(&chunk) {
-            Ok(n) => {
-                for &s in chunk[n * 2..].iter().rev() {
-                    buf.push_front(s);
-                }
-            }
-            Err(_) => renderer = None,
+        chunk.clear();
+        if jb.pull(now_us(), target - queued, queued, &mut chunk) == 0 {
+            continue;
+        }
+        // The device buffer is larger than the target, so this all fits.
+        if r.write(&chunk).is_err() {
+            renderer = None;
         }
     }
 }

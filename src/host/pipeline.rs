@@ -61,14 +61,6 @@ struct Stats {
     transfer_ms: Vec<f32>,
 }
 
-fn median(v: &mut [f32]) -> f32 {
-    if v.is_empty() {
-        return 0.0;
-    }
-    v.sort_by(|a, b| a.total_cmp(b));
-    v[v.len() / 2]
-}
-
 pub struct Pipeline {
     /// Client window this stream is for (0 = main window).
     pub slot: u32,
@@ -115,6 +107,8 @@ pub struct Pipeline {
     last_keyframe: Instant,
     cursor: CursorTracker,
     stats: Stats,
+    /// Encode times of the last 10 s, for the 99th percentile.
+    encode_window: nya_proto::stats::Rolling,
     built_at: Instant,
     warned_no_image: bool,
     diag: CaptureCounters,
@@ -338,6 +332,7 @@ impl Pipeline {
             last_keyframe: now - Duration::from_secs(1),
             cursor: CursorTracker::default(),
             stats: Stats::default(),
+            encode_window: Default::default(),
             built_at: now,
             warned_no_image: false,
             diag: CaptureCounters::default(),
@@ -686,12 +681,13 @@ impl Pipeline {
         }
         let secs = elapsed.as_secs_f32();
         let s = std::mem::take(&mut self.stats);
-        let mut enc = s.encode_ms;
+        let (encode_ms_p50, encode_ms_p99) = self.encode_window.close(s.encode_ms);
         let mut xfer = s.transfer_ms;
         sink.send(Ev::Stats(pb::ServerStats {
             capture_ms_p50: 0.0,
-            encode_ms_p50: median(&mut enc),
-            transfer_ms_p50: median(&mut xfer),
+            encode_ms_p50,
+            encode_ms_p99,
+            transfer_ms_p50: nya_proto::stats::percentile(&mut xfer, 0.5),
             fps: (s.frames as f32 / secs).round() as u32,
             bitrate_kbps: (s.bytes as f32 * 8.0 / 1000.0 / secs) as u32,
             target_kbps: self.encoder.config().bitrate_kbps,
