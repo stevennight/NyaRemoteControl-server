@@ -1,5 +1,5 @@
 fn main() {
-    let common_proto = "../common/crates/nya-proto/proto";
+    let common_proto = "../../common/crates/nya-proto/proto";
     println!("cargo:rerun-if-changed=proto");
     println!("cargo:rerun-if-changed={common_proto}");
     let fds = protox::compile(["ipc.proto"], ["proto", common_proto]).expect("compile ipc.proto");
@@ -11,7 +11,7 @@ fn main() {
     // Gamepads: ViGEmClient (MIT) is compiled in when its source is present
     // (common/scripts/fetch-vigem.ps1 puts it in ../third_party/ViGEmClient).
     println!("cargo:rustc-check-cfg=cfg(vigem)");
-    let vigem = std::path::Path::new("../third_party/ViGEmClient");
+    let vigem = std::path::Path::new("../../third_party/ViGEmClient");
     println!("cargo:rerun-if-changed={}", vigem.display());
     if vigem.join("src/ViGEmClient.cpp").exists() {
         cc::Build::new()
@@ -30,14 +30,14 @@ fn main() {
 
     // Icon and version information shown in the file's properties.
     let mut res = winresource::WindowsResource::new();
-    res.set_icon("../common/assets/server.ico")
+    res.set_icon("../../common/assets/server.ico")
         .set("ProductName", "NyaRemoteControl Server")
         .set("FileDescription", "NyaRemoteControl Server (service and capture)")
         .set("CompanyName", "NyaRemoteControl")
         .set("LegalCopyright", "MIT License")
         .set("OriginalFilename", "nya-server-svc.exe");
     res.compile().expect("Windows resources (needs rc.exe from the Windows SDK)");
-    println!("cargo:rerun-if-changed=../common/assets/server.ico");
+    println!("cargo:rerun-if-changed=../../common/assets/server.ico");
     git_hash();
 }
 

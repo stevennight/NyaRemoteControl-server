@@ -1,66 +1,21 @@
 [workspace]
-# The host (this package, nya-server-svc.exe), what it shares with the
-# management program (core), and the management program itself (manager,
-# nya-server.exe). manager must never depend on this package: it would link
-# the capture / encoding stack and FFmpeg.
-members = [".", "core", "manager"]
-default-members = [".", "core", "manager"]
+# NyaRemoteControl for Windows: one product, several processes.
+#   app   NyaRemoteControl.exe   the program users open: remote control of other
+#                                computers and management of this one
+#   host  nya-server-svc.exe     the remote-control service (service / helper /
+#                                standalone / diag); the only one with capture
+#                                and encoding
+#   cli   nya-server.exe         command line for this computer's host, and the
+#                                updater the service starts (copied out as
+#                                nya-updater.exe)
+#   core  nya-server-core        what host, cli and app share about the host
+#                                (settings, pairing data, control pipe, install)
+# cli and core must never depend on host or app: they would link FFmpeg, and
+# the updater has to run on its own without the FFmpeg DLLs (MSVC keeps the
+# imports of every object file pulled in; FFmpeg's GNU-style import libraries
+# cannot be delay-loaded).
+members = ["app", "host", "core", "cli"]
 resolver = "2"
-
-[package]
-name = "nya-server"
-description = "NyaRemoteControl host: Windows service, per-session helper and standalone mode (nya-server-svc.exe)"
-version = "0.6.2"
-edition = "2021"
-license = "MIT"
-publish = false
-
-[dependencies]
-nya-server-core = { path = "core" }
-# Shared crates from the common repository. For CI / releases switch these to
-# `git = "<common repo url>", tag = "vX.Y.Z"` and keep a `[patch]` for local work.
-nya-proto = { path = "../common/crates/nya-proto" }
-nya-transport = { path = "../common/crates/nya-transport" }
-nya-media = { path = "../common/crates/nya-media" }
-nya-win = { path = "../common/crates/nya-win" }
-
-anyhow = "1"
-tracing = "0.1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process"] }
-prost = "0.13"
-clap = { version = "4", features = ["derive"] }
-crossbeam-channel = "0.5"
-windows-service = "0.7"
-rand = "0.8"
-
-[dependencies.windows]
-version = "0.58"
-features = [
-    "Win32_Foundation",
-    "Win32_Devices_Display",
-    "Win32_Security",
-    "Win32_Security_Authorization",
-    "Win32_System_RemoteDesktop",
-    "Win32_System_Threading",
-    "Win32_System_JobObjects",
-    "Win32_System_LibraryLoader",
-    "Win32_System_SystemInformation",
-    "Win32_System_Registry",
-    "Win32_Graphics_Direct3D11",
-    "Win32_Graphics_Dxgi",
-    "Win32_Graphics_Dxgi_Common",
-    "Win32_UI_Shell",
-    "Win32_UI_WindowsAndMessaging",
-    "Win32_System_Console",
-    "Win32_System_Pipes",
-    "Win32_System_StationsAndDesktops",
-]
-
-[build-dependencies]
-cc = "1"
-prost-build = "0.13"
-protox = "0.7"
-winresource = "0.1.31"
 
 [profile.release]
 debug = "line-tables-only"
