@@ -1059,8 +1059,8 @@ impl App {
                     return;
                 }
                 // Keys the hook forwarded were swallowed and never reach the window, so
-                // anything arriving here still has to go to the host (cloud desktops
-                // deliver no keys to low-level hooks at all).
+                // anything arriving here still has to go to the host (the hook is
+                // not running, or missed the key).
                 if input::grabbed() && self.focused {
                     use winit::platform::scancode::PhysicalKeyExtScancode;
                     if let (Some(sc), Some(s)) = (event.physical_key.to_scancode(), &self.session) {

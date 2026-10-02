@@ -1,11 +1,16 @@
 //! Keyboard capture.
 //!
 //! * A low-level hook forwards keys (including Win / Alt+Tab combinations)
-//!   while the window is focused and the keyboard is grabbed.
-//! * Some environments (cloud desktops) never deliver keys to low-level hooks;
-//!   there keys reach the window and are forwarded from window events. To keep
-//!   shell hotkeys such as Win+D / Win+E from acting locally, raw keyboard input
-//!   is registered with `RIDEV_NOHOTKEYS` while grabbed.
+//!   while the window is focused and the keyboard is grabbed. It runs on a
+//!   thread of its own that does nothing but pump messages: Windows calls the
+//!   hook on the installing thread and silently removes a hook that does not
+//!   answer within LowLevelHooksTimeout — which the UI thread (decoding,
+//!   presenting, connecting) missed, notably in cloud desktops, after which
+//!   Alt+Tab acted locally.
+//! * Should keys still reach the window (the hook gone anyway), they are
+//!   forwarded from window events. To keep shell hotkeys such as Win+D / Win+E
+//!   from acting locally, raw keyboard input is registered with
+//!   `RIDEV_NOHOTKEYS` while grabbed.
 //!
 //! Hotkeys are Ctrl+Alt+Shift+<key>.
 
@@ -16,10 +21,11 @@ use nya_proto::pb::{self, input_msg::Ev};
 use tokio::sync::mpsc::UnboundedSender;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL};
 use windows::Win32::UI::Input::KeyboardAndMouse::{MapVirtualKeyW, MAPVK_VK_TO_VSC_EX};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetForegroundWindow, SetWindowsHookExW, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_UP,
-    WH_KEYBOARD_LL,
+    CallNextHookEx, GetForegroundWindow, GetMessageW, SetWindowsHookExW, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_EXTENDED,
+    LLKHF_UP, MSG, WH_KEYBOARD_LL,
 };
 
 use crate::events::{Hotkey, NetCmd, Ui, UiEvent};
@@ -85,16 +91,25 @@ fn state() -> &'static HookState {
     })
 }
 
-/// Install the hook once per process.
+/// Install the hook once per process, on its own thread.
 pub fn install(hwnd: HWND, ui: Ui) {
     let s = state();
     s.hwnd.store(hwnd.0 as isize, Ordering::SeqCst);
     *s.ui.lock().unwrap() = Some(ui);
-    unsafe {
+    let spawned = std::thread::Builder::new().name("keyboard hook".into()).spawn(|| unsafe {
+        // Keys wait for the hook: answer them before anything else.
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
         let module = GetModuleHandleW(None).unwrap_or_default();
         if let Err(e) = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook), module, 0) {
             tracing::error!("keyboard hook: {e}");
+            return;
         }
+        // The hook is called from this loop; it lives as long as the process.
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {}
+    });
+    if let Err(e) = spawned {
+        tracing::error!("keyboard hook thread: {e}");
     }
 }
 
