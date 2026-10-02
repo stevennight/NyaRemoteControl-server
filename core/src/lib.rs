@@ -1,10 +1,11 @@
-//! What the host service (`nya-server-svc.exe`, the `nya-server` crate) and
-//! the management program (`nya-server.exe`, `manager/`) share: settings,
+//! What the host service (`nya-server-svc.exe`, `host/`), the program users
+//! open (`NyaRemoteControl.exe`, `app/`, its "本机" section) and the command
+//! line (`nya-server.exe`, `cli/`) share about the host: settings,
 //! pairing data, paths, logging, installation, and the control pipe protocol
 //! with its client.
 //!
 //! This crate must not depend on the capture / encoding stack (nya-media,
-//! FFmpeg): the management program links it, and must be able to run — and
+//! FFmpeg): the command line links it, and must be able to run — and
 //! keep running — while the host's binaries are replaced.
 
 pub mod auth;

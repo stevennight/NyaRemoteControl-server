@@ -1,10 +1,14 @@
 [package]
-name = "nya-client"
-description = "NyaRemoteControl Windows client"
+name = "nya-app"
+description = "NyaRemoteControl for Windows: the program users open (remote control of other computers, management of this one)"
 version = "0.6.2"
 edition = "2021"
 license = "MIT"
 publish = false
+
+[[bin]]
+name = "NyaRemoteControl"
+path = "src/main.rs"
 
 [dependencies]
 # Shared crates from the common repository (pinned by COMMON_REF for releases).
@@ -14,6 +18,9 @@ nya-media = { path = "../../common/crates/nya-media" }
 nya-win = { path = "../../common/crates/nya-win" }
 nya-ui = { path = "../../common/crates/nya-ui" }
 nya-webui = { path = "../../common/crates/nya-webui" }
+# This computer as a host: settings, pairing data, control pipe, service install.
+# Never the host itself (nya-server): it would load the capture stack here.
+nya-server-core = { path = "../core" }
 
 anyhow = "1"
 tracing = "0.1"
@@ -27,6 +34,7 @@ crossbeam-channel = "0.5"
 winit = "0.30"
 rfd = "0.15"
 serde_json = "1"
+windows-service = "0.7"
 
 [dependencies.windows]
 version = "0.58"
@@ -43,6 +51,7 @@ features = [
     "Win32_UI_Input_XboxController",
     "Win32_System_LibraryLoader",
     "Win32_System_Console",
+    "Win32_UI_Shell",
 ]
 
 

@@ -158,7 +158,7 @@ impl Default for Defaults {
     }
 }
 
-/// Command-line overrides for one connection (`nya-client connect … --mode game`).
+/// Command-line overrides for one connection (`NyaRemoteControl connect … --mode game`).
 #[derive(Debug, Clone, Default)]
 pub struct Overrides {
     pub mode: Option<String>,

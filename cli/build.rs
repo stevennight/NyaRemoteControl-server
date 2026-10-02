@@ -4,8 +4,8 @@
 fn main() {
     let mut res = winresource::WindowsResource::new();
     res.set_icon("../../common/assets/server.ico")
-        .set("ProductName", "NyaRemoteControl Server")
-        .set("FileDescription", "NyaRemoteControl Server Manager")
+        .set("ProductName", "NyaRemoteControl")
+        .set("FileDescription", "NyaRemoteControl host command line and updater")
         .set("CompanyName", "NyaRemoteControl")
         .set("LegalCopyright", "MIT License")
         .set("OriginalFilename", "nya-server.exe");

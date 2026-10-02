@@ -74,7 +74,7 @@ pub async fn check(state: &Arc<State>) -> cpb::UpdateStatus {
         return u.status();
     }
     u.set(|s| s.state = St::Checking as i32);
-    let r = tokio::task::spawn_blocking(|| gh::latest(gh::SERVER_REPO)).await.map_err(anyhow::Error::from).and_then(|r| r);
+    let r = tokio::task::spawn_blocking(|| gh::latest(gh::WINDOWS_REPO)).await.map_err(anyhow::Error::from).and_then(|r| r);
     match r {
         Ok(rel) => {
             let newer = gh::is_newer(&rel.version, env!("CARGO_PKG_VERSION"));

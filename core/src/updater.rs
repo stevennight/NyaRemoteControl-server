@@ -32,7 +32,7 @@ use crate::paths;
 use crate::SERVICE_NAME;
 
 pub const UPDATER_EXE: &str = "nya-updater.exe";
-/// The management program, which is also the updater.
+/// The command line, which is also the updater (it has no FFmpeg to keep loaded).
 pub const MANAGER_EXE: &str = "nya-server.exe";
 
 /// `%ProgramData%\NyaRemoteControl\update`: downloads, the updater, the backup and the result.
@@ -68,7 +68,7 @@ impl Outcome {
 /// Look for a newer release from this program (no service to ask).
 pub fn check_here() -> Result<(crate::control_pb::UpdateStatus, Option<nya_win::update::Release>)> {
     use crate::control_pb::update_status::State as St;
-    let rel = nya_win::update::latest(nya_win::update::SERVER_REPO)?;
+    let rel = nya_win::update::latest(nya_win::update::WINDOWS_REPO)?;
     let current = env!("CARGO_PKG_VERSION");
     let newer = nya_win::update::is_newer(&rel.version, current);
     let s = crate::control_pb::UpdateStatus {
@@ -98,7 +98,7 @@ pub fn installed_by_setup(install_dir: &Path) -> bool {
     install_dir.join("uninstall.exe").exists()
 }
 
-/// Copy the management program out of the install directory and start it
+/// Copy the command line out of the install directory and start it
 /// as the updater. Returns once it runs; it continues on its own.
 pub fn launch(installer: &Path, install_dir: &Path, from: &str, to: &str) -> Result<()> {
     let dir = update_dir();
@@ -240,7 +240,7 @@ fn no_window(cmd: &mut Command) -> &mut Command {
 
 /// Silent install into the current directory; 15 minutes at most.
 fn run_installer(installer: &Path, install_dir: &Path, log: &mut Log) -> Result<i32> {
-    // NSIS: /S silent, /UPDATE (close the management program instead of
+    // NSIS: /S silent, /UPDATE (close the running program instead of
     // asking), /D=<dir> last and unquoted.
     let mut child = no_window(&mut Command::new(installer))
         .arg("/S")

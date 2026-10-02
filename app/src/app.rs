@@ -27,6 +27,7 @@ use crate::ui::{self, Action};
 
 mod conn;
 mod extra;
+pub mod host;
 mod update;
 mod launcher;
 use launcher::{Kind, Phase};
@@ -51,6 +52,10 @@ pub struct App {
     identity: Identity,
     auto_connect: Option<(String, Option<String>, crate::config::Overrides)>,
     updates: update::Updates,
+    /// This computer as a host (the page's "本机" section).
+    host: host::HostPanel,
+    /// Page the launcher opens on (`--page`), handed out once.
+    start_page: Option<String>,
     /// The current connection (see `conn`) and the parked others.
     conn_id: u64,
     next_conn: u64,
@@ -187,8 +192,11 @@ impl App {
         cfg: ClientConfig,
         identity: Identity,
         auto_connect: Option<(String, Option<String>, crate::config::Overrides)>,
+        start_page: Option<String>,
     ) -> Self {
         Self {
+            host: host::HostPanel::new(ui_tx.clone()),
+            start_page,
             rt,
             ui_tx,
             data_dir,
@@ -375,7 +383,7 @@ impl App {
     pub(super) fn client_name(&self) -> String {
         let n = self.cfg.client_name.trim();
         if n.is_empty() {
-            std::env::var("COMPUTERNAME").unwrap_or_else(|_| "nya-client".into())
+            std::env::var("COMPUTERNAME").unwrap_or_else(|_| "NyaRemoteControl".into())
         } else {
             n.to_owned()
         }
@@ -1250,6 +1258,7 @@ impl ApplicationHandler<UiEvent> for App {
             UiEvent::UpdateChecked(r) => self.on_update_checked(r),
             UiEvent::UpdateProgress(p) => self.on_update_progress(p),
             UiEvent::UpdateDownloaded(r) => self.on_update_downloaded(r),
+            UiEvent::Host(ev) => self.host.event(self.web.as_ref(), ev),
             UiEvent::WebReply(id, r) => {
                 if let Some(w) = &self.web {
                     w.reply(id, r);
@@ -1427,6 +1436,11 @@ impl ApplicationHandler<UiEvent> for App {
             }
         }
         self.keep_one_idle(el);
+        // "本机" follows the service while the launcher is on screen (the
+        // control pipe is asked on this thread, so not behind a session).
+        if self.launcher.as_ref().is_some_and(|l| l.is_visible() != Some(false) && l.is_minimized() != Some(true)) {
+            self.host.tick(self.web.as_ref());
+        }
         el.set_control_flow(ControlFlow::WaitUntil(wake));
     }
 }

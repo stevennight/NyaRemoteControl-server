@@ -28,7 +28,7 @@ pub fn install_usbipd(status: &mut dyn FnMut(String)) -> Result<()> {
             _ => format!("下载中 {:.1} MB", done as f64 / 1e6),
         })
     })
-    .with_context(|| format!("可以手动下载 {} 放到 nya-client.exe 旁边的 drivers 文件夹后重试", USBIPD.file))?;
+    .with_context(|| format!("可以手动下载 {} 放到 NyaRemoteControl.exe 旁边的 drivers 文件夹后重试", USBIPD.file))?;
     status("安装中（请在弹出的权限确认里点“是”）…".into());
     let msiexec = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap_or_else(|| "C:\\Windows".into()).join("System32\\msiexec.exe");
     let code = nya_win::package::run_elevated(&msiexec, &format!("/i \"{}\" /qn /norestart", msi.display()))?;

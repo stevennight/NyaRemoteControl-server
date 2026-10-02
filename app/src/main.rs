@@ -1,7 +1,9 @@
-//! NyaRemoteControl Windows client.
+//! NyaRemoteControl for Windows: the program users open.
 //!
-//! Double-click: graphical launcher. `nya-client connect <host>` connects right
-//! away; `diag` / `hosts` print to the terminal they were started from.
+//! Double-click: the main window — remote control of other computers, and
+//! this computer as a host ("本机", managing the service nya-server-svc.exe).
+//! `NyaRemoteControl connect <host>` connects right away; `diag` / `hosts`
+//! print to the terminal they were started from.
 
 #![windows_subsystem = "windows"]
 
@@ -44,8 +46,11 @@ pub fn version() -> String {
 }
 
 #[derive(Parser)]
-#[command(name = "nya-client", version = concat!(env!("CARGO_PKG_VERSION"), " ", env!("NYA_GIT_HASH")), about = "NyaRemoteControl 客户端")]
+#[command(name = "NyaRemoteControl", version = concat!(env!("CARGO_PKG_VERSION"), " ", env!("NYA_GIT_HASH")), about = "NyaRemoteControl 远程桌面")]
 struct Cli {
+    /// Page the window opens on (host = 本机).
+    #[arg(long, global = true, hide = true)]
+    page: Option<String>,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -175,7 +180,7 @@ fn real_main() -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     let event_loop = EventLoop::<UiEvent>::with_user_event().build().map_err(|e| anyhow!("{e}"))?;
     let ui = Ui::new(event_loop.create_proxy());
-    let mut app = app::App::new(rt.handle().clone(), ui, dir, cfg, identity, auto_connect);
+    let mut app = app::App::new(rt.handle().clone(), ui, dir, cfg, identity, auto_connect, cli.page);
     event_loop.run_app(&mut app).map_err(|e| anyhow!("{e}"))?;
     // Let the Bye go out.
     rt.shutdown_timeout(std::time::Duration::from_millis(300));

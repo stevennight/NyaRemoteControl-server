@@ -1,6 +1,6 @@
 [package]
-name = "nya-server-manager"
-description = "NyaRemoteControl host management: GUI and command line (nya-server.exe)"
+name = "nya-server-cli"
+description = "NyaRemoteControl host: command line and updater (nya-server.exe)"
 version = "0.6.2"
 edition = "2021"
 license = "MIT"
@@ -12,26 +12,19 @@ name = "nya-server"
 path = "src/main.rs"
 
 [dependencies]
-# Never depend on the `nya-server` package (host): see the workspace manifest.
+# Never depend on the host (nya-server) or the app: see the workspace manifest.
 nya-server-core = { path = "../core" }
-nya-webui = { path = "../../common/crates/nya-webui" }
 nya-win = { path = "../../common/crates/nya-win" }
-winit = "0.30"
 
 anyhow = "1"
-tracing = "0.1"
 clap = { version = "4", features = ["derive"] }
 toml = "0.8"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-windows-service = "0.7"
 
 [dependencies.windows]
 version = "0.58"
 features = [
     "Win32_Foundation",
     "Win32_System_Time",
-    "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ]
 

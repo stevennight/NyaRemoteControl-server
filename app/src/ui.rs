@@ -205,7 +205,7 @@ fn displays_menu(ui: &mut egui::Ui, s: &Session, actions: &mut Vec<Action>) {
     } else if s.info.is_some() {
         ui.label(
             RichText::new(if s.vd_supported {
-                "被控端没有安装虚拟显示器（在被控端管理程序“可选组件”中安装）"
+                "被控端没有安装虚拟显示器（在被控端的“本机 → 可选组件”中安装）"
             } else {
                 "被控端版本太旧，不支持虚拟显示器"
             })
@@ -313,7 +313,7 @@ fn mic_toggle(ui: &mut egui::Ui, s: &Session, actions: &mut Vec<Action>) {
         }
         None => {
             ui.add_enabled(false, egui::Button::new("麦克风"))
-                .on_disabled_hover_text("被控端没有安装虚拟声卡（可在被控端管理程序“可选组件”中安装）");
+                .on_disabled_hover_text("被控端没有安装虚拟声卡（可在被控端的“本机 → 可选组件”中安装）");
         }
     }
 }

@@ -12,7 +12,7 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# The workspace mirrors the local layout: server/, common/ (latest main; a
+# The workspace mirrors the local layout: windows/, common/ (latest main; a
 # release pins it with COMMON_REF instead) and third_party/ side by side.
 jobs:
   build-test:
@@ -24,10 +24,10 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - name: Check out server
+      - name: Check out windows
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          path: server
+          path: windows
           persist-credentials: false
 
       - name: Check out common
@@ -62,27 +62,28 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          workspaces: server -> ../target
+          workspaces: windows -> ../target
 
       - name: Check version
-        working-directory: server
+        working-directory: windows
         run: |
           . ../common/scripts/release-lib.ps1
-          Test-NyaVersion (Get-Location).Path @('Cargo.toml', 'core/Cargo.toml', 'manager/Cargo.toml')
+          . ./scripts/versions.ps1
+          Test-NyaVersion (Get-Location).Path $NyaTomls
 
       - name: Test
-        working-directory: server
+        working-directory: windows
         # Not --locked: common main may be ahead of this Cargo.lock (releases build with --locked).
         run: cargo test --release
 
       - name: Package (no installer)
-        working-directory: server
+        working-directory: windows
         run: ./scripts/build-release.ps1 -SkipInstaller
 
       - name: Upload package
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: nya-server-${{ github.sha }}
-          path: server/release/*.zip
+          name: NyaRemoteControl-${{ github.sha }}
+          path: windows/release/*.zip
           if-no-files-found: error
           retention-days: 14

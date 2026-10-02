@@ -23,16 +23,16 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - name: Check out server
+      - name: Check out windows
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          path: server
+          path: windows
           persist-credentials: false
 
       - name: Read pinned common commit
         id: common
         run: |
-          $ref = if (Test-Path server/COMMON_REF) { (Get-Content server/COMMON_REF -Raw).Trim() } else { 'main' }
+          $ref = if (Test-Path windows/COMMON_REF) { (Get-Content windows/COMMON_REF -Raw).Trim() } else { 'main' }
           Write-Host "common: $ref"
           "ref=$ref" >> $env:GITHUB_OUTPUT
 
@@ -61,21 +61,21 @@ jobs:
           }
 
       - name: Test
-        working-directory: server
+        working-directory: windows
         run: |
           ../common/scripts/fetch-ffmpeg.ps1
           ../common/scripts/fetch-vigem.ps1
           cargo test --release --locked
 
       - name: Build installer and zip
-        working-directory: server
+        working-directory: windows
         run: ./scripts/build-release.ps1 -Tag "${env:GITHUB_REF_NAME}"
 
       - name: Upload release files
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release
-          path: server/release/*
+          path: windows/release/*
           if-no-files-found: error
 
   publish:
@@ -94,7 +94,7 @@ jobs:
       - name: Publish
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          name: NyaRemoteControl 被控端 ${{ github.ref_name }}
+          name: NyaRemoteControl ${{ github.ref_name }}
           prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
           files: dist/*

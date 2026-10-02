@@ -1,8 +1,12 @@
-//! Client updates: look for a newer release on GitHub (at start and on
-//! request), download and verify its installer, start it silently and
-//! elevated (`/S /UPDATE`), and quit; the installer starts the new client
-//! when it is done. A client not installed by the installer (portable zip)
-//! gets the release page instead.
+//! Updates of the whole program (app, service and command line are one
+//! release): look for a newer release on GitHub (at start and on request),
+//! download and verify its installer, start it silently and elevated
+//! (`/S /UPDATE`), and quit; the installer stops and restarts the service if
+//! remote control is on, and starts the new program when it is done. A copy
+//! not installed by the installer (portable zip) gets the release page instead.
+//!
+//! The service has its own updater with a rollback (`nya-server update
+//! --install`, nya_server_core::updater) for hosts nobody sits at.
 
 use std::path::PathBuf;
 
@@ -59,7 +63,7 @@ impl App {
         self.updates.info.state = "checking";
         self.push_state();
         let ui = self.ui_tx.clone();
-        std::thread::spawn(move || ui.send(UiEvent::UpdateChecked(gh::latest(gh::CLIENT_REPO).map_err(|e| format!("{e:#}")))));
+        std::thread::spawn(move || ui.send(UiEvent::UpdateChecked(gh::latest(gh::WINDOWS_REPO).map_err(|e| format!("{e:#}")))));
     }
 
     pub(super) fn on_update_checked(&mut self, r: Result<Release, String>) {
@@ -93,7 +97,7 @@ impl App {
         let Some(rel) = self.updates.release.clone() else { return Err("没有可安装的新版本".into()) };
         if !installed() {
             let _ = std::process::Command::new("explorer").arg(&rel.page).spawn();
-            return Err("这份客户端不是用安装包安装的（便携版），已打开发布页，请下载新版本".into());
+            return Err("这份程序不是用安装包安装的（便携版），已打开发布页，请下载新版本".into());
         }
         self.updates.info.state = "downloading";
         self.updates.info.progress = 0;
@@ -101,7 +105,7 @@ impl App {
         self.push_state();
         let ui = self.ui_tx.clone();
         std::thread::spawn(move || {
-            let dir = std::env::temp_dir().join("nya-client-update");
+            let dir = std::env::temp_dir().join("nya-update");
             let size = rel.installer.size.max(1);
             let mut last = 0;
             let r = gh::download_installer(&rel, &dir, &mut |done, total| {

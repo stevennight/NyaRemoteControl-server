@@ -1,4 +1,4 @@
-//! `nya-client diag`: GPUs, hardware decoders, audio output.
+//! `NyaRemoteControl diag`: GPUs, hardware decoders, audio output.
 
 use nya_win::d3d::D3dDevice;
 use nya_win::topology::Topology;
@@ -10,7 +10,7 @@ macro_rules! out {
     }};
 }
 
-/// `nya-client diag` in a terminal.
+/// `NyaRemoteControl diag` in a terminal.
 pub fn run() -> anyhow::Result<()> {
     print!("{}", report()?);
     Ok(())

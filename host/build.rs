@@ -31,8 +31,8 @@ fn main() {
     // Icon and version information shown in the file's properties.
     let mut res = winresource::WindowsResource::new();
     res.set_icon("../../common/assets/server.ico")
-        .set("ProductName", "NyaRemoteControl Server")
-        .set("FileDescription", "NyaRemoteControl Server (service and capture)")
+        .set("ProductName", "NyaRemoteControl")
+        .set("FileDescription", "NyaRemoteControl service (remote control of this computer)")
         .set("CompanyName", "NyaRemoteControl")
         .set("LegalCopyright", "MIT License")
         .set("OriginalFilename", "nya-server-svc.exe");

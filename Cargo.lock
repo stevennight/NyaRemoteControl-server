@@ -2210,7 +2210,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "nya-client"
+name = "nya-app"
 version = "0.6.2"
 dependencies = [
  "anyhow",
@@ -2218,6 +2218,7 @@ dependencies = [
  "crossbeam-channel",
  "nya-media",
  "nya-proto",
+ "nya-server-core",
  "nya-transport",
  "nya-ui",
  "nya-webui",
@@ -2231,6 +2232,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "windows 0.58.0",
+ "windows-service",
  "winit",
  "winresource",
 ]
@@ -2290,6 +2292,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nya-server-cli"
+version = "0.6.2"
+dependencies = [
+ "anyhow",
+ "clap",
+ "nya-server-core",
+ "nya-win",
+ "toml 0.8.2",
+ "windows 0.58.0",
+ "winresource",
+]
+
+[[package]]
 name = "nya-server-core"
 version = "0.6.2"
 dependencies = [
@@ -2308,25 +2323,6 @@ dependencies = [
  "tracing-subscriber",
  "windows 0.58.0",
  "windows-service",
-]
-
-[[package]]
-name = "nya-server-manager"
-version = "0.6.2"
-dependencies = [
- "anyhow",
- "clap",
- "nya-server-core",
- "nya-webui",
- "nya-win",
- "serde",
- "serde_json",
- "toml 0.8.2",
- "tracing",
- "windows 0.58.0",
- "windows-service",
- "winit",
- "winresource",
 ]
 
 [[package]]

@@ -4,11 +4,11 @@
 fn main() {
     let mut res = winresource::WindowsResource::new();
     res.set_icon("../../common/assets/client.ico")
-        .set("ProductName", "NyaRemoteControl Client")
-        .set("FileDescription", "NyaRemoteControl Client")
+        .set("ProductName", "NyaRemoteControl")
+        .set("FileDescription", "NyaRemoteControl 远程桌面")
         .set("CompanyName", "NyaRemoteControl")
         .set("LegalCopyright", "MIT License")
-        .set("OriginalFilename", "nya-client.exe");
+        .set("OriginalFilename", "NyaRemoteControl.exe");
     res.compile().expect("Windows resources (needs rc.exe from the Windows SDK)");
     println!("cargo:rerun-if-changed=../../common/assets/client.ico");
     git_hash();

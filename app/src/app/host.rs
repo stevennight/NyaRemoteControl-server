@@ -1,13 +1,19 @@
-//! Host management GUI (double-click nya-server.exe): a web page
-//! (common/web/src/manager) in a WebView2 window. This side keeps the model —
-//! service state, the control pipe (or the files while the service is
-//! stopped), background jobs — and answers the page's calls.
+//! "本机": this computer as a remote-control host, a section of the main
+//! page (common/web/src/host). The page calls `host.<cmd>`; this side keeps
+//! the model — service state, the control pipe (or the files while the
+//! service is stopped), background jobs — and pushes `host.snapshot`
+//! (whenever something changed), `host.job` (a background job finished)
+//! and `host.install` (component install progress).
 //!
-//! Page → Rust calls: snapshot, svc, reset_code, set_config, remove_client,
+//! Commands: snapshot, enable, svc, reset_code, set_config, remove_client,
 //! disconnect, diag, components, install, log, open_logs, open_url,
-//! open_sound_settings, relaunch_elevated.
-//! Rust → page events: `snapshot` (whenever something changed), `job`
-//! (a background job started / finished), `install` (component install progress).
+//! open_sound_settings; relaunch_elevated is the app's (launcher.rs).
+//!
+//! Without admin rights only the status is available (the service tells
+//! non-administrators nothing else: a paired client controls the computer
+//! with the service's rights). `enable` then installs the service through an
+//! elevated `nya-server.exe install`; everything else needs the app reopened
+//! as administrator.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -19,17 +25,18 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use windows_service::service::{ServiceAccess, ServiceState};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
-use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
-use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::window::{Window, WindowId};
 
 use nya_server_core::backend::Backend;
 use nya_server_core::config::{ServerConfig, ENCODERS};
 use nya_server_core::control_pb::{self as cpb, event::Kind};
 use nya_server_core::SERVICE_NAME;
 use nya_server_core::{components, install, paths, win as winutil};
+
+use crate::events::{Ui, UiEvent};
+
+const TOOL: &str = "NyaRemoteControl";
+/// The command-line program next to us; it installs the service when we are not elevated.
+const CLI_EXE: &str = "nya-server.exe";
 
 fn service_exists(name: &str) -> bool {
     ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
@@ -47,7 +54,7 @@ fn service_running(name: &str) -> bool {
 
 /// An optional third-party component: installed only when the user asks.
 #[derive(Serialize)]
-struct Component {
+pub struct Component {
     id: &'static str,
     /// What it is for, as users call it.
     name: &'static str,
@@ -228,18 +235,6 @@ fn run_diag(out: &Path) -> Result<String> {
     Ok(std::fs::read_to_string(out)?)
 }
 
-fn relaunch_elevated() -> Result<()> {
-    use windows::core::{w, HSTRING};
-    use windows::Win32::UI::Shell::ShellExecuteW;
-    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-    let exe = std::env::current_exe()?;
-    let r = unsafe { ShellExecuteW(None, w!("runas"), &HSTRING::from(exe.as_os_str()), None, None, SW_SHOWNORMAL) };
-    if r.0 as isize <= 32 {
-        return Err(anyhow!("未获得管理员权限"));
-    }
-    Ok(())
-}
-
 fn open(target: impl AsRef<std::ffi::OsStr>) {
     let _ = std::process::Command::new("explorer").arg(target).spawn();
 }
@@ -254,24 +249,6 @@ fn event_kind(k: i32) -> &'static str {
         Kind::Service => "service",
         Kind::Other => "other",
     }
-}
-
-fn update_json(u: &cpb::UpdateStatus) -> Value {
-    use cpb::update_status::State as St;
-    let state = match St::try_from(u.state).unwrap_or(St::Idle) {
-        St::Idle => "idle",
-        St::Checking => "checking",
-        St::UpToDate => "up_to_date",
-        St::Available => "available",
-        St::Downloading => "downloading",
-        St::Installing => "installing",
-        St::Failed => "failed",
-        St::Unavailable => "unavailable",
-    };
-    json!({
-        "state": state, "current": u.current, "latest": u.latest, "notes": u.notes, "page": u.page,
-        "progress": u.progress, "message": u.message, "checked_unix": u.checked_unix,
-    })
 }
 
 fn status_json(s: &cpb::Status) -> Value {
@@ -292,9 +269,9 @@ fn status_json(s: &cpb::Status) -> Value {
     })
 }
 
-/// Events delivered to the winit loop.
-enum UserEvent {
-    Call(Call),
+
+/// Background work done, delivered through the app's event loop.
+pub enum HostEvent {
     /// (call id or 0, label, result) of a background job.
     JobDone(u64, &'static str, Result<String, String>),
     Components(u64, Vec<Component>),
@@ -319,10 +296,6 @@ struct Model {
     load_error: Option<String>,
     busy: Option<&'static str>,
     install_job: Option<Arc<Mutex<InstallJob>>>,
-    /// Update status found by this program (no service that checks itself).
-    local_update: Arc<Mutex<Option<cpb::UpdateStatus>>>,
-    /// Last snapshot sent to the page (to push only changes).
-    sent: String,
 }
 
 impl Model {
@@ -342,8 +315,6 @@ impl Model {
             load_error: None,
             busy: None,
             install_job: None,
-            local_update: Default::default(),
-            sent: String::new(),
         };
         m.svc = service_state();
         m.reload();
@@ -354,7 +325,7 @@ impl Model {
     /// the connection so the next call reconnects (the service may have restarted).
     fn with_backend<T>(&mut self, f: impl FnOnce(&mut Backend) -> Result<T>) -> Result<T> {
         if self.backend.is_none() {
-            self.backend = Some(Backend::service("nya-server gui")?);
+            self.backend = Some(Backend::service(TOOL)?);
         }
         let r = f(self.backend.as_mut().unwrap());
         if r.is_err() {
@@ -368,12 +339,13 @@ impl Model {
     }
 
     /// Re-read pairing data, settings and clients from the service (or its
-    /// files while it is stopped).
+    /// files while it is stopped). Without admin rights: the status only.
     fn reload(&mut self) {
+        self.backend = None;
         if !self.elevated {
+            self.refresh_status();
             return;
         }
-        self.backend = None;
         self.points_here = install::service_points_here();
         self.load_error = None;
         match self.with_backend(|b| b.pairing()) {
@@ -390,8 +362,13 @@ impl Model {
         self.refresh_status();
     }
 
+    /// The service's status; non-administrators get it from the running service only.
     fn refresh_status(&mut self) {
-        self.status = self.with_backend(|b| b.status()).ok().flatten();
+        self.status = if self.elevated || self.svc == SvcState::Running {
+            self.with_backend(|b| b.status()).ok().flatten()
+        } else {
+            None
+        };
     }
 
     /// Once a second: follow the service (started / stopped / reinstalled).
@@ -402,7 +379,7 @@ impl Model {
         let before = self.svc;
         self.svc = service_state();
         self.svc_checked = Instant::now();
-        if self.elevated && self.busy.is_none() {
+        if self.busy.is_none() {
             // Started / stopped: switch between the pipe and the files.
             if before != self.svc || (self.svc == SvcState::Running && !self.live()) {
                 self.reload();
@@ -421,7 +398,6 @@ impl Model {
             "live": self.live(),
             "points_here": self.points_here,
             "status": self.status.as_ref().map(status_json),
-            "update": self.update_status().as_ref().map(update_json),
             "code": self.code,
             "fingerprint": self.fingerprint,
             "config": self.cfg,
@@ -431,18 +407,6 @@ impl Model {
             "busy": self.busy,
             "log_dir": self.dir.join("logs"),
         })
-    }
-
-    /// The service's update status when it updates itself, else this program's check.
-    fn update_status(&self) -> Option<cpb::UpdateStatus> {
-        let service = self.backend.as_ref().is_some_and(|b| b.service_updates());
-        match &self.status {
-            Some(s) if service => s.update.clone(),
-            _ => self.local_update.lock().unwrap().clone().map(|mut u| {
-                u.current = crate::VERSION_PLAIN.into();
-                u
-            }),
-        }
     }
 
     fn install_json(&self) -> Value {
@@ -462,59 +426,86 @@ impl Model {
     }
 }
 
-struct App {
+/// This computer as a host: the model behind the page's "本机" section.
+pub struct HostPanel {
     model: Model,
-    proxy: EventLoopProxy<UserEvent>,
-    window: Option<Arc<Window>>,
-    web: Option<WebUi>,
-    next_tick: Instant,
+    ui: Ui,
+    /// Last snapshot sent to the page (to push only changes).
+    sent: String,
 }
 
-impl App {
-    fn reply(&self, id: u64, r: Result<Value, String>) {
-        if id != 0 {
-            if let Some(w) = &self.web {
-                w.reply(id, r);
-            }
+impl HostPanel {
+    pub fn new(ui: Ui) -> Self {
+        Self { model: Model::new(), ui, sent: String::new() }
+    }
+
+    fn reply(web: Option<&WebUi>, id: u64, r: Result<Value, String>) {
+        if let (Some(w), true) = (web, id != 0) {
+            w.reply(id, r);
         }
     }
 
-    fn push(&mut self) {
+    /// Send the snapshot if it changed.
+    pub fn push(&mut self, web: Option<&WebUi>) {
         let snap = self.model.snapshot();
         let text = snap.to_string();
-        if text != self.model.sent {
-            if let Some(w) = &self.web {
-                w.emit("snapshot", &snap);
+        if text != self.sent {
+            if let Some(w) = web {
+                w.emit("host.snapshot", &snap);
             }
-            self.model.sent = text;
+            self.sent = text;
         }
+    }
+
+    /// Call often; follows the service once a second.
+    pub fn tick(&mut self, web: Option<&WebUi>) {
+        self.model.tick();
+        self.push(web);
     }
 
     /// Start a background job; its result answers call `id` and refreshes.
-    fn job(&mut self, id: u64, label: &'static str, f: impl FnOnce() -> Result<String> + Send + 'static) {
+    fn job(&mut self, web: Option<&WebUi>, id: u64, label: &'static str, f: impl FnOnce() -> Result<String> + Send + 'static) {
         if let Some(b) = self.model.busy {
-            return self.reply(id, Err(format!("正在{b}，请稍候")));
+            return Self::reply(web, id, Err(format!("正在{b}，请稍候")));
         }
         self.model.busy = Some(label);
-        self.push();
-        let proxy = self.proxy.clone();
+        self.push(web);
+        let ui = self.ui.clone();
         std::thread::spawn(move || {
             let r = f().map_err(|e| format!("{e:#}"));
-            let _ = proxy.send_event(UserEvent::JobDone(id, label, r));
+            ui.send(UiEvent::Host(HostEvent::JobDone(id, label, r)));
         });
     }
 
-    fn call(&mut self, c: Call) {
+    /// A `host.<cmd>` call from the page (`cmd` without the prefix).
+    pub fn call(&mut self, web: Option<&WebUi>, c: &Call, cmd: &str) {
         let id = c.id;
         let m = &mut self.model;
         let str_arg = |k: &str| c.args.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
-        let r: Result<Value, String> = match c.cmd.as_str() {
+        let r: Result<Value, String> = match cmd {
             "snapshot" => Ok(m.snapshot()),
-            "relaunch_elevated" => match relaunch_elevated() {
-                Ok(()) => std::process::exit(0),
-                Err(e) => Err(format!("{e:#}")),
-            },
-            _ if !m.elevated && !matches!(c.cmd.as_str(), "open_url" | "open_logs") => Err("需要管理员权限".into()),
+            "open_url" => {
+                let url = str_arg("url");
+                if url.starts_with("https://") || url.starts_with("ms-settings:") {
+                    open(url);
+                }
+                Ok(Value::Null)
+            }
+            "open_logs" => {
+                open(m.dir.join("logs"));
+                Ok(Value::Null)
+            }
+            // Turn on remote control of this computer: install and start the service.
+            "enable" => {
+                if m.svc != SvcState::NotInstalled {
+                    Err("服务已经安装".into())
+                } else if m.elevated {
+                    return self.job(web, id, "开启远程控制", || install::install(None));
+                } else {
+                    return self.job(web, id, "开启远程控制", install_elevated);
+                }
+            }
+            _ if !m.elevated => Err("需要管理员权限".into()),
             "svc" => {
                 let action = str_arg("action");
                 let (label, f): (&'static str, Box<dyn FnOnce() -> Result<String> + Send>) = match action.as_str() {
@@ -523,43 +514,13 @@ impl App {
                     "start" => ("启动服务", Box::new(|| control_service(true, false))),
                     "stop" => ("停止服务", Box::new(|| control_service(false, true))),
                     "restart" => ("重启服务", Box::new(|| control_service(true, true))),
-                    other => return self.reply(id, Err(format!("未知操作 {other}"))),
+                    other => return Self::reply(web, id, Err(format!("未知操作 {other}"))),
                 };
-                return self.job(id, label, f);
+                return self.job(web, id, label, f);
             }
             "diag" => {
                 let out = m.dir.join("logs").join("nya-diag.txt");
-                return self.job(id, "诊断", move || run_diag(&out));
-            }
-            "update_check" => {
-                let local = m.local_update.clone();
-                return self.job(id, "检查更新", move || {
-                    let mut b = Backend::service("nya-server gui")?;
-                    let s = b.check_update()?;
-                    let msg = if s.state == cpb::update_status::State::Available as i32 {
-                        format!("有新版本 {}", s.latest)
-                    } else {
-                        format!("已经是最新版本（{}）", s.latest)
-                    };
-                    if !b.service_updates() {
-                        *local.lock().unwrap() = Some(s);
-                    }
-                    Ok(msg)
-                });
-            }
-            "update_apply" => {
-                return self.job(id, "安装更新", move || {
-                    let mut b = Backend::service("nya-server gui")?;
-                    let (msg, exit) = b.apply_update()?;
-                    if exit {
-                        // The installer replaces this program: get out of its way.
-                        std::thread::spawn(|| {
-                            std::thread::sleep(Duration::from_millis(1500));
-                            std::process::exit(0);
-                        });
-                    }
-                    Ok(msg)
-                });
+                return self.job(web, id, "诊断", move || run_diag(&out));
             }
             "reset_code" => m.with_backend(|b| b.reset_pairing_code()).map_err(|e| format!("{e:#}")).map(|p| {
                 m.code = p.code;
@@ -591,10 +552,8 @@ impl App {
                 m.with_backend(|b| b.tail_log(name, 400)).map(Value::String).map_err(|e| format!("{e:#}"))
             }
             "components" => {
-                let proxy = self.proxy.clone();
-                std::thread::spawn(move || {
-                    let _ = proxy.send_event(UserEvent::Components(id, detect_components()));
-                });
+                let ui = self.ui.clone();
+                std::thread::spawn(move || ui.send(UiEvent::Host(HostEvent::Components(id, detect_components()))));
                 return;
             }
             "install" => {
@@ -610,133 +569,58 @@ impl App {
                     if ids.is_empty() {
                         Err("没有要安装的组件".into())
                     } else {
-                        m.install_job = Some(start_install(ids, self.proxy.clone()));
+                        m.install_job = Some(start_install(ids, self.ui.clone()));
                         Ok(m.install_json())
                     }
                 }
-            }
-            "open_logs" => {
-                open(m.dir.join("logs"));
-                Ok(Value::Null)
-            }
-            "open_url" => {
-                let url = str_arg("url");
-                if url.starts_with("https://") || url.starts_with("ms-settings:") {
-                    open(url);
-                }
-                Ok(Value::Null)
             }
             "open_sound_settings" => {
                 open("ms-settings:sound");
                 Ok(Value::Null)
             }
-            other => Err(format!("未知命令 {other}")),
+            other => Err(format!("未知命令 host.{other}")),
         };
-        self.reply(id, r);
-        self.push();
-    }
-}
-
-impl ApplicationHandler<UserEvent> for App {
-    fn resumed(&mut self, el: &ActiveEventLoop) {
-        if self.window.is_some() {
-            return;
-        }
-        let attrs = Window::default_attributes()
-            .with_title("NyaRemoteControl 被控端")
-            .with_inner_size(LogicalSize::new(1000.0, 700.0))
-            .with_min_inner_size(LogicalSize::new(640.0, 480.0));
-        let window = match el.create_window(attrs) {
-            Ok(w) => Arc::new(w),
-            Err(e) => {
-                nya_server_core::fatal(&format!("无法创建窗口：{e}"));
-                el.exit();
-                return;
-            }
-        };
-        let dark = matches!(window.theme(), Some(winit::window::Theme::Dark));
-        let opts = nya_webui::Options {
-            page: "manager.html",
-            data_dir: std::env::var_os("LOCALAPPDATA")
-                .map(PathBuf::from)
-                .unwrap_or_else(std::env::temp_dir)
-                .join("NyaRemoteControl")
-                .join("manager-webview"),
-            background: if dark { (0x17, 0x18, 0x1c) } else { (0xf7, 0xf8, 0xfa) },
-        };
-        let proxy = self.proxy.clone();
-        match WebUi::new(&*window, window.inner_size(), opts, move |c| {
-            let _ = proxy.send_event(UserEvent::Call(c));
-        }) {
-            Ok(w) => self.web = Some(w),
-            Err(e) => {
-                nya_server_core::fatal(&format!("{e:#}"));
-                el.exit();
-                return;
-            }
-        }
-        self.window = Some(window);
+        Self::reply(web, id, r);
+        self.push(web);
     }
 
-    fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        match event {
-            WindowEvent::CloseRequested => el.exit(),
-            WindowEvent::Resized(size) => {
-                if let Some(w) = &self.web {
-                    w.resize(size);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn user_event(&mut self, _el: &ActiveEventLoop, ev: UserEvent) {
+    pub fn event(&mut self, web: Option<&WebUi>, ev: HostEvent) {
         match ev {
-            UserEvent::Call(c) => self.call(c),
-            UserEvent::JobDone(id, label, r) => {
-                self.model.busy = None;
-                self.model.svc_checked = Instant::now() - Duration::from_secs(10);
-                if !matches!(label, "诊断" | "检查更新" | "安装更新") {
+            HostEvent::JobDone(id, label, r) => {
+                let m = &mut self.model;
+                m.busy = None;
+                m.svc_checked = Instant::now() - Duration::from_secs(10);
+                if label != "诊断" {
                     // The service was (un)installed / started / stopped.
-                    self.model.svc = service_state();
-                    self.model.reload();
+                    m.svc = service_state();
+                    m.reload();
                 }
-                if let Some(w) = &self.web {
-                    w.emit("job", &json!({ "label": label, "ok": r.is_ok() }));
+                if let Some(w) = web {
+                    w.emit("host.job", &json!({ "label": label, "ok": r.is_ok() }));
                 }
-                self.reply(id, r.map(Value::String));
-                self.push();
+                Self::reply(web, id, r.map(Value::String));
+                self.push(web);
             }
-            UserEvent::Components(id, list) => self.reply(id, Ok(serde_json::to_value(list).unwrap_or_default())),
-            UserEvent::InstallProgress => {
-                if let Some(w) = &self.web {
-                    w.emit("install", &self.model.install_json());
+            HostEvent::Components(id, list) => Self::reply(web, id, Ok(serde_json::to_value(list).unwrap_or_default())),
+            HostEvent::InstallProgress => {
+                if let Some(w) = web {
+                    w.emit("host.install", &self.model.install_json());
                 }
             }
         }
-    }
-
-    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
-        if Instant::now() >= self.next_tick {
-            self.next_tick = Instant::now() + Duration::from_secs(1);
-            self.model.tick();
-            self.push();
-        }
-        el.set_control_flow(ControlFlow::WaitUntil(self.next_tick));
     }
 }
 
-pub fn run() -> Result<()> {
-    // Managing the service needs admin rights: ask for them up front.
-    if !winutil::is_elevated() && relaunch_elevated().is_ok() {
-        return Ok(());
+/// Not elevated: `nya-server.exe install` behind a UAC prompt, waiting for it.
+fn install_elevated() -> Result<String> {
+    let cli = std::env::current_exe()?.with_file_name(CLI_EXE);
+    if !cli.exists() {
+        return Err(anyhow!("找不到 {}", cli.display()));
     }
-    let _log = nya_server_core::logging::init(&paths::service_dir(), "gui", false);
-    let el = EventLoop::<UserEvent>::with_user_event().build()?;
-    let proxy = el.create_proxy();
-    let mut app = App { model: Model::new(), proxy, window: None, web: None, next_tick: Instant::now() };
-    el.run_app(&mut app)?;
-    Ok(())
+    match nya_win::package::run_elevated(&cli, "install")? {
+        0 => Ok("已开启远程控制：服务已安装并启动".into()),
+        code => Err(anyhow!("安装服务失败（代码 {code}），详情见 {}", paths::service_dir().join("logs").display())),
+    }
 }
 
 #[derive(Default)]
@@ -750,12 +634,12 @@ struct InstallJob {
 }
 
 /// Install components one after another on a worker thread.
-fn start_install(list: Vec<(components::Id, &'static str)>, proxy: EventLoopProxy<UserEvent>) -> Arc<Mutex<InstallJob>> {
+fn start_install(list: Vec<(components::Id, &'static str)>, ui: Ui) -> Arc<Mutex<InstallJob>> {
     let job = Arc::new(Mutex::new(InstallJob::default()));
     let j = job.clone();
     std::thread::spawn(move || {
         let notify = || {
-            let _ = proxy.send_event(UserEvent::InstallProgress);
+            ui.send(UiEvent::Host(HostEvent::InstallProgress));
         };
         for (id, name) in list {
             {

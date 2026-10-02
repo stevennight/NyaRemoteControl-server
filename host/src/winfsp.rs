@@ -204,7 +204,7 @@ fn api() -> Result<&'static Api> {
 fn load() -> Result<Api> {
     use windows::core::{s, HSTRING};
     use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-    let path = nya_server_core::components::winfsp_dll().ok_or_else(|| anyhow!("被控端没有安装 WinFsp（管理程序“可选组件”里可一键安装）"))?;
+    let path = nya_server_core::components::winfsp_dll().ok_or_else(|| anyhow!("被控端没有安装 WinFsp（“本机 → 可选组件”里可一键安装）"))?;
     // SAFETY: loading WinFsp's own signed DLL and looking up its documented exports.
     unsafe {
         let lib = LoadLibraryW(&HSTRING::from(path.as_os_str()))?;

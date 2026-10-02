@@ -5,7 +5,7 @@
 //! * `standalone` – single user-mode process for development (no lock screen / UAC support)
 //! * `diag`       – hardware / encoder diagnostics
 //!
-//! It is managed by `nya-server.exe` (`manager/`) through the control pipe
+//! It is managed by the app ("本机", `app/`) and `nya-server.exe` (`cli/`) through the control pipe
 //! (`control`); what both sides share lives in `nya-server-core` (`core/`),
 //! whose modules are re-exported here.
 

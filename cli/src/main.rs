@@ -1,11 +1,13 @@
-//! `nya-server.exe`: management of the host — the GUI (no arguments) and the
-//! command line. The host itself is `nya-server-svc.exe` (see lib.rs); this
-//! program talks to it through the control pipe, or edits its files while it
-//! is not running.
+//! `nya-server.exe`: command line for this computer's host, and the updater
+//! the service starts. The host itself is `nya-server-svc.exe`; this program
+//! talks to it through the control pipe, or edits its files while it is not
+//! running. Without arguments it opens the main program on its "本机" page
+//! (the management GUI lives there now).
+//!
+//! It must stay free of FFmpeg: the service copies it out as the updater,
+//! which runs while the program files are replaced.
 
 #![windows_subsystem = "windows"]
-
-mod gui;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
@@ -15,7 +17,7 @@ use nya_server_core::config::ServerConfig;
 use nya_server_core::{install, paths};
 
 #[derive(Parser)]
-#[command(name = "nya-server", version = concat!(env!("CARGO_PKG_VERSION"), " ", env!("NYA_GIT_HASH")), about = "NyaRemoteControl 被控端管理（不带参数运行打开图形界面）")]
+#[command(name = "nya-server", version = concat!(env!("CARGO_PKG_VERSION"), " ", env!("NYA_GIT_HASH")), about = "NyaRemoteControl 本机（被控端）管理（不带参数运行打开主程序的“本机”页）")]
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -105,7 +107,7 @@ fn main() {
 }
 
 fn real_main(cli: Cli) -> Result<()> {
-    let Some(cmd) = cli.cmd else { return gui::run() };
+    let Some(cmd) = cli.cmd else { return open_app() };
     match cmd {
         Cmd::Install { port } => install::install(port).map(|s| println!("{s}")),
         Cmd::Uninstall { purge } => install::uninstall(purge).map(|s| println!("{s}")),
@@ -181,6 +183,15 @@ fn real_main(cli: Cli) -> Result<()> {
         }
     }
 }
+
+/// The main program, on its "本机" page.
+fn open_app() -> Result<()> {
+    let exe = std::env::current_exe()?.with_file_name(APP_EXE);
+    std::process::Command::new(&exe).args(["--page", "host"]).spawn().map_err(|e| anyhow::anyhow!("无法打开 {}：{e}", exe.display()))?;
+    Ok(())
+}
+
+const APP_EXE: &str = "NyaRemoteControl.exe";
 
 /// Apply `key=value` pairs; values are parsed as TOML where possible
 /// (numbers, booleans), otherwise taken as strings.
@@ -268,14 +279,4 @@ pub fn format_unix(t: u64) -> String {
         }
     }
     format!("{:02}-{:02} {:02}:{:02}:{:02}", local.wMonth, local.wDay, local.wHour, local.wMinute, local.wSecond)
-}
-
-pub const VERSION_PLAIN: &str = env!("CARGO_PKG_VERSION");
-
-/// Version for display: `0.2.0 (1a2b3c4d)` (commit id from build.rs; `+` = uncommitted changes).
-pub fn version() -> String {
-    match env!("NYA_GIT_HASH") {
-        "" => env!("CARGO_PKG_VERSION").to_owned(),
-        h => format!("{} ({h})", env!("CARGO_PKG_VERSION")),
-    }
 }

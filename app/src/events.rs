@@ -108,6 +108,8 @@ pub enum UiEvent {
     Web(nya_webui::Call),
     /// Late answer to a launcher request (work done on another thread).
     WebReply(u64, Result<serde_json::Value, String>),
+    /// Background work of the "本机" section finished.
+    Host(crate::app::host::HostEvent),
     /// An event of one connection (session window), see `Ui::for_conn`.
     Conn(u64, Box<UiEvent>),
 }

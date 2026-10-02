@@ -172,6 +172,9 @@ impl App {
     }
 
     pub(super) fn on_web_call(&mut self, c: Call) {
+        if let Some(cmd) = c.cmd.strip_prefix("host.") {
+            return self.host.call(self.web.as_ref(), &c, cmd);
+        }
         let id = c.id;
         let r = self.web_call(c);
         if let Some(r) = r {
@@ -192,6 +195,18 @@ impl App {
         let args = |c: &Call| c.args::<Addr>().map_err(|e| e.to_string());
         Some(match c.cmd.as_str() {
             "state" => Ok(self.web_state()),
+            "start_page" => Ok(json!(self.start_page.take())),
+            // Managing this computer as a host needs admin rights: reopen the app elevated.
+            "relaunch_elevated" => (|| {
+                if self.any_session() || self.pending.is_some() {
+                    return Err("请先断开远程连接，再以管理员身份重新打开".to_string());
+                }
+                let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+                let page = c.args.get("page").and_then(Value::as_str).filter(|p| p.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-')).unwrap_or("host");
+                nya_win::package::start_elevated(&exe, &format!("--page {page}")).map_err(|e| format!("{e:#}"))?;
+                self.exit = true;
+                Ok(Value::Null)
+            })(),
             "connect" => (|| {
                 let a = args(&c)?;
                 if self.pending.is_some() {
