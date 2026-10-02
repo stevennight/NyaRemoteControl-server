@@ -6,6 +6,7 @@
 mod audio;
 mod clipboard;
 mod cursor;
+mod drives;
 mod gamepad;
 mod input;
 mod mic;
@@ -154,7 +155,9 @@ pub fn run(mut commands: mpsc::UnboundedReceiver<HostCommand>, events: mpsc::Sen
                 let _ = input_tx.send(input::InputCmd::UnplugPads);
                 let _ = clip_tx.send(clipboard::ClipCmd::Enable(false));
             }
+            Cmd::DriveChanged(d) => drives::announce(&d.letter, d.added),
             Cmd::Shutdown(_) => break,
+
         }
     }
 

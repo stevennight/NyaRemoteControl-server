@@ -79,7 +79,7 @@ pub fn thread(rx: Receiver<ClipCmd>, sink: Sink) {
             }
             Ok(ClipCmd::Offer(id)) => {
                 let (sink, waiters) = (sink.clone(), waiters.clone());
-                virtual_files.offer(Box::new(move || {
+                virtual_files.offer(std::sync::Arc::new(move || {
                     let (tx, rx) = std::sync::mpsc::channel();
                     waiters.lock().unwrap().insert(id, tx);
                     tracing::info!("client files pasted on the host; fetching (offer {id:016x})");

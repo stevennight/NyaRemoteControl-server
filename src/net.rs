@@ -203,8 +203,15 @@ type FolderMount = Arc<tokio::sync::Mutex<Option<crate::winfsp::Mount>>>;
 
 /// Mount, keep or unmount the client's folders to match `want`, and tell
 /// the client how it went.
-fn apply_folders(mount: &FolderMount, want: pb::SharedFolders, conn: &Connection, client: &str, ctl_tx: &mpsc::Sender<pb::ControlMsg>) {
-    let (mount, conn, client, ctl_tx) = (mount.clone(), conn.clone(), client.to_owned(), ctl_tx.clone());
+fn apply_folders(
+    mount: &FolderMount,
+    want: pb::SharedFolders,
+    conn: &Connection,
+    client: &str,
+    ctl_tx: &mpsc::Sender<pb::ControlMsg>,
+    hub: &Arc<Hub>,
+) {
+    let (mount, conn, client, ctl_tx, hub) = (mount.clone(), conn.clone(), client.to_owned(), ctl_tx.clone(), hub.clone());
     tokio::spawn(async move {
         let mut m = mount.lock().await;
         let status = if want.folders.is_empty() {
@@ -212,6 +219,7 @@ fn apply_folders(mount: &FolderMount, want: pb::SharedFolders, conn: &Connection
                 let point = old.point.clone();
                 let _ = tokio::task::spawn_blocking(move || drop(old)).await;
                 tracing::info!("client folders unmounted from {point}");
+                announce_drive(&hub, &point, false);
             }
             pb::FolderMountStatus { mounted: false, mount_point: String::new(), message: String::new() }
         } else if let Some(cur) = m.as_ref() {
@@ -225,6 +233,7 @@ fn apply_folders(mount: &FolderMount, want: pb::SharedFolders, conn: &Connection
                     tracing::info!("client folders mounted on {} ({} folder(s))", new.point, want.folders.len());
                     let point = new.point.clone();
                     *m = Some(new);
+                    announce_drive(&hub, &point, true);
                     pb::FolderMountStatus { mounted: true, mount_point: point, message: String::new() }
                 }
                 Err(e) => {
@@ -237,7 +246,14 @@ fn apply_folders(mount: &FolderMount, want: pb::SharedFolders, conn: &Connection
     });
 }
 
+/// The drive letter came or went: the helper tells Explorer in the user's
+/// session (Windows doesn't announce letters a service creates).
+fn announce_drive(hub: &Hub, point: &str, added: bool) {
+    hub.send(Cmd::DriveChanged(crate::ipc_pb::DriveChanged { letter: point.to_owned(), added }));
+}
+
 async fn run_session(
+
     conn: &Connection,
     send: SendStream,
     mut recv: RecvStream,
@@ -446,7 +462,7 @@ async fn run_session(
                     Some(Msg::SharedFolders(f)) if folders_on => {
                         replay.folders = Some(f.clone());
                         if in_control {
-                            apply_folders(&mount, f, conn, client_name, &ctl_tx);
+                            apply_folders(&mount, f, conn, client_name, &ctl_tx, hub);
                         } else {
                             let message = "正在观看，接管操作后才会挂载共享文件夹".to_string();
                             let _ = ctl_tx.send(ctl(Msg::FolderMountStatus(pb::FolderMountStatus { message, ..Default::default() }))).await;
@@ -683,11 +699,11 @@ async fn run_session(
                     if replay.caps.is_some() { hub.push_caps(); }
                     if replay.audio { hub.send(Cmd::SetAudio(SetAudio { enabled: true })); }
                     for s in replay.starts.values() { hub.send(Cmd::StartStream(s.clone())); }
-                    if let Some(f) = &replay.folders { apply_folders(&mount, f.clone(), conn, client_name, &ctl_tx); }
+                    if let Some(f) = &replay.folders { apply_folders(&mount, f.clone(), conn, client_name, &ctl_tx, hub); }
                 }
                 if !role.controlling && was && replay.folders.as_ref().is_some_and(|f| !f.folders.is_empty()) {
                     // Someone else operates now: their files, not ours, belong on the host.
-                    apply_folders(&mount, pb::SharedFolders::default(), conn, client_name, &ctl_tx);
+                    apply_folders(&mount, pb::SharedFolders::default(), conn, client_name, &ctl_tx, hub);
                 }
             }
             p = prints.recv() => {
@@ -718,8 +734,11 @@ async fn run_session(
     // Give attached USB devices back to the client, take its folders off the host.
     let _ = timeout(Duration::from_secs(8), async { usb.lock().await.detach_all().await }).await;
     if let Some(m) = mount.lock().await.take() {
+        let point = m.point.clone();
         let _ = timeout(Duration::from_secs(12), tokio::task::spawn_blocking(move || drop(m))).await;
+        announce_drive(hub, &point, false);
     }
+
     drop(ctl_tx);
     video_task.abort();
     mic_task.abort();

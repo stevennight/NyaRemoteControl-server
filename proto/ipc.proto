@@ -26,8 +26,17 @@ message HostCommand {
     ClipboardOffer clipboard_offer = 16;
     ClipboardPasteDone clipboard_paste_done = 17;
     ControllerChanged controller_changed = 18;
+    DriveChanged drive_changed = 19;
   }
 }
+
+// The service mounted / unmounted the client's folders as `letter` ("Z:"):
+// announce it to Explorer in the user's session.
+message DriveChanged {
+  string letter = 1;
+  bool added = 2;
+}
+
 
 // Another client operates the host now: release what the previous one held.
 message ControllerChanged {}
