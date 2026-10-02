@@ -74,6 +74,7 @@ pub fn thread(rx: Receiver<InputCmd>, sink: super::Sink) {
                 Ev::Key(k) => inj.key(k.scancode as u16, k.extended, k.down),
                 Ev::ReleaseAll(_) => inj.release_all(),
                 Ev::Gamepad(g) => pads.update(&g),
+                Ev::Text(t) => inj.text(&t.text),
             },
             InputCmd::Event(_) => {}
             InputCmd::SetRect(slot, r) => {
