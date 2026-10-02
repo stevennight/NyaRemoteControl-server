@@ -279,6 +279,9 @@ async fn run_session(
     }
     // Keyframes asked for by a watching client (rate-limited: they cost the operator bandwidth).
     let mut last_keyframe = Instant::now() - Duration::from_secs(10);
+    // A watching client starts mid-stream: nothing before a keyframe is any use to it.
+    let mut watch_needs_key = true;
+
 
     // Video as datagrams + FEC (game mode by default) or on a stream.
     let dgram_on = neg.has(Feature::VideoDatagram);
@@ -393,11 +396,10 @@ async fn run_session(
                     Some(Msg::ClientCaps(c)) => {
                         replay.caps = Some(c.clone());
                         replay.audio = audio_on;
-                        if in_control {
-                            hub.send(Cmd::ClientCaps(c));
-                            if audio_on {
-                                hub.send(Cmd::SetAudio(SetAudio { enabled: true }));
-                            }
+                        // Watching clients count too: the picture's format is one they all decode.
+                        hub.set_caps(att.token, c);
+                        if in_control && audio_on {
+                            hub.send(Cmd::SetAudio(SetAudio { enabled: true }));
                         }
                     }
                     Some(Msg::StartStream(mut s)) => {
@@ -551,10 +553,26 @@ async fn run_session(
                     // windows have no window on this client, which would stop the stream).
                     Some(Ev::Video(f)) if f.slot != 0 => {}
                     Some(Ev::Video(f)) => {
-                        // Watching: never hold up the host; after a loss, ask for a keyframe.
+                        // Watching: never hold up the host for long. Frames after a
+                        // loss are useless until the next keyframe, so they are not
+                        // sent (the queue drains); a keyframe waits a little for room
+                        // instead of being dropped, or the watcher would never recover.
                         let slot = f.slot;
-                        if video_tx.try_send(f).is_err() {
-                            att.video_dropped.store(true, Ordering::Relaxed);
+                        let key = nya_proto::frame::VideoFrameHeader::parse(&f.header).is_ok_and(|(h, _)| h.is_keyframe());
+                        if key || !watch_needs_key {
+                            let sent = if key {
+                                matches!(tokio::time::timeout(Duration::from_millis(500), video_tx.send(f)).await, Ok(Ok(())))
+                            } else {
+                                video_tx.try_send(f).is_ok()
+                            };
+                            if sent {
+                                if key {
+                                    watch_needs_key = false;
+                                }
+                            } else {
+                                watch_needs_key = true;
+                                att.video_dropped.store(true, Ordering::Relaxed);
+                            }
                         }
                         if att.video_dropped.load(Ordering::Relaxed) && last_keyframe.elapsed() >= Duration::from_secs(1) {
                             att.video_dropped.store(false, Ordering::Relaxed);
@@ -662,7 +680,7 @@ async fn run_session(
                 if role.controlling && !was {
                     // Taking over: the host follows this client's requests now.
                     tracing::info!("client operates the host now; applying its stream requests");
-                    if let Some(c) = &replay.caps { hub.send(Cmd::ClientCaps(c.clone())); }
+                    if replay.caps.is_some() { hub.push_caps(); }
                     if replay.audio { hub.send(Cmd::SetAudio(SetAudio { enabled: true })); }
                     for s in replay.starts.values() { hub.send(Cmd::StartStream(s.clone())); }
                     if let Some(f) = &replay.folders { apply_folders(&mount, f.clone(), conn, client_name, &ctl_tx); }
@@ -683,7 +701,7 @@ async fn run_session(
             _ = generation.changed(), if controlling.load(Ordering::Relaxed) => {
                 // The helper restarted (session switch): replay the client's requests.
                 tracing::info!("host restarted; replaying stream request");
-                if let Some(c) = &replay.caps { hub.send(Cmd::ClientCaps(c.clone())); }
+                if replay.caps.is_some() { hub.push_caps(); }
                 if replay.audio { hub.send(Cmd::SetAudio(SetAudio { enabled: true })); }
                 for s in replay.starts.values() { hub.send(Cmd::StartStream(s.clone())); }
             }

@@ -247,7 +247,24 @@ pub fn thread(rx: Receiver<VideoCmd>, sink: Sink, input_tx: Sender<InputCmd>, cf
                         }
                     }
                 }
-                VideoCmd::Caps(c) => st.caps = Some(c),
+                VideoCmd::Caps(c) => {
+                    // What every attached client decodes (the hub combines them): a
+                    // watcher joining or leaving can change the best format.
+                    let changed = st.caps.as_ref() != Some(&c);
+                    st.caps = Some(c);
+                    if changed {
+                        let (probes, caps) = (&st.probes, st.caps.as_ref());
+                        for x in st.slots.values_mut() {
+                            let Some(p) = x.pipe.as_ref() else { continue };
+                            let best = select::plans(probes, p.plan.capture_adapter, &x.req, caps, &cfg.encoder, p.plan.hdr).into_iter().next();
+                            if best.as_ref().is_some_and(|b| (b.codec, b.yuv444, b.hdr) != (p.plan.codec, p.plan.yuv444, p.plan.hdr)) {
+                                tracing::info!("attached clients decode differently now: slot {} {:?} -> {:?}", p.slot, p.plan, best);
+                                x.rebuild = true;
+                            }
+                        }
+                    }
+                }
+
                 VideoCmd::SetBitrate(k) => {
                     st.bitrate_total = Some(k);
                     split_bitrate(&mut st);

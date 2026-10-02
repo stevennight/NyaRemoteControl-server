@@ -12,6 +12,10 @@
 //!   frames (`Attachment::video_dropped`) and asks for a keyframe
 //! * `generation` increments whenever the host (helper) restarts, so the
 //!   controller can re-send its stream request
+//! * the picture follows the controller's requests (size, mode, codec wish),
+//!   but its format is limited to what every attached client decodes
+//!   (`combine_caps`): a phone watching a PC client's session must not get
+//!   4:4:4, AV1 or HDR it can't decode
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -110,6 +114,8 @@ pub struct Hub {
     clients: Mutex<Clients>,
     next_token: Mutex<u64>,
     picture: Mutex<Picture>,
+    /// Decoders of every attached session, by token.
+    caps: Mutex<std::collections::HashMap<u64, pb::ClientCaps>>,
     pub session_info: watch::Sender<Option<pb::SessionInfo>>,
     pub generation: watch::Sender<u64>,
 }
@@ -122,6 +128,7 @@ impl Hub {
             clients: Mutex::new(Clients::default()),
             next_token: Mutex::new(1),
             picture: Mutex::new(Picture::default()),
+            caps: Mutex::new(Default::default()),
             session_info: watch::channel(None).0,
             generation: watch::channel(0).0,
         });
@@ -130,6 +137,21 @@ impl Hub {
 
     pub fn send(&self, cmd: Cmd) {
         let _ = self.cmd_tx.send(HostCommand { cmd: Some(cmd) });
+    }
+
+    /// What session `token` decodes (operating or watching).
+    pub fn set_caps(&self, token: u64, caps: pb::ClientCaps) {
+        self.caps.lock().unwrap().insert(token, caps);
+        self.push_caps();
+    }
+
+    /// Tell the host what the picture may use now (sessions or the controller changed).
+    pub fn push_caps(&self) {
+        let controller = self.controller();
+        let combined = combine_caps(controller, &self.caps.lock().unwrap());
+        if let Some(c) = combined {
+            self.send(Cmd::ClientCaps(c));
+        }
     }
 
     /// Attach a client session. With `shared` (the client can watch) it
@@ -199,6 +221,7 @@ impl Hub {
         c.broadcast();
         drop(c);
         self.send(Cmd::ControllerChanged(Default::default()));
+        self.push_caps();
     }
 
     /// The operating session, if any.
@@ -223,6 +246,7 @@ impl Hub {
     }
 
     pub fn detach(&self, token: u64) {
+        self.caps.lock().unwrap().remove(&token);
         let mut c = self.clients.lock().unwrap();
         let before = c.subs.len();
         c.subs.retain(|s| s.token != token);
@@ -244,10 +268,20 @@ impl Hub {
             self.send(Cmd::ControllerChanged(Default::default()));
         } else {
             c.broadcast();
+            drop(c);
         }
+        // A watcher that left may have held the format back.
+        self.push_caps();
+    }
+
+    /// Forget a session's decoders without detaching (tests).
+    #[cfg(test)]
+    fn caps_count(&self) -> usize {
+        self.caps.lock().unwrap().len()
     }
 
     /// The running streams and displays, for a client joining now.
+
     pub fn picture(&self) -> (Vec<pb::StreamStarted>, Option<pb::DisplayChanged>) {
         let p = self.picture.lock().unwrap();
         (p.streams.values().cloned().collect(), p.displays.clone())
@@ -306,8 +340,65 @@ impl Hub {
     }
 }
 
+/// The controller's decoders, keeping only the formats every watching client
+/// decodes too, so everyone can show the one picture. A watcher with nothing
+/// in common (or no caps yet) is left out rather than leaving nothing.
+pub fn combine_caps(controller: Option<u64>, all: &std::collections::HashMap<u64, pb::ClientCaps>) -> Option<pb::ClientCaps> {
+    let mut out = all.get(&controller?)?.clone();
+    for (token, w) in all {
+        if Some(*token) == controller {
+            continue;
+        }
+        let kept: Vec<pb::CodecCap> = out
+            .decoders
+            .iter()
+            .filter(|d| w.decoders.iter().any(|x| x.codec == d.codec && x.chroma == d.chroma && (x.ten_bit || !d.ten_bit)))
+            .cloned()
+            .collect();
+        if !kept.is_empty() {
+            out.decoders = kept;
+        }
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
+    fn cap(codec: pb::Codec, chroma: pb::Chroma, ten_bit: bool) -> pb::CodecCap {
+        pb::CodecCap { codec: codec as i32, chroma: chroma as i32, ten_bit, hardware: true, ..Default::default() }
+    }
+
+    #[test]
+    fn picture_format_is_what_everyone_decodes() {
+        use pb::{Chroma::*, Codec::*};
+        let pc = pb::ClientCaps {
+            decoders: vec![cap(Hevc, Yuv420, false), cap(Hevc, Yuv444, false), cap(Av1, Yuv420, false), cap(Hevc, Yuv420, true)],
+            max_fps: 144,
+            ..Default::default()
+        };
+        let phone = pb::ClientCaps { decoders: vec![cap(H264, Yuv420, false), cap(Hevc, Yuv420, false)], ..Default::default() };
+        let mut all = std::collections::HashMap::new();
+        all.insert(1, pc.clone());
+        assert_eq!(combine_caps(Some(1), &all), Some(pc.clone()), "alone: as it is");
+        all.insert(2, phone);
+        let c = combine_caps(Some(1), &all).unwrap();
+        assert_eq!(c.decoders, vec![cap(Hevc, Yuv420, false)], "no 4:4:4, AV1 or 10-bit for the phone");
+        assert_eq!(c.max_fps, 144, "everything else follows the controller");
+        all.insert(3, pb::ClientCaps::default());
+        assert_eq!(combine_caps(Some(1), &all).unwrap().decoders.len(), 1, "a watcher without caps changes nothing");
+        assert_eq!(combine_caps(None, &all), None);
+    }
+
+    #[tokio::test]
+    async fn caps_are_forgotten_on_detach() {
+        let (hub, _rx) = Hub::new();
+        let a = hub.attach("a", "fa", true);
+        hub.set_caps(a.token, pb::ClientCaps::default());
+        assert_eq!(hub.caps_count(), 1);
+        hub.detach(a.token);
+        assert_eq!(hub.caps_count(), 0);
+    }
+
     use super::*;
 
     fn role(a: &Attachment) -> Role {
