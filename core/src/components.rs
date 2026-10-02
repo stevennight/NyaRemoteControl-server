@@ -188,7 +188,7 @@ fn install_cable(zip: &Path) -> Result<Installed> {
     if !nya_win::devnode::exists(CABLE_HWID) {
         bail!("VB-Cable 安装程序没有装上驱动（返回代码 {code}）");
     }
-    Ok(Installed { reboot: true, note: "重启后，在被控端软件里选择“CABLE Output”作为麦克风".into() })
+    Ok(Installed { reboot: true, note: "重启后即可使用；客户端麦克风打开期间，“CABLE Output”会自动成为被控端的默认麦克风".into() })
 }
 
 fn install_vdd(zip: &Path) -> Result<Installed> {

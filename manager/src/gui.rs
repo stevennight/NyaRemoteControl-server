@@ -101,7 +101,7 @@ fn detect_components() -> Vec<Component> {
             id: "cable",
             name: "虚拟声卡",
             product: "VB-Cable",
-            purpose: "把客户端麦克风送进被控端：客户端工具条打开“麦克风”，被控端软件选择“CABLE Output”作为麦克风",
+            purpose: "把客户端麦克风送进被控端：客户端工具条打开“麦克风”，打开期间“CABLE Output”自动成为被控端默认麦克风",
             installed: cable.is_some(),
             status: cable.map(|n| {
                 if nya_win::audio::default_render_is("CABLE") {
