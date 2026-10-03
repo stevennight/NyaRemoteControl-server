@@ -171,7 +171,25 @@ impl App {
         Ok(self.web_state())
     }
 
+    /// Show the launcher (created hidden) once its page is up.
+    pub(super) fn reveal_launcher(&mut self) {
+        let Some(deadline) = self.launcher_reveal.take() else { return };
+        let waited = std::time::Duration::from_secs(4).saturating_sub(deadline.saturating_duration_since(std::time::Instant::now()));
+        tracing::info!("launcher shown after {} ms", waited.as_millis());
+        if let Some(l) = &self.launcher {
+            // The page fills the window at its final size (DPI scaling may
+            // have changed it since the web view was created).
+            if let Some(w) = &self.web {
+                w.resize(l.inner_size());
+            }
+            l.set_visible(true);
+            l.focus_window();
+        }
+    }
+
     pub(super) fn on_web_call(&mut self, c: Call) {
+        // The page's first request: it is loaded and drawn.
+        self.reveal_launcher();
         if let Some(cmd) = c.cmd.strip_prefix("host.") {
             return self.host.call(self.web.as_ref(), &c, cmd);
         }

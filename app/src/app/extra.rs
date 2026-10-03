@@ -74,7 +74,7 @@ impl App {
         let Some(dev) = self.renderer.as_ref().map(|r| r.dev.clone()) else { return };
         let title = format!("{} · {} — NyaRemoteControl", s.label, s.display_title(display_id));
         use winit::platform::windows::WindowAttributesExtWindows;
-        let attrs = Window::default_attributes().with_class_name(input::SESSION_CLASS).with_title(title).with_inner_size(LogicalSize::new(960.0, 600.0)).with_min_inner_size(LogicalSize::new(320.0, 200.0));
+        let attrs = Window::default_attributes().with_class_name(input::SESSION_CLASS).with_window_icon(super::app_icon()).with_title(title).with_inner_size(LogicalSize::new(960.0, 600.0)).with_min_inner_size(LogicalSize::new(320.0, 200.0));
         let window = match el.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => return tracing::warn!("extra window: {e}"),

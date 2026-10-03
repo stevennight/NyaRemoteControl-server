@@ -179,6 +179,7 @@ impl App {
         use winit::platform::windows::WindowAttributesExtWindows;
         let attrs = Window::default_attributes()
             .with_class_name(input::SESSION_CLASS)
+            .with_window_icon(super::app_icon())
             .with_title("NyaRemoteControl")
             .with_inner_size(LogicalSize::new(1280.0, 800.0))
             .with_min_inner_size(LogicalSize::new(640.0, 480.0))

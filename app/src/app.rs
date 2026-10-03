@@ -70,6 +70,9 @@ pub struct App {
     window: Option<Arc<Window>>,
     /// The launcher window (devices, settings), a web page.
     launcher: Option<Arc<Window>>,
+    /// The launcher is created hidden and shown once its page is up (no
+    /// blank window while WebView2 starts), at the latest at this time.
+    launcher_reveal: Option<Instant>,
     renderer: Option<Renderer>,
     gui: Option<Gui>,
     adapter_luid: u64,
@@ -109,6 +112,13 @@ pub struct App {
     sync_extras: bool,
     /// Virtual screen (1-based) created for a new window, until it appears.
     pending_virtual: Option<u32>,
+}
+
+/// The program's icon (resource 1, from common/assets/client.ico) for the
+/// title bar and the taskbar of our windows.
+pub(crate) fn app_icon() -> Option<winit::window::Icon> {
+    use winit::platform::windows::IconExtWindows;
+    winit::window::Icon::from_resource(1, None).ok()
 }
 
 fn hwnd(window: &Window) -> Option<windows::Win32::Foundation::HWND> {
@@ -212,6 +222,7 @@ impl App {
             session_host: String::new(),
             window: None,
             launcher: None,
+            launcher_reveal: None,
             renderer: None,
             gui: None,
             adapter_luid: 0,
@@ -1098,6 +1109,8 @@ impl ApplicationHandler<UiEvent> for App {
         // The launcher and the session each get a window, so the launcher
         // stays usable during a session.
         let launcher = Window::default_attributes()
+            .with_window_icon(app_icon())
+            .with_visible(false)
             .with_title("NyaRemoteControl")
             .with_inner_size(LogicalSize::new(1100.0, 760.0))
             .with_min_inner_size(LogicalSize::new(640.0, 480.0));
@@ -1110,6 +1123,7 @@ impl ApplicationHandler<UiEvent> for App {
             }
         };
         self.launcher = Some(launcher);
+        self.launcher_reveal = Some(Instant::now() + Duration::from_secs(4));
         // The first (idle) session window, ready for a connection.
         if let Err(e) = self.new_conn(el) {
             crate::fatal(&format!("{e:#}"));
@@ -1452,6 +1466,14 @@ impl ApplicationHandler<UiEvent> for App {
             return;
         }
         let mut wake = Instant::now() + Duration::from_millis(250);
+        if let Some(at) = self.launcher_reveal {
+            if Instant::now() >= at {
+                tracing::warn!("launcher page not up after 4 s; showing the window anyway");
+                self.reveal_launcher();
+            } else {
+                wake = wake.min(at);
+            }
+        }
         for id in self.conn_ids() {
             if self.activate(id) {
                 wake = wake.min(self.conn_tick(el));

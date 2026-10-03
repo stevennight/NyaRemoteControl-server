@@ -248,7 +248,7 @@ pub fn extra_overlay(ctx: &egui::Context, title: &str, status: &str, fullscreen:
             .interactable(false)
             .show(ctx, |ui| {
                 egui::Frame::NONE.fill(BAR_FILL).corner_radius(10).inner_margin(egui::Margin::symmetric(14, 8)).show(ui, |ui| {
-                    ui.label(RichText::new(status).color(Color32::WHITE));
+                    status_label(ui, status);
                 });
             });
     }
@@ -629,7 +629,7 @@ pub fn session_overlay(
                     .corner_radius(10)
                     .inner_margin(egui::Margin::symmetric(14, 8))
                     .show(ui, |ui| {
-                        ui.label(RichText::new(&s.status).color(Color32::WHITE));
+                        status_label(ui, &s.status);
                     });
             });
     }
@@ -668,6 +668,18 @@ pub fn session_overlay(
             actions.push(Action::Hotkey(Hotkey::ToggleStats));
         }
     }
+}
+
+/// A status message in its box: one line as wide as the text needs (an
+/// area otherwise keeps the width of an earlier frame and wraps every
+/// message into a narrow column), wrapped only beyond the window's width.
+fn status_label(ui: &mut egui::Ui, text: &str) {
+    let max = (ui.ctx().screen_rect().width() - 80.0).clamp(160.0, 900.0);
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let natural = ui.fonts(|f| f.layout_no_wrap(text.to_owned(), font, Color32::WHITE).size().x);
+    ui.set_min_width(natural.min(max));
+    ui.set_max_width(max);
+    ui.add(egui::Label::new(RichText::new(text).color(Color32::WHITE)).wrap());
 }
 
 /// Bottom-right panel: host file offers and running / finished transfers.
@@ -1020,5 +1032,37 @@ mod bar_tests {
         s.wait(0.5);
         assert!(s.bar.get());
         assert!(s.button.get().unwrap().center().x < 400.0);
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    /// A status message is one line as wide as its text, frame after frame
+    /// (it used to keep a narrow width and wrap into a column).
+    #[test]
+    fn status_is_as_wide_as_its_text() {
+        let ctx = egui::Context::default();
+        let text = "共享文件夹已出现在被控端的 Z 盘";
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0))),
+            ..Default::default()
+        };
+        let mut size = egui::Vec2::ZERO;
+        for _ in 0..4 {
+            let _ = ctx.run(input(), |ctx| {
+                let r = egui::Area::new(egui::Id::new("status"))
+                    .anchor(Align2::CENTER_BOTTOM, [0.0, -24.0])
+                    .show(ctx, |ui| status_label(ui, text));
+                size = r.response.rect.size();
+            });
+        }
+        // (Not ctx.style() inside ctx.fonts(): nested context locks deadlock.)
+        let font = egui::TextStyle::Body.resolve(&ctx.style());
+        let line = ctx.fonts(|f| f.row_height(&font));
+        assert!(size.y < line * 1.5, "one line, got {size:?}");
+        let natural = ctx.fonts(|f| f.layout_no_wrap(text.to_owned(), font.clone(), Color32::WHITE).size().x);
+        assert!(size.x >= natural - 1.0, "as wide as the text ({natural}), got {size:?}");
     }
 }
