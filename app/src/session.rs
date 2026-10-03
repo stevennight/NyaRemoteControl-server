@@ -627,8 +627,9 @@ impl Session {
             self.last_rendered_total = r;
             let keys = (input::hook_key_count(), self.winit_keys);
             if keys != self.logged_keys {
+                let (reinstalls, missed) = input::hook_repairs();
                 tracing::info!(
-                    "keys so far: hook {} (hook calls {}) / window {} (grab {})",
+                    "keys so far: hook {} (hook calls {}) / window {} (grab {}, past the hook {missed}, hook put first again {reinstalls}x)",
                     keys.0,
                     input::hook_call_count(),
                     keys.1,

@@ -1063,6 +1063,7 @@ impl App {
                 // anything arriving here still has to go to the host (the hook is
                 // not running, or missed the key).
                 if input::grabbed() && self.focused {
+                    input::key_missed_hook();
                     use winit::platform::scancode::PhysicalKeyExtScancode;
                     if let (Some(sc), Some(s)) = (event.physical_key.to_scancode(), &self.session) {
                         let (scancode, extended) = (sc & 0xff, sc & 0xff00 == 0xe000);
@@ -1161,6 +1162,7 @@ impl ApplicationHandler<UiEvent> for App {
                     // The keyboard hook sends keys to the focused session.
                     if let Some(s) = &self.session {
                         input::set_session(Some(s.net_tx.clone()));
+                        input::reinstall_hook();
                     }
                 }
                 self.update_no_hotkeys();

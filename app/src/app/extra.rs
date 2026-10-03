@@ -215,6 +215,9 @@ impl App {
             WindowEvent::RedrawRequested => self.draw_extra(id),
             WindowEvent::Focused(f) => {
                 w.focused = *f;
+                if *f && self.session.is_some() {
+                    input::reinstall_hook();
+                }
                 if !*f {
                     w.remote_buttons = 0;
                     input::reset_modifiers();
@@ -271,6 +274,7 @@ impl App {
                     return self.hotkey(h);
                 }
                 if input::grabbed() {
+                    input::key_missed_hook();
                     use winit::platform::scancode::PhysicalKeyExtScancode;
                     if let (Some(sc), Some(s)) = (event.physical_key.to_scancode(), &self.session) {
                         let (scancode, extended) = (sc & 0xff, sc & 0xff00 == 0xe000);

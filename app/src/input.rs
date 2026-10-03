@@ -7,6 +7,11 @@
 //!   answer within LowLevelHooksTimeout — which the UI thread (decoding,
 //!   presenting, connecting) missed, notably in cloud desktops, after which
 //!   Alt+Tab acted locally.
+//! * Windows calls the most recently installed low-level hook first. Another
+//!   program's hook ahead of ours (seen: keys reached the window, our hook
+//!   was never called for them, Alt+Tab acted locally) gets ours put back in
+//!   front: the hook is installed again whenever a session window gains the
+//!   focus, and when a key reaches the window past it.
 //! * Should keys still reach the window (the hook gone anyway), they are
 //!   forwarded from window events. To keep shell hotkeys such as Win+D / Win+E
 //!   from acting locally, raw keyboard input is registered with
@@ -14,18 +19,18 @@
 //!
 //! Hotkeys are Ctrl+Alt+Shift+<key>.
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use nya_proto::pb::{self, input_msg::Ev};
 use tokio::sync::mpsc::UnboundedSender;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL};
+use windows::Win32::System::Threading::{GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL};
 use windows::Win32::UI::Input::KeyboardAndMouse::{MapVirtualKeyW, MAPVK_VK_TO_VSC_EX};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetForegroundWindow, GetMessageW, SetWindowsHookExW, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_EXTENDED,
-    LLKHF_UP, MSG, WH_KEYBOARD_LL,
+    CallNextHookEx, GetForegroundWindow, GetMessageW, PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HC_ACTION,
+    KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_UP, MSG, WH_KEYBOARD_LL, WM_APP,
 };
 
 use crate::events::{Hotkey, NetCmd, Ui, UiEvent};
@@ -44,6 +49,48 @@ static STATE: OnceLock<HookState> = OnceLock::new();
 static HOOK_KEYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static HOOK_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// The hook thread (0 = not running).
+static HOOK_TID: AtomicU32 = AtomicU32::new(0);
+/// Times the hook was put first again.
+static REINSTALLS: AtomicU64 = AtomicU64::new(0);
+/// Keys that reached a session window although the hook should have taken them.
+static MISSED: AtomicU64 = AtomicU64::new(0);
+/// Thread message: install the hook again (first in the chain).
+const WM_REINSTALL: u32 = WM_APP + 1;
+
+/// (times the hook was put first again, keys that went past it)
+pub fn hook_repairs() -> (u64, u64) {
+    (REINSTALLS.load(Ordering::Relaxed), MISSED.load(Ordering::Relaxed))
+}
+
+/// Put the hook first in the chain again (at most twice a second).
+pub fn reinstall_hook() {
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    let tid = HOOK_TID.load(Ordering::SeqCst);
+    if tid == 0 {
+        return;
+    }
+    {
+        let mut last = LAST.lock().unwrap();
+        if last.is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(500)) {
+            return;
+        }
+        *last = Some(std::time::Instant::now());
+    }
+    // SAFETY: posting to our own hook thread's queue.
+    unsafe {
+        let _ = PostThreadMessageW(tid, WM_REINSTALL, WPARAM(0), LPARAM(0));
+    }
+}
+
+/// A key reached a session window while the keyboard is captured: the hook
+/// did not get it first (another program's hook is ahead of ours).
+pub fn key_missed_hook() {
+    if MISSED.fetch_add(1, Ordering::Relaxed) == 0 {
+        tracing::warn!("keys reach the window past the keyboard hook (another program's hook first?): putting ours first again");
+    }
+    reinstall_hook();
+}
 
 /// Hook invocations for any window (tells "hook not running" from "not our window").
 pub fn hook_call_count() -> u64 {
@@ -100,13 +147,29 @@ pub fn install(hwnd: HWND, ui: Ui) {
         // Keys wait for the hook: answer them before anything else.
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
         let module = GetModuleHandleW(None).unwrap_or_default();
-        if let Err(e) = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook), module, 0) {
-            tracing::error!("keyboard hook: {e}");
-            return;
-        }
+        let mut installed = match SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook), module, 0) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::error!("keyboard hook: {e}");
+                return;
+            }
+        };
+        HOOK_TID.store(GetCurrentThreadId(), Ordering::SeqCst);
         // The hook is called from this loop; it lives as long as the process.
         let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {}
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            if msg.message == WM_REINSTALL {
+                // The new one first, then the old one off: never without a hook.
+                match SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook), module, 0) {
+                    Ok(h) => {
+                        let _ = UnhookWindowsHookEx(installed);
+                        installed = h;
+                        REINSTALLS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => tracing::warn!("keyboard hook again: {e}"),
+                }
+            }
+        }
     });
     if let Err(e) = spawned {
         tracing::error!("keyboard hook thread: {e}");
