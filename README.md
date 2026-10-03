@@ -201,7 +201,7 @@ vd_width = 1920        # vd_size = "fixed" 时使用
 vd_height = 1080
 vd_scale = true        # 虚拟显示器使用本机的缩放比例
 mic = false            # 连接后打开麦克风
-grab_keyboard = false  # 连接后捕获键盘
+grab_keyboard = true   # 连接后捕获键盘（Alt+Tab、Win 键组合发给被控端）
 
 [[hosts]]              # 连接成功后自动保存
 name = "家里台式机"

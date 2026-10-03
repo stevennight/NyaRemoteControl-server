@@ -666,6 +666,7 @@ impl App {
     }
 
     fn set_grab(&mut self, on: bool) {
+        tracing::info!("keyboard capture {}", if on { "on" } else { "off" });
         input::set_grab(on);
         if !on {
             if let Some(s) = &self.session {

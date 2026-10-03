@@ -150,7 +150,7 @@ impl Default for Defaults {
             vd_scale: true,
             multi_window: false,
             mic: false,
-            grab_keyboard: false,
+            grab_keyboard: true,
             shared_folders: Vec::new(),
             print_mode: "print".into(),
             hdr: true,
@@ -198,8 +198,14 @@ impl Overrides {
     }
 }
 
+/// Bumped when a stored setting has to be changed once on load (see `migrate`).
+const CONFIG_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
+    /// `CONFIG_VERSION` this file was last migrated to (0 = before versions).
+    #[serde(default)]
+    pub version: u32,
     /// This computer's name as hosts show it; empty = the computer name.
     #[serde(default)]
     pub client_name: String,
@@ -214,7 +220,13 @@ pub struct ClientConfig {
 
 impl Default for ClientConfig {
     fn default() -> Self {
-        Self { client_name: String::new(), check_updates: true, defaults: Defaults::default(), hosts: Vec::new() }
+        Self {
+            version: CONFIG_VERSION,
+            client_name: String::new(),
+            check_updates: true,
+            defaults: Defaults::default(),
+            hosts: Vec::new(),
+        }
     }
 }
 
@@ -227,7 +239,33 @@ impl ClientConfig {
             return Ok(c);
         }
         let text = std::fs::read_to_string(&path)?;
-        toml::from_str(&text).with_context(|| format!("parse {}", path.display()))
+        let mut c: Self = toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+        if c.migrate() {
+            if let Err(e) = c.save(dir) {
+                tracing::warn!("save migrated settings: {e:#}");
+            }
+        }
+        Ok(c)
+    }
+
+    /// One-time changes to settings stored by older versions; true if any.
+    fn migrate(&mut self) -> bool {
+        if self.version >= CONFIG_VERSION {
+            return false;
+        }
+        if self.version < 1 {
+            // Up to 0.7.1 keyboard capture was off by default (meant to be
+            // on), so Alt+Tab & co. acted locally; nobody could tell the
+            // default from a choice, so capture is switched on everywhere.
+            self.defaults.grab_keyboard = true;
+            for h in &mut self.hosts {
+                if let Some(s) = &mut h.settings {
+                    s.grab_keyboard = true;
+                }
+            }
+        }
+        self.version = CONFIG_VERSION;
+        true
     }
 
     pub fn save(&self, dir: &Path) -> Result<()> {
@@ -366,6 +404,27 @@ mod tests {
         assert_eq!((d.mode.as_str(), d.mic), ("game", true), "own settings start from the defaults");
         assert_eq!(c.settings_for("10.0.0.9").mode, "office");
         assert!(!c.edit_settings("10.0.0.9", |_| {}));
+    }
+
+    #[test]
+    fn keyboard_capture_switched_on_once() {
+        let text = "[defaults]
+grab_keyboard = false
+[[hosts]]
+name = \"a\"
+address = \"10.0.0.1\"
+[hosts.settings]
+grab_keyboard = false
+";
+        let mut c: ClientConfig = toml::from_str(text).unwrap();
+        assert!(c.migrate());
+        assert!(c.defaults.grab_keyboard && c.settings_for("10.0.0.1").grab_keyboard);
+        // Switched off again afterwards: stays off.
+        c.defaults.grab_keyboard = false;
+        let mut c: ClientConfig = toml::from_str(&toml::to_string_pretty(&c).unwrap()).unwrap();
+        assert!(!c.migrate());
+        assert!(!c.defaults.grab_keyboard);
+        assert!(ClientConfig::default().defaults.grab_keyboard);
     }
 
     #[test]
