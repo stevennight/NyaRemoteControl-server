@@ -55,10 +55,22 @@ enum Cmd {
         #[arg(long)]
         pipe: String,
     },
+    /// （内部）由服务启动：用 WinFsp 把客户端的共享文件夹挂成盘符
+    #[command(hide = true)]
+    Folders {
+        #[arg(long)]
+        point: String,
+        #[arg(long)]
+        label: String,
+    },
 }
 
 fn main() {
-    nya_server::attach_parent_console();
+    // The mount process talks to the service over stdin / stdout (pipes):
+    // no console to attach.
+    if std::env::args().nth(1).as_deref() != Some("folders") {
+        nya_server::attach_parent_console();
+    }
     if let Err(e) = real_main(Cli::parse()) {
         eprintln!("错误：{e:#}");
         std::process::exit(1);
@@ -82,6 +94,12 @@ fn real_main(cli: Cli) -> Result<()> {
             nya_win::dpi::set_per_monitor_aware();
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(ipc::run_helper(&pipe))
+        }
+        Cmd::Folders { point, label } => {
+            let _log = logging::init(&paths::service_dir(), "folders", false);
+            let code = nya_server::winfsp::run_mount_process(&point, &label)?;
+            drop(_log);
+            std::process::exit(code)
         }
         Cmd::VddTest { screens, physical_off, secs, driver_log } => {
             let _log = logging::init(&paths::service_dir(), "vdd-test", true);

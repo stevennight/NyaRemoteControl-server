@@ -7,18 +7,24 @@
 //! (`nya_transport::folders::call`); WinFsp caches file and directory
 //! information for a second to keep Explorer responsive over the network.
 //!
-//! Run as SYSTEM (the service), the drive letter is global: the user sees it
-//! in their session. Files get mode 0777 (Everyone may read and write); the
+//! The drive is served by a child process of the service (`nya-server-svc.exe
+//! folders`, see [`Mount`]) that relays every call to the service over its
+//! stdin / stdout. Run as SYSTEM, the drive letter is global: the user sees
+//! it in their session. Files get mode 0777 (Everyone may read and write); the
 //! client enforces read-only folders.
 //!
 //! The types below follow WinFsp's `inc/fuse/*.h` for 64-bit Windows.
 
+use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
+use prost::Message;
 use nya_proto::pb::{self, fs_request::Op, FsError};
 use nya_transport::folders::MAX_IO;
 use nya_transport::quinn::Connection;
@@ -130,7 +136,7 @@ struct FuseOperations {
     releasedir: Unused,
     fsyncdir: Unused,
     init: Option<unsafe extern "C" fn(*mut c_void) -> *mut c_void>,
-    destroy: Unused,
+    destroy: Option<unsafe extern "C" fn(*mut c_void)>,
     access: Unused,
     create: Option<unsafe extern "C" fn(Path, u32, Fi) -> c_int>,
     ftruncate: Option<unsafe extern "C" fn(Path, i64, Fi) -> c_int>,
@@ -219,7 +225,51 @@ fn load() -> Result<Api> {
     }
 }
 
-// ---------------------------------------------------------------- the file system
+// ---------------------------------------------------------------- service ↔ mount process
+
+// Frames on the mount process's stdin / stdout: kind (u8), id (u64 LE),
+// payload length (u32 LE), payload.
+const TO_SERVICE_REQUEST: u8 = 1; // FsRequest; answered under the same id
+const TO_SERVICE_MOUNTED: u8 = 2; // the drive letter exists
+const TO_MOUNT_REPLY: u8 = 1; // FsReply
+const TO_MOUNT_FAILED: u8 = 2; // the client did not answer
+const MAX_FRAME: usize = 2 * nya_proto::MAX_MESSAGE_LEN;
+
+fn write_frame(w: &mut impl Write, kind: u8, id: u64, payload: &[u8]) -> io::Result<()> {
+    let mut b = Vec::with_capacity(13 + payload.len());
+    b.push(kind);
+    b.extend_from_slice(&id.to_le_bytes());
+    b.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    b.extend_from_slice(payload);
+    w.write_all(&b)?;
+    w.flush()
+}
+
+fn read_frame(r: &mut impl Read) -> io::Result<(u8, u64, Vec<u8>)> {
+    let mut h = [0u8; 13];
+    r.read_exact(&mut h)?;
+    let id = u64::from_le_bytes(h[1..9].try_into().unwrap());
+    let len = u32::from_le_bytes(h[9..13].try_into().unwrap()) as usize;
+    if len > MAX_FRAME {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
+    }
+    let mut p = vec![0; len];
+    r.read_exact(&mut p)?;
+    Ok((h[0], id, p))
+}
+
+/// Is `point` ("Z:") a drive letter this process sees?
+fn drive_exists(point: &str) -> bool {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetLogicalDrives() -> u32;
+    }
+    let Some(i) = point.bytes().next().map(|c| c.to_ascii_uppercase().wrapping_sub(b'A')) else { return false };
+    // SAFETY: no arguments.
+    i < 26 && unsafe { GetLogicalDrives() } & (1 << i) != 0
+}
+
+// ---------------------------------------------------------------- the file system (mount process)
 
 const ENOENT: c_int = 2;
 const EIO: c_int = 5;
@@ -233,30 +283,50 @@ const ENOTEMPTY: c_int = 41;
 const S_IFDIR: u32 = 0o040000;
 const S_IFREG: u32 = 0o100000;
 
-/// The mounted file system's state, reached from WinFsp's threads.
-struct RemoteFs {
-    conn: Connection,
-    rt: tokio::runtime::Handle,
-    /// `struct fuse *`, known once mounted (to unmount).
-    fuse: AtomicPtr<c_void>,
-    mounted: Mutex<Option<mpsc::Sender<()>>>,
+/// `struct fuse *` while WinFsp runs the file system (to stop it).
+#[derive(Default)]
+struct FuseSlot {
+    ptr: usize,
+    stopping: bool,
 }
 
-impl RemoteFs {
+/// The mounted file system, reached from WinFsp's threads. Every call goes
+/// to the service over stdout and is answered on stdin.
+struct PipeFs {
+    out: Mutex<io::Stdout>,
+    next_id: AtomicU64,
+    waiting: Mutex<HashMap<u64, mpsc::Sender<Option<pb::FsReply>>>>,
+    /// The service closed stdin (unmount) or went away.
+    closed: AtomicBool,
+    fuse: Mutex<FuseSlot>,
+    inited: Mutex<Option<mpsc::Sender<()>>>,
+}
+
+static FS: OnceLock<PipeFs> = OnceLock::new();
+
+fn fs() -> &'static PipeFs {
+    FS.get().expect("mount process")
+}
+
+impl PipeFs {
     fn call(&self, path: &str, op: Op) -> std::result::Result<pb::FsReply, c_int> {
         let req = pb::FsRequest { path: path.to_owned(), op: Some(op) };
-        let conn = self.conn.clone();
-        let r = self.rt.block_on(async move { tokio::time::timeout(Duration::from_secs(30), nya_transport::folders::call(&conn, &req)).await });
-        let reply = match r {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                tracing::debug!("folder request {path}: {e:#}");
-                return Err(-EIO);
-            }
-            Err(_) => {
-                tracing::warn!("folder request {path}: no answer in 30 s");
-                return Err(-EIO);
-            }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel();
+        self.waiting.lock().unwrap().insert(id, tx);
+        // Checked after registering: closing empties `waiting` after setting it.
+        let reply = if self.closed.load(Ordering::SeqCst) {
+            None
+        } else if write_frame(&mut *self.out.lock().unwrap(), TO_SERVICE_REQUEST, id, &req.encode_to_vec()).is_err() {
+            None
+        } else {
+            // The service gives up after 30 s and says so.
+            rx.recv_timeout(Duration::from_secs(40)).ok().flatten()
+        };
+        self.waiting.lock().unwrap().remove(&id);
+        let Some(reply) = reply else {
+            tracing::debug!("folder request {path}: no answer");
+            return Err(-EIO);
         };
         match FsError::try_from(reply.error).unwrap_or(FsError::FsIo) {
             FsError::FsOk => Ok(reply),
@@ -269,6 +339,38 @@ impl RemoteFs {
             FsError::FsInvalid => Err(-EINVAL),
             FsError::FsNoSpace => Err(-ENOSPC),
             FsError::FsIo => Err(-EIO),
+        }
+    }
+
+    /// Answers from the service, until it closes stdin; then unmount.
+    fn read_replies(&self) {
+        let mut input = io::stdin().lock();
+        while let Ok((kind, id, payload)) = read_frame(&mut input) {
+            let reply = (kind == TO_MOUNT_REPLY).then(|| pb::FsReply::decode(&payload[..]).ok()).flatten();
+            if let Some(tx) = self.waiting.lock().unwrap().remove(&id) {
+                let _ = tx.send(reply);
+            }
+        }
+        tracing::info!("service closed the pipe: unmounting");
+        self.closed.store(true, Ordering::SeqCst);
+        self.waiting.lock().unwrap().clear(); // waiting calls fail
+        self.stop_if_closed();
+    }
+
+    /// Stop WinFsp's loop once the service is gone (WinFsp may not have
+    /// started it yet; called again from `init`).
+    fn stop_if_closed(&self) {
+        if !self.closed.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut f = self.fuse.lock().unwrap();
+        if f.ptr != 0 && !f.stopping {
+            f.stopping = true;
+            if let Ok(api) = api() {
+                // SAFETY: WinFsp's `struct fuse *`, cleared by `destroy` (under
+                // this lock) before WinFsp frees it.
+                unsafe { (api.exit)(&ENV, f.ptr as *mut c_void) };
+            }
         }
     }
 }
@@ -292,13 +394,6 @@ fn fill_stat(a: &pb::FsAttr, st: &mut FuseStat) {
     st.st_atim = ts(if a.atime_us != 0 { a.atime_us } else { a.mtime_us });
     st.st_ctim = ts(a.mtime_us);
     st.st_birthtim = ts(if a.ctime_us != 0 { a.ctime_us } else { a.mtime_us });
-}
-
-/// The file system of the current WinFsp call.
-unsafe fn fs<'a>() -> &'a RemoteFs {
-    let api = api().expect("WinFsp loaded");
-    let ctx = (api.get_context)(&ENV);
-    &*((*ctx).private_data as *const RemoteFs)
 }
 
 unsafe fn path<'a>(p: Path) -> std::borrow::Cow<'a, str> {
@@ -456,12 +551,19 @@ unsafe extern "C" fn op_utimens(p: Path, tv: *const FuseTimespec) -> c_int {
 unsafe extern "C" fn op_init(_conn: *mut c_void) -> *mut c_void {
     let api = api().expect("WinFsp loaded");
     let ctx = (api.get_context)(&ENV);
-    let fs = &*((*ctx).private_data as *const RemoteFs);
-    fs.fuse.store((*ctx).fuse, Ordering::SeqCst);
-    if let Some(tx) = fs.mounted.lock().unwrap().take() {
+    let fs = fs();
+    fs.fuse.lock().unwrap().ptr = (*ctx).fuse as usize;
+    if let Some(tx) = fs.inited.lock().unwrap().take() {
         let _ = tx.send(());
     }
+    // Unmounted before WinFsp got here: it stops right after starting.
+    fs.stop_if_closed();
     (*ctx).private_data
+}
+
+unsafe extern "C" fn op_destroy(_data: *mut c_void) {
+    // WinFsp frees `struct fuse` next.
+    fs().fuse.lock().unwrap().ptr = 0;
 }
 
 fn operations() -> FuseOperations {
@@ -484,28 +586,61 @@ fn operations() -> FuseOperations {
         statfs: Some(op_statfs),
         utimens: Some(op_utimens),
         init: Some(op_init),
+        destroy: Some(op_destroy),
         ..Default::default()
     }
 }
 
-// ---------------------------------------------------------------- mounting
-
-/// A mounted drive; unmounted by [`Mount::unmount`] (or on drop).
-pub struct Mount {
-    fs: Arc<RemoteFs>,
-    done: mpsc::Receiver<c_int>,
-    pub point: String,
+/// `nya-server-svc.exe folders`: mount the drive and serve it until the
+/// service closes stdin. Returns WinFsp's exit code.
+pub fn run_mount_process(point: &str, volname: &str) -> Result<i32> {
+    let api = api()?;
+    let (inited_tx, inited) = mpsc::channel();
+    FS.get_or_init(|| PipeFs {
+        out: Mutex::new(io::stdout()),
+        next_id: AtomicU64::new(1),
+        waiting: Mutex::new(HashMap::new()),
+        closed: AtomicBool::new(false),
+        fuse: Mutex::new(FuseSlot::default()),
+        inited: Mutex::new(Some(inited_tx)),
+    });
+    std::thread::Builder::new().name("replies".into()).spawn(|| fs().read_replies())?;
+    // `init` runs before WinFsp creates the volume and the drive letter:
+    // "mounted" only once the letter is really there.
+    let watched = point.to_owned();
+    std::thread::Builder::new().name("mount watch".into()).spawn(move || {
+        if inited.recv().is_err() {
+            return;
+        }
+        let until = std::time::Instant::now() + Duration::from_secs(20);
+        while !drive_exists(&watched) {
+            if std::time::Instant::now() >= until {
+                tracing::warn!("{watched} did not appear in 20 s");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        tracing::info!("{watched} mounted");
+        let _ = write_frame(&mut *fs().out.lock().unwrap(), TO_SERVICE_MOUNTED, 0, &[]);
+    })?;
+    let opts =
+        format!("uid=-1,gid=-1,umask=0,FileInfoTimeout=1000,DirInfoTimeout=1000,VolumeInfoTimeout=5000,volname={volname}");
+    let args: Vec<CString> = ["nya-remote-folders", "-o", &opts, point].iter().map(|a| CString::new(*a).unwrap()).collect();
+    let mut argv: Vec<*mut c_char> = args.iter().map(|a| a.as_ptr() as *mut c_char).collect();
+    let ops = operations();
+    // SAFETY: argv and ops outlive the call; the file system is the global `FS`.
+    let code = unsafe {
+        (api.main_real)(&ENV, argv.len() as c_int, argv.as_mut_ptr(), &ops, std::mem::size_of::<FuseOperations>(), std::ptr::null_mut())
+    };
+    tracing::info!("WinFsp finished ({code})");
+    Ok(code)
 }
+
+// ---------------------------------------------------------------- mounting (service)
 
 /// First free drive letter from Z: down to D:.
 fn free_drive() -> Option<String> {
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn GetLogicalDrives() -> u32;
-    }
-    // SAFETY: no arguments.
-    let used = unsafe { GetLogicalDrives() };
-    (3..26u32).rev().find(|i| used & (1 << i) == 0).map(|i| format!("{}:", (b'A' + i as u8) as char))
+    (3..26u8).rev().map(|i| format!("{}:", (b'A' + i) as char)).find(|p| !drive_exists(p))
 }
 
 /// Volume label: ASCII letters and digits of `name`, at most 32 characters.
@@ -514,58 +649,159 @@ fn label(name: &str) -> String {
     if clean.is_empty() { "NyaRemote".into() } else { format!("NyaRemote-{clean}") }
 }
 
+enum ToMount {
+    Frame(u8, u64, Vec<u8>),
+    /// Close stdin: the mount process unmounts and exits.
+    Close,
+}
+
+enum Event {
+    Mounted,
+    /// The mount process exited (its exit code).
+    Ended(Option<i32>),
+}
+
+/// A mounted drive, served by a mount process; unmounted by
+/// [`Mount::unmount`] (or on drop).
+///
+/// WinFsp's FUSE loop runs `FspServiceRun` on a thread of its own and ends
+/// the file system when that thread does. In a process that already is a
+/// service (ours) that thread fails at once (the process's service control
+/// dispatcher is taken), so the drive vanished right after it was created.
+/// A child process is no service: WinFsp runs it in console mode, as with
+/// WinFsp's own launcher. As LocalSystem's child its drive letter is still
+/// global (visible in the user's session).
+pub struct Mount {
+    pub point: String,
+    child: Arc<Mutex<Child>>,
+    to_mount: mpsc::Sender<ToMount>,
+    events: Mutex<mpsc::Receiver<Event>>,
+    closing: Arc<AtomicBool>,
+    ended: Arc<AtomicBool>,
+}
+
 impl Mount {
-    /// Mount the client's folders (answered over `conn`) on a free drive letter.
-    pub fn start(conn: Connection, rt: tokio::runtime::Handle, client_name: &str) -> Result<Mount> {
-        let api = api()?;
+    /// Mount the client's folders (answered over `conn`) on a free drive
+    /// letter. `on_end` hears why if the drive goes away later on its own.
+    pub fn start(
+        conn: Connection,
+        rt: tokio::runtime::Handle,
+        client_name: &str,
+        on_end: impl FnOnce(String) + Send + 'static,
+    ) -> Result<Mount> {
+        use std::os::windows::process::CommandExt;
+        api()?; // installed? (the mount process loads it itself)
         let point = free_drive().ok_or_else(|| anyhow!("被控端没有空闲的盘符"))?;
-        let (mounted_tx, mounted_rx) = mpsc::channel();
-        let fs = Arc::new(RemoteFs { conn, rt, fuse: AtomicPtr::new(std::ptr::null_mut()), mounted: Mutex::new(Some(mounted_tx)) });
-        let opts = format!(
-            "uid=-1,gid=-1,umask=0,FileInfoTimeout=1000,DirInfoTimeout=1000,VolumeInfoTimeout=5000,volname={}",
-            label(client_name)
-        );
-        let args: Vec<CString> = ["nya-remote-folders", "-o", &opts, &point].iter().map(|a| CString::new(*a).unwrap()).collect();
-        let (done_tx, done) = mpsc::channel();
-        let data = Arc::into_raw(fs.clone()) as usize;
-        std::thread::Builder::new().name("nya-folders".into()).spawn(move || {
-            let ops = operations();
-            let mut argv: Vec<*mut c_char> = args.iter().map(|a| a.as_ptr() as *mut c_char).collect();
-            // SAFETY: argv and ops outlive the call; `data` is an Arc<RemoteFs>
-            // reference released below, after WinFsp has stopped calling us.
-            let code = unsafe {
-                (api.main_real)(&ENV, argv.len() as c_int, argv.as_mut_ptr(), &ops, std::mem::size_of::<FuseOperations>(), data as *mut c_void)
-            };
-            unsafe { drop(Arc::from_raw(data as *const RemoteFs)) };
-            let _ = done_tx.send(code);
+        let exe = std::env::current_exe()?;
+        let mut child = Command::new(exe)
+            .args(["folders", "--point", &point, "--label", &label(client_name)])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .spawn()
+            .map_err(|e| anyhow!("无法启动挂载进程：{e}"))?;
+        let (stdin, stdout, stderr) = (child.stdin.take().unwrap(), child.stdout.take().unwrap(), child.stderr.take().unwrap());
+        let child = Arc::new(Mutex::new(child));
+
+        std::thread::Builder::new().name("folders stderr".into()).spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(|l| l.ok()) {
+                tracing::warn!("mount process: {line}");
+            }
         })?;
-        match mounted_rx.recv_timeout(Duration::from_secs(15)) {
-            Ok(()) => Ok(Mount { fs, done, point }),
-            Err(_) => match done.try_recv() {
-                Ok(code) => bail!("WinFsp 挂载 {point} 失败（代码 {code}）"),
-                Err(_) => {
-                    let m = Mount { fs, done, point: point.clone() };
-                    m.unmount();
-                    bail!("WinFsp 挂载 {point} 超时")
+
+        let (to_mount, rx) = mpsc::channel::<ToMount>();
+        std::thread::Builder::new().name("folders out".into()).spawn(move || {
+            let mut w = stdin;
+            for m in rx {
+                match m {
+                    ToMount::Frame(kind, id, p) => {
+                        if write_frame(&mut w, kind, id, &p).is_err() {
+                            break;
+                        }
+                    }
+                    ToMount::Close => break,
                 }
-            },
+            }
+        })?;
+
+        let (events_tx, events) = mpsc::channel();
+        let (closing, ended) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        {
+            let (to_mount, child, closing, ended, point) = (to_mount.clone(), child.clone(), closing.clone(), ended.clone(), point.clone());
+            std::thread::Builder::new().name("folders in".into()).spawn(move || {
+                let mut input = BufReader::new(stdout);
+                let mut mounted = false;
+                while let Ok((kind, id, payload)) = read_frame(&mut input) {
+                    match kind {
+                        TO_SERVICE_REQUEST => {
+                            let (conn, to_mount) = (conn.clone(), to_mount.clone());
+                            rt.spawn(async move {
+                                let frame = match answer(&conn, &payload).await {
+                                    Some(r) => ToMount::Frame(TO_MOUNT_REPLY, id, r.encode_to_vec()),
+                                    None => ToMount::Frame(TO_MOUNT_FAILED, id, Vec::new()),
+                                };
+                                let _ = to_mount.send(frame);
+                            });
+                        }
+                        TO_SERVICE_MOUNTED => {
+                            mounted = true;
+                            let _ = events_tx.send(Event::Mounted);
+                        }
+                        _ => {}
+                    }
+                }
+                drop(to_mount);
+                let code = wait_exit(&child);
+                ended.store(true, Ordering::SeqCst);
+                let _ = events_tx.send(Event::Ended(code));
+                if mounted && !closing.load(Ordering::SeqCst) {
+                    tracing::warn!("{point} went away (mount process ended: {code:?})");
+                    on_end(format!("被控端的 {point} 盘意外卸载了（WinFsp 代码 {}）", code.map_or("?".into(), |c| c.to_string())));
+                }
+            })?;
+        }
+
+        let m = Mount { point, child, to_mount, events: Mutex::new(events), closing, ended };
+        let first = m.events.lock().unwrap().recv_timeout(Duration::from_secs(25));
+        match first {
+            Ok(Event::Mounted) => Ok(m),
+            Ok(Event::Ended(code)) => {
+                m.closing.store(true, Ordering::SeqCst);
+                bail!("WinFsp 挂载 {} 失败（代码 {}）", m.point, code.map_or("?".into(), |c| c.to_string()))
+            }
+            Err(_) => {
+                m.unmount();
+                bail!("WinFsp 挂载 {} 超时", m.point)
+            }
         }
     }
 
-    /// Unmount and wait (briefly) for WinFsp to finish.
+    /// The mount process is gone (the drive with it).
+    pub fn ended(&self) -> bool {
+        self.ended.load(Ordering::SeqCst)
+    }
+
+    /// Unmount and wait (briefly) for the mount process to finish.
     pub fn unmount(&self) {
-        let fuse = self.fs.fuse.swap(std::ptr::null_mut(), Ordering::SeqCst);
-        if fuse.is_null() {
+        if self.closing.swap(true, Ordering::SeqCst) || self.ended.load(Ordering::SeqCst) {
             return;
         }
-        if let Ok(api) = api() {
-            // SAFETY: the `struct fuse *` WinFsp handed to init, still mounted.
-            unsafe { (api.exit)(&ENV, fuse) };
+        let _ = self.to_mount.send(ToMount::Close);
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        let events = self.events.lock().unwrap();
+        loop {
+            match events.recv_timeout(until.saturating_duration_since(std::time::Instant::now())) {
+                Ok(Event::Ended(code)) => {
+                    tracing::info!("unmounted {} ({code:?})", self.point);
+                    return;
+                }
+                Ok(Event::Mounted) => {}
+                Err(_) => break,
+            }
         }
-        match self.done.recv_timeout(Duration::from_secs(10)) {
-            Ok(code) => tracing::info!("unmounted {} ({code})", self.point),
-            Err(_) => tracing::warn!("unmounting {} is taking long", self.point),
-        }
+        tracing::warn!("unmounting {} is taking long: ending the mount process", self.point);
+        let _ = self.child.lock().unwrap().kill();
     }
 }
 
@@ -573,6 +809,33 @@ impl Drop for Mount {
     fn drop(&mut self) {
         self.unmount();
     }
+}
+
+/// Ask the client (FsRequest bytes from the mount process); `None` = no answer.
+async fn answer(conn: &Connection, req: &[u8]) -> Option<pb::FsReply> {
+    let req = pb::FsRequest::decode(req).ok()?;
+    match tokio::time::timeout(Duration::from_secs(30), nya_transport::folders::call(conn, &req)).await {
+        Ok(Ok(r)) => Some(r),
+        Ok(Err(e)) => {
+            tracing::debug!("folder request {}: {e:#}", req.path);
+            None
+        }
+        Err(_) => {
+            tracing::warn!("folder request {}: no answer in 30 s", req.path);
+            None
+        }
+    }
+}
+
+/// The exit code of a process that closed its stdout (waited for briefly).
+fn wait_exit(child: &Mutex<Child>) -> Option<i32> {
+    for _ in 0..100 {
+        if let Ok(Some(s)) = child.lock().unwrap().try_wait() {
+            return s.code();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    None
 }
 
 #[cfg(test)]
@@ -592,6 +855,24 @@ mod tests {
         assert_eq!(std::mem::offset_of!(FuseOperations, flags), 38 * 8);
         assert_eq!(std::mem::offset_of!(FuseOperations, ioctl), 39 * 8);
         assert_eq!(std::mem::size_of::<FuseOperations>(), 58 * 8);
+    }
+
+    #[test]
+    fn frames_and_drives() {
+        let mut b = Vec::new();
+        write_frame(&mut b, TO_SERVICE_REQUEST, 7, b"abc").unwrap();
+        write_frame(&mut b, TO_SERVICE_MOUNTED, 0, &[]).unwrap();
+        let mut r = &b[..];
+        assert_eq!(read_frame(&mut r).unwrap(), (TO_SERVICE_REQUEST, 7, b"abc".to_vec()));
+        assert_eq!(read_frame(&mut r).unwrap(), (TO_SERVICE_MOUNTED, 0, Vec::new()));
+        assert!(read_frame(&mut r).is_err(), "end of stream");
+        let mut huge = vec![1u8];
+        huge.extend_from_slice(&0u64.to_le_bytes());
+        huge.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(read_frame(&mut &huge[..]).is_err());
+        let system = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+        assert!(drive_exists(&system) && drive_exists(&system.to_lowercase()));
+        assert!(free_drive().is_some_and(|p| !drive_exists(&p)));
     }
 
     #[test]

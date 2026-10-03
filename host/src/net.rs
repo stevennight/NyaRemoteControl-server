@@ -227,7 +227,21 @@ fn apply_folders(
             pb::FolderMountStatus { mounted: true, mount_point: cur.point.clone(), message: String::new() }
         } else {
             let rt = tokio::runtime::Handle::current();
-            let r = tokio::task::spawn_blocking(move || crate::winfsp::Mount::start(conn, rt, &client)).await;
+            // The drive going away on its own: the client hears it.
+            let on_end = {
+                let (mount, ctl_tx, hub, rt) = (mount.clone(), ctl_tx.clone(), hub.clone(), rt.clone());
+                move |message: String| {
+                    rt.spawn(async move {
+                        let mut m = mount.lock().await;
+                        let Some(point) = m.as_ref().filter(|m| m.ended()).map(|m| m.point.clone()) else { return };
+                        m.take();
+                        announce_drive(&hub, &point, false);
+                        let status = pb::FolderMountStatus { mounted: false, mount_point: String::new(), message };
+                        let _ = ctl_tx.send(ctl(Msg::FolderMountStatus(status))).await;
+                    });
+                }
+            };
+            let r = tokio::task::spawn_blocking(move || crate::winfsp::Mount::start(conn, rt, &client, on_end)).await;
             match r.map_err(anyhow::Error::from).and_then(|r| r) {
                 Ok(new) => {
                     tracing::info!("client folders mounted on {} ({} folder(s))", new.point, want.folders.len());
