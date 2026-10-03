@@ -42,7 +42,10 @@ message DriveChanged {
 message ControllerChanged {}
 
 // The client copied files: put them on the host clipboard (fetched when pasted).
-message ClipboardOffer { uint64 transfer_id = 1; }
+message ClipboardOffer {
+  uint64 transfer_id = 1;
+  repeated nya.v1.FileEntry files = 2;  // what was copied (shown as virtual files)
+}
 // Answer to ClipboardPaste: the files are local now (paths), or `error`.
 message ClipboardPasteDone {
   uint64 transfer_id = 1;

@@ -523,7 +523,7 @@ impl Session {
     /// The host copied files: they are on our clipboard now.
     pub fn on_clip_offer(&mut self, o: pb::FileOffer) {
         let Some(tx) = &self.clip_tx else { return self.on_offer(o) };
-        let _ = tx.send(ClipIn::Offer(o.transfer_id));
+        let _ = tx.send(ClipIn::Offer(o.transfer_id, crate::clipboard::virtual_files(&o.files)));
         let top = o.files.iter().filter(|f| !f.path.contains('/')).count().max(1);
         self.notice(format!("被控端复制了 {top} 项，可以在本机粘贴"), Duration::from_secs(4));
     }

@@ -119,7 +119,7 @@ pub fn run(mut commands: mpsc::UnboundedReceiver<HostCommand>, events: mpsc::Sen
                 let _ = clip_tx.send(clipboard::ClipCmd::SetFiles(f.paths));
             }
             Cmd::ClipboardOffer(o) => {
-                let _ = clip_tx.send(clipboard::ClipCmd::Offer(o.transfer_id));
+                let _ = clip_tx.send(clipboard::ClipCmd::Offer(o.transfer_id, o.files));
             }
             Cmd::ClipboardPasteDone(d) => {
                 let r = if d.error.is_empty() { Ok(d.paths) } else { Err(d.error) };

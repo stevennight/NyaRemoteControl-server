@@ -21,8 +21,8 @@ const MAX_IMAGE: usize = 64 << 20;
 pub enum ClipIn {
     Text(String),
     Image(Vec<u8>),
-    /// The host copied files (offer id): put them on our clipboard.
-    Offer(u64),
+    /// The host copied files (offer id, what they are): put them on our clipboard.
+    Offer(u64, Vec<nya_win::clipboard_files::VirtualFile>),
 }
 
 /// How long a paste may wait for the host's files.
@@ -42,6 +42,18 @@ fn provider(id: u64, net: UnboundedSender<NetCmd>) -> nya_win::clipboard_files::
     })
 }
 
+/// An offer's list as virtual files.
+pub fn virtual_files(files: &[pb::FileEntry]) -> Vec<nya_win::clipboard_files::VirtualFile> {
+    files
+        .iter()
+        .map(|f| nya_win::clipboard_files::VirtualFile {
+            path: if f.path.is_empty() { f.name.clone() } else { f.path.clone() },
+            size: f.size,
+            dir: f.is_dir,
+        })
+        .collect()
+}
+
 fn hash(b: &[u8]) -> u64 {
     let mut h = DefaultHasher::new();
     b.hash(&mut h);
@@ -57,6 +69,9 @@ pub fn spawn(remote: Receiver<ClipIn>, net: UnboundedSender<NetCmd>, files: bool
             let mut last_text: Option<String> = None;
             let mut last_image: Option<u64> = None;
             let virtual_files = files.then(nya_win::clipboard_files::VirtualClipboard::start);
+            // Copied files that could not be read yet (clipboard busy: other
+            // programs read every change too): tries left.
+            let mut file_retries = 0u32;
             loop {
                 let applied = match remote.recv_timeout(Duration::from_millis(300)) {
                     Ok(ClipIn::Text(text)) => {
@@ -72,9 +87,9 @@ pub fn spawn(remote: Receiver<ClipIn>, net: UnboundedSender<NetCmd>, files: bool
                         last_image = Some(hash(&dib));
                         clipboard::set_dib(&dib).is_ok()
                     }
-                    Ok(ClipIn::Offer(id)) => {
+                    Ok(ClipIn::Offer(id, files)) => {
                         if let Some(v) = &virtual_files {
-                            v.offer(provider(id, net.clone()));
+                            v.offer(files, provider(id, net.clone()));
                         }
                         false
                     }
@@ -85,8 +100,15 @@ pub fn spawn(remote: Receiver<ClipIn>, net: UnboundedSender<NetCmd>, files: bool
                     last_seq = clipboard::sequence_number();
                 }
                 let seq = clipboard::sequence_number();
-                if seq == last_seq {
-                    continue;
+                // Reading again copied files the clipboard was too busy for.
+                let retry = seq == last_seq;
+                if retry {
+                    if file_retries == 0 {
+                        continue;
+                    }
+                    file_retries -= 1;
+                } else {
+                    file_retries = 0;
                 }
                 last_seq = seq;
                 let ours = virtual_files.as_ref().is_some_and(|v| v.is_ours());
@@ -96,8 +118,22 @@ pub fn spawn(remote: Receiver<ClipIn>, net: UnboundedSender<NetCmd>, files: bool
                 } else if files && clipboard::has_files() {
                     match clipboard::get_files() {
                         // Every copy is a new offer (the clipboard changed), even of the same files.
-                        Ok(Some(paths)) if !paths.is_empty() => Some(NetCmd::OfferFiles(paths)),
-                        _ => None,
+                        Ok(Some(paths)) if !paths.is_empty() => {
+                            file_retries = 0;
+                            Some(NetCmd::OfferFiles(paths))
+                        }
+                        Err(e) => {
+                            if !retry {
+                                file_retries = 10;
+                            } else if file_retries == 0 {
+                                tracing::warn!("copied files not offered: {e:#}");
+                            }
+                            None
+                        }
+                        _ => {
+                            file_retries = 0;
+                            None
+                        }
                     }
                 } else if clipboard::has_text() {
                     match clipboard::get_text() {

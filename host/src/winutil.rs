@@ -202,6 +202,30 @@ pub fn console_user_token() -> Option<Handle> {
     Some(Handle(token))
 }
 
+/// Run `f` on this thread as the user logged on at the console: their
+/// mapped drives, network shares and folder permissions (the service itself
+/// is SYSTEM in session 0). As ourselves where there is no such user
+/// (standalone mode, nobody logged on).
+pub fn as_console_user<T>(f: impl FnOnce() -> T) -> T {
+    use windows::Win32::Security::{ImpersonateLoggedOnUser, RevertToSelf};
+    struct Revert;
+    impl Drop for Revert {
+        fn drop(&mut self) {
+            // SAFETY: ends the impersonation started below on this thread.
+            unsafe {
+                let _ = RevertToSelf();
+            }
+        }
+    }
+    let Some(token) = console_user_token() else { return f() };
+    // SAFETY: a token handle we own, for this thread only.
+    if unsafe { ImpersonateLoggedOnUser(token.0) }.is_err() {
+        return f();
+    }
+    let _revert = Revert;
+    f()
+}
+
 /// Folder for files received from the client: the console user's
 /// `Downloads\NyaRemoteControl` (or the current user's in standalone mode).
 /// The console user's paste cache (`%LOCALAPPDATA%\NyaRemoteControl\clipboard`):

@@ -24,8 +24,8 @@ pub enum ClipCmd {
     Set(String),
     SetImage(Vec<u8>),
     SetFiles(Vec<String>),
-    /// The client copied files (offer id): put them on the clipboard.
-    Offer(u64),
+    /// The client copied files (offer id, what they are): put them on the clipboard.
+    Offer(u64, Vec<pb::FileEntry>),
     /// The files of a paste in progress are here (or not).
     PasteDone(u64, Result<Vec<String>, String>),
     Enable(bool),
@@ -53,6 +53,9 @@ pub fn thread(rx: Receiver<ClipCmd>, sink: Sink) {
     let mut last_image: Option<u64> = None;
     let virtual_files = nya_win::clipboard_files::VirtualClipboard::start();
     let waiters: Waiters = Default::default();
+    // Copied files that could not be read yet (clipboard busy: other
+    // programs read every change too): tries left.
+    let mut file_retries = 0u32;
     let fail_all = |w: &Waiters, msg: &str| {
         for (_, tx) in w.lock().unwrap().drain() {
             let _ = tx.send(Err(msg.to_owned()));
@@ -77,9 +80,17 @@ pub fn thread(rx: Receiver<ClipCmd>, sink: Sink) {
                 let list: Vec<std::path::PathBuf> = paths.iter().map(Into::into).collect();
                 Some(clipboard::set_files(&list))
             }
-            Ok(ClipCmd::Offer(id)) => {
+            Ok(ClipCmd::Offer(id, entries)) => {
                 let (sink, waiters) = (sink.clone(), waiters.clone());
-                virtual_files.offer(std::sync::Arc::new(move || {
+                let files = entries
+                    .iter()
+                    .map(|f| nya_win::clipboard_files::VirtualFile {
+                        path: if f.path.is_empty() { f.name.clone() } else { f.path.clone() },
+                        size: f.size,
+                        dir: f.is_dir,
+                    })
+                    .collect();
+                virtual_files.offer(files, std::sync::Arc::new(move || {
                     let (tx, rx) = std::sync::mpsc::channel();
                     waiters.lock().unwrap().insert(id, tx);
                     tracing::info!("client files pasted on the host; fetching (offer {id:016x})");
@@ -119,20 +130,38 @@ pub fn thread(rx: Receiver<ClipCmd>, sink: Sink) {
             continue;
         }
         let seq = clipboard::sequence_number();
-        if seq == last_seq {
-            continue;
+        // Reading again copied files the clipboard was too busy for.
+        let retry = seq == last_seq;
+        if retry {
+            if file_retries == 0 {
+                continue;
+            }
+            file_retries -= 1;
+        } else {
+            file_retries = 0;
         }
         last_seq = seq;
 
         if virtual_files.is_ours() {
             // The client's own files (not yet fetched): nothing to offer back.
         } else if clipboard::has_files() {
-            if let Ok(Some(files)) = clipboard::get_files() {
-                let paths: Vec<String> = files.iter().map(|p| p.to_string_lossy().into_owned()).collect();
-                // Every copy is a new offer (the clipboard changed), even of the same files.
-                if !paths.is_empty() {
-                    sink.send(Ev::ClipboardFiles(ClipboardFiles { paths }));
+            match clipboard::get_files() {
+                Ok(Some(files)) => {
+                    file_retries = 0;
+                    let paths: Vec<String> = files.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+                    // Every copy is a new offer (the clipboard changed), even of the same files.
+                    if !paths.is_empty() {
+                        sink.send(Ev::ClipboardFiles(ClipboardFiles { paths }));
+                    }
                 }
+                Err(e) => {
+                    if !retry {
+                        file_retries = 10;
+                    } else if file_retries == 0 {
+                        tracing::warn!("copied files not offered: {e:#}");
+                    }
+                }
+                Ok(None) => file_retries = 0,
             }
         } else if clipboard::has_text() {
             if let Ok(Some(text)) = clipboard::get_text() {

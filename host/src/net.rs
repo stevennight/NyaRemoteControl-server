@@ -533,7 +533,7 @@ async fn run_session(
                     Some(Msg::FileOffer(o)) if clip_files_on && in_control => {
                         tracing::info!("client copied {} item(s) (offer {:016x})", o.files.len(), o.transfer_id);
                         incoming.register(&o, &clip_cache);
-                        hub.send(Cmd::ClipboardOffer(crate::ipc_pb::ClipboardOffer { transfer_id: o.transfer_id }));
+                        hub.send(Cmd::ClipboardOffer(crate::ipc_pb::ClipboardOffer { transfer_id: o.transfer_id, files: o.files.clone() }));
                     }
                     Some(Msg::FileResult(r)) if !r.ok => {
                         if let Some(Err(e)) = incoming.fail(r.transfer_id, r.message.clone()) {
@@ -653,9 +653,11 @@ async fn run_session(
                     }
                     Some(Ev::ClipboardFiles(f)) if files_on => {
                         let paths: Vec<std::path::PathBuf> = f.paths.iter().map(std::path::PathBuf::from).collect();
-                        match offers.offer(&paths, clip_files_on) {
+                        let count = paths.len();
+                        let items = tokio::task::spawn_blocking(move || user_items(&paths, clip_files_on)).await.unwrap_or_default();
+                        match offers.offer_items(items) {
                             Some(o) => { let _ = ctl_tx.send(ctl(Msg::FileOffer(o))).await; }
-                            None => tracing::info!("nothing to offer from {} copied item(s)", paths.len()),
+                            None => tracing::info!("nothing to offer from {count} copied item(s)"),
                         }
                     }
                     Some(Ev::ClipboardPaste(p)) => {
@@ -911,6 +913,19 @@ async fn cursor_writer(conn: Connection, mut rx: mpsc::Receiver<pb::CursorMsg>) 
 }
 
 /// Accept client uni streams; the input stream feeds the host.
+/// The user's copied files as the user sees them (mapped drives, shares),
+/// else as the service does.
+fn user_items(paths: &[std::path::PathBuf], folders: bool) -> Vec<nya_transport::files::Item> {
+    use nya_transport::clipfiles::Outgoing;
+    let items = crate::winutil::as_console_user(|| Outgoing::expand(paths, folders));
+    if items.is_empty() { Outgoing::expand(paths, folders) } else { items }
+}
+
+/// Opens offered files as the logged-on user (else as the service).
+fn user_opener() -> nya_transport::files::Opener {
+    Arc::new(|p: &std::path::Path| crate::winutil::as_console_user(|| std::fs::File::open(p)).or_else(|_| std::fs::File::open(p)))
+}
+
 /// Send files the client asked for (from a FileOffer).
 async fn send_offered(
     conn: Connection,
@@ -920,7 +935,8 @@ async fn send_offered(
     ctl_tx: mpsc::Sender<pb::ControlMsg>,
 ) {
     let files = items.iter().filter(|i| !i.is_dir).count();
-    if let Err(e) = nya_transport::clipfiles::send_items(&conn, id, &items, purpose, |_, _| {}).await {
+    let open = user_opener();
+    if let Err(e) = nya_transport::clipfiles::send_items_with(&conn, id, &items, purpose, Some(&open), |_, _| {}).await {
         tracing::warn!("sending offer {id:016x}: {e:#}");
         let _ = ctl_tx
             .send(ctl(Msg::FileResult(pb::FileResult {
