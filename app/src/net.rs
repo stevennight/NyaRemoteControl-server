@@ -255,6 +255,9 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
     let clip_on = files_on && neg.has(Feature::ClipboardFiles);
     let file_flags = (files_on, images_on, clip_on, neg.has(Feature::Print));
     let downloads = Arc::new(crate::transfer::Downloads::default());
+    // Where files go: the TCP file channel once the host offered it and it
+    // is up (FEATURE_TCP_FILES), FILE streams on this connection until then.
+    let files_link = nya_transport::files::FileLink::new(conn.clone());
     let uni = tokio::spawn(accept_uni(
         conn.clone(),
         sinks.video.clone(),
@@ -262,12 +265,10 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
         sinks.stats.clone(),
         sinks.clip.clone(),
         downloads.clone(),
+        files_link.cancels().clone(),
         file_flags,
         neg.has(Feature::MultiStream),
     ));
-    // Where files go: the TCP file channel once the host offered it and it
-    // is up (FEATURE_TCP_FILES), FILE streams on this connection until then.
-    let files_link = nya_transport::files::FileLink::new(conn.clone());
     let mut file_channel_task: Option<tokio::task::JoinHandle<()>> = None;
     // Control messages from spawned tasks (failed clipboard sends).
     let (internal_tx, mut internal_rx) = mpsc::unbounded_channel::<pb::ControlMsg>();
@@ -358,18 +359,22 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
                     }
                     Some(Msg::UsbStatus(u)) => sinks.ui.send(UiEvent::UsbStatus(u)),
                     Some(Msg::FolderMountStatus(s)) => sinks.ui.send(UiEvent::FolderMount(s)),
+                    Some(Msg::FileCancel(c)) => {
+                        tracing::info!("the host cancelled transfer {:016x}", c.transfer_id);
+                        cancel_transfer(&files_link, &sinks.clip, c.transfer_id, "被控端取消了传输");
+                    }
                     Some(Msg::FileChannel(fc)) if neg.has(Feature::TcpFiles) => {
                         // Same address and port as QUIC (a port forward needs both).
                         let addr = conn.remote_address();
                         let (identity, pinned, link) = (p.identity.clone(), p.pinned, files_link.clone());
-                        let (ui, downloads, clip) = (sinks.ui.clone(), downloads.clone(), sinks.clip.clone());
+                        let (ui, downloads, clip, cancels) = (sinks.ui.clone(), downloads.clone(), sinks.clip.clone(), files_link.cancels().clone());
                         if let Some(t) = file_channel_task.take() {
                             t.abort();
                         }
                         file_channel_task = Some(tokio::spawn(async move {
                             let on_file: nya_transport::filechan::OnFile = Arc::new(move |h, mut r| {
-                                let (ui, downloads, clip) = (ui.clone(), downloads.clone(), clip.clone());
-                                tokio::spawn(async move { crate::transfer::receive_body(h, &mut r, ui, downloads, clip, file_flags).await });
+                                let (ui, downloads, clip, cancels) = (ui.clone(), downloads.clone(), clip.clone(), cancels.clone());
+                                tokio::spawn(async move { crate::transfer::receive_body(h, &mut r, ui, downloads, clip, cancels, file_flags).await });
                             });
                             match nya_transport::filechan::connect(addr, &identity, pinned, &fc.token, on_file).await {
                                 Ok(ch) => {
@@ -420,6 +425,13 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
                 Some(NetCmd::SendImage(dib)) => {
                     if images_on {
                         tokio::spawn(crate::transfer::send_image(files_link.clone(), dib));
+                    }
+                }
+                Some(NetCmd::CancelTransfer(id)) => {
+                    tracing::info!("transfer {id:016x} cancelled here");
+                    cancel_transfer(&files_link, &sinks.clip, id, "已取消");
+                    if let Err(e) = write_msg(&mut send, &ctl(Msg::FileCancel(pb::FileCancel { transfer_id: id }))).await {
+                        break End::Lost(format!("control: {e}"));
                     }
                 }
                 Some(NetCmd::OfferFiles(paths)) => {
@@ -482,6 +494,17 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
     end
 }
 
+/// Stop transfer `id` here: sending stops, receiving fails (partial files
+/// removed), a paste waiting for it fails with `why`.
+fn cancel_transfer(link: &nya_transport::files::FileLink, clip: &crate::transfer::ClipFiles, id: u64, why: &str) {
+    link.cancels().cancel(id);
+    if clip.incoming.in_progress(id) {
+        if let Some(done) = clip.incoming.fail(id, why.to_owned()) {
+            clip.finish(id, done);
+        }
+    }
+}
+
 async fn accept_uni(
     conn: Connection,
     video: Arc<VideoRoutes>,
@@ -489,14 +512,15 @@ async fn accept_uni(
     stats: Arc<Shared>,
     clip: Arc<crate::transfer::ClipFiles>,
     downloads: Arc<crate::transfer::Downloads>,
+    cancels: Arc<nya_transport::files::Cancels>,
     flags: (bool, bool, bool, bool),
     multi: bool,
 ) {
     while let Ok(mut r) = conn.accept_uni().await {
-        let (video, ui, stats, downloads, clip) = (video.clone(), ui.clone(), stats.clone(), downloads.clone(), clip.clone());
+        let (video, ui, stats, downloads, clip, cancels) = (video.clone(), ui.clone(), stats.clone(), downloads.clone(), clip.clone(), cancels.clone());
         tokio::spawn(async move {
             match read_varint(&mut r).await {
-                Ok(Some(stream_type::FILE)) => crate::transfer::receive(r, ui, downloads, clip, flags).await,
+                Ok(Some(stream_type::FILE)) => crate::transfer::receive(r, ui, downloads, clip, cancels, flags).await,
                 Ok(Some(stream_type::VIDEO)) => {
                     let Ok(Some(stream_id)) = read_varint(&mut r).await else { return };
                     // With FEATURE_MULTI_STREAM the prelude names the window (slot).

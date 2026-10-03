@@ -17,6 +17,8 @@ pub enum NetCmd {
     OfferFiles(Vec<std::path::PathBuf>),
     /// The host's files (offer id) are being pasted here: fetch them.
     ClipboardPaste(u64, crate::transfer::PasteReply),
+    /// Stop a transfer (both sides), dropping what was received of it.
+    CancelTransfer(u64),
     /// Encoded MIC datagram.
     Mic(Vec<u8>),
     Quit,

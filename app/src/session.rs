@@ -520,6 +520,14 @@ impl Session {
         self.transfers.retain(|t| t.id != id);
     }
 
+    /// Stop a running transfer; its row says so (later progress of it is ignored).
+    pub fn cancel_transfer(&mut self, id: u64) {
+        if let Some(t) = self.transfers.iter_mut().find(|t| t.id == id) {
+            t.state = TransferState::Failed("已取消".into());
+        }
+        let _ = self.net_tx.send(NetCmd::CancelTransfer(id));
+    }
+
     /// The host copied files: they are on our clipboard now.
     pub fn on_clip_offer(&mut self, o: pb::FileOffer) {
         let Some(tx) = &self.clip_tx else { return self.on_offer(o) };
@@ -539,6 +547,8 @@ impl Session {
 
     pub fn on_transfer(&mut self, u: TransferUpdate) {
         let t = match self.transfers.iter_mut().find(|t| t.id == u.id) {
+            // Cancelled here: what the stopping tasks report changes nothing.
+            Some(t) if matches!(&t.state, TransferState::Failed(m) if m == "已取消") => return,
             Some(t) => t,
             None => {
                 self.transfers.push(TransferView {
@@ -581,6 +591,7 @@ impl Session {
             TransferState::Failed(r.message.clone())
         };
         match self.transfers.iter_mut().find(|t| t.id == r.transfer_id) {
+            Some(t) if matches!(&t.state, TransferState::Failed(m) if m == "已取消") => {}
             Some(t) => {
                 t.state = state;
                 if r.ok {

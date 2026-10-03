@@ -349,6 +349,9 @@ async fn run_session(
     // Copy on one side, paste on the other (folders too), both directions.
     let clip_files_on = files_on && neg.has(Feature::ClipboardFiles);
     let incoming = nya_transport::clipfiles::Incoming::default();
+    // Where files go: the TCP file channel once the client has opened it
+    // (FEATURE_TCP_FILES), FILE streams on this connection until then.
+    let link = nya_transport::files::FileLink::new(conn.clone());
     let file_ctx = Arc::new(FileCtx {
         ctl_tx: ctl_tx.clone(),
         files_on,
@@ -357,11 +360,9 @@ async fn run_session(
         incoming: incoming.clone(),
         batches: Default::default(),
         controlling: controlling.clone(),
+        cancels: link.cancels().clone(),
     });
     let input_task = tokio::spawn(client_streams(conn.clone(), hub.clone(), file_ctx.clone()));
-    // Where files go: the TCP file channel once the client has opened it
-    // (FEATURE_TCP_FILES), FILE streams on this connection until then.
-    let link = nya_transport::files::FileLink::new(conn.clone());
     let file_channel_task = match (neg.has(Feature::TcpFiles), peer_fingerprint(conn)) {
         (true, Some(client)) => {
             let place = state.file_channels.expect(client);
@@ -561,6 +562,15 @@ async fn run_session(
                         tracing::info!("client copied {} item(s) (offer {:016x})", o.files.len(), o.transfer_id);
                         incoming.register(&o, &clip_cache);
                         hub.send(Cmd::ClipboardOffer(crate::ipc_pb::ClipboardOffer { transfer_id: o.transfer_id, files: o.files.clone() }));
+                    }
+                    Some(Msg::FileCancel(c)) => {
+                        tracing::info!("the client cancelled transfer {:016x}", c.transfer_id);
+                        link.cancels().cancel(c.transfer_id);
+                        if incoming.in_progress(c.transfer_id) {
+                            if let Some(done) = incoming.fail(c.transfer_id, "客户端取消了传输".into()) {
+                                hub.send(paste_done(c.transfer_id, done));
+                            }
+                        }
                     }
                     Some(Msg::FileResult(r)) if !r.ok => {
                         if let Some(Err(e)) = incoming.fail(r.transfer_id, r.message.clone()) {
@@ -1006,6 +1016,8 @@ struct FileCtx {
     batches: Arc<std::sync::Mutex<std::collections::HashMap<u64, Vec<String>>>>,
     /// This client operates the host (input and files are taken only then).
     controlling: Arc<AtomicBool>,
+    /// Transfers cancelled by the client (FileCancel).
+    cancels: Arc<nya_transport::files::Cancels>,
 }
 
 /// A FILE stream from the client: save an upload, or apply a clipboard image.
@@ -1018,6 +1030,8 @@ async fn receive_file(mut r: RecvStream, hub: Arc<Hub>, ctx: Arc<FileCtx>) -> Re
 /// Returning without reading it refuses it.
 async fn receive_file_body<R: tokio::io::AsyncRead + Unpin>(h: pb::FileHeader, r: &mut R, hub: Arc<Hub>, ctx: Arc<FileCtx>) -> Result<()> {
     use nya_transport::files;
+    // Cancelled by the client: reads fail, partial files are removed.
+    let r = &mut files::Cancellable::new(r, ctx.cancels.flag(h.transfer_id));
     match pb::FilePurpose::try_from(h.purpose).unwrap_or(pb::FilePurpose::Unspecified) {
         pb::FilePurpose::Save if ctx.files_on => {
             let dir = tokio::task::spawn_blocking(crate::winutil::receive_dir).await?;
@@ -1741,6 +1755,57 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    /// The client cancels files the host is pasting: the paste fails at
+    /// once and what had arrived is removed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn client_cancels_a_paste() {
+        let dir = std::env::temp_dir().join(format!("nya-cancel-{}", nya_proto::now_us()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let server_id = server_identity();
+        let server_fp = server_id.fingerprint();
+        let auth = Arc::new(AuthStore::open(&dir).unwrap());
+        let key = auth.key();
+        let (hub, cmd_rx) = Hub::new();
+        let (done_tx, mut done_rx) = mpsc::unbounded_channel();
+        tokio::spawn(pasting_host(hub.clone(), cmd_rx, done_tx));
+        let ep = nya_transport::endpoint::server_endpoint("127.0.0.1:0".parse().unwrap(), &server_id).unwrap();
+        let addr = ep.local_addr().unwrap();
+        let state = State::new(cpb::Mode::Standalone, dir.clone(), Default::default(), server_fp.to_string(), auth, hub);
+        tokio::spawn(serve_endpoint(ep, state));
+        let client_id = Identity::generate().unwrap();
+        let (mut c, _) = connect(addr, &client_id, server_fp).await;
+        assert!(pair(&mut c, &client_id, server_fp, &key).await.ok);
+        c.conn.close(0u32.into(), b"");
+        let (mut c, _) = connect(addr, &client_id, server_fp).await;
+
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.txt"), b"first").unwrap();
+        std::fs::write(src.join("b.bin"), vec![0u8; 1 << 20]).unwrap();
+        let mut outgoing = nya_transport::clipfiles::Outgoing::default();
+        let offer = outgoing.offer(&[src.join("a.txt"), src.join("b.bin")], true).unwrap();
+        let id = offer.transfer_id;
+        write_msg(&mut c.send, &ctl(Msg::FileOffer(offer))).await.unwrap();
+        loop {
+            let m: pb::ControlMsg = timeout(Duration::from_secs(5), expect_msg(&mut c.recv, MAX_MESSAGE_LEN)).await.unwrap().unwrap();
+            if matches!(m.msg, Some(Msg::FileRequest(ref r)) if r.transfer_id == id) {
+                break;
+            }
+        }
+        // One file arrives, then the client cancels.
+        let items = outgoing.items(id).unwrap();
+        nya_transport::clipfiles::send_items(&c.conn, id, &items[..1], pb::FilePurpose::Clipboard, |_, _| {}).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        write_msg(&mut c.send, &ctl(Msg::FileCancel(pb::FileCancel { transfer_id: id }))).await.unwrap();
+        let done = timeout(Duration::from_secs(5), done_rx.recv()).await.unwrap().unwrap();
+        assert_eq!(done.error, "客户端取消了传输");
+        assert!(done.paths.is_empty());
+        let cache = crate::winutil::clipboard_cache_dir().join(format!("{id:016x}"));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!cache.exists(), "the paste's cache folder is removed: {}", cache.display());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// FEATURE_TCP_FILES: the session hands the client a token, the client

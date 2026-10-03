@@ -216,13 +216,14 @@ pub async fn receive(
     ui: Ui,
     downloads: Arc<Downloads>,
     clip: Arc<ClipFiles>,
+    cancels: Arc<files::Cancels>,
     (files_on, images_on, clip_on, print_on): (bool, bool, bool, bool),
 ) {
     let h = match files::read_header(&mut r).await {
         Ok(h) => h,
         Err(e) => return tracing::warn!("file header: {e:#}"),
     };
-    receive_body(h, &mut r, ui, downloads, clip, (files_on, images_on, clip_on, print_on)).await
+    receive_body(h, &mut r, ui, downloads, clip, cancels, (files_on, images_on, clip_on, print_on)).await
 }
 
 /// A file from the host (QUIC FILE stream or the TCP file channel).
@@ -233,8 +234,11 @@ pub async fn receive_body<R: tokio::io::AsyncRead + Unpin>(
     ui: Ui,
     downloads: Arc<Downloads>,
     clip: Arc<ClipFiles>,
+    cancels: Arc<files::Cancels>,
     (files_on, images_on, clip_on, print_on): (bool, bool, bool, bool),
 ) {
+    // Cancelled (here or by the host): reads fail, partial files are removed.
+    let r = &mut files::Cancellable::new(r, cancels.flag(h.transfer_id));
     match pb::FilePurpose::try_from(h.purpose).unwrap_or(pb::FilePurpose::Unspecified) {
         pb::FilePurpose::ClipboardImage if images_on => match files::receive_to_vec(r, &h, files::MAX_IMAGE_BYTES).await {
             Ok(dib) => ui.send(UiEvent::ClipboardImage(dib)),

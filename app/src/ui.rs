@@ -33,6 +33,7 @@ pub enum Action {
     AcceptOffer(u64),
     DismissOffer(u64),
     DismissTransfer(u64),
+    CancelTransfer(u64),
     OpenFolder(std::path::PathBuf),
 }
 
@@ -680,7 +681,11 @@ fn transfers_panel(ctx: &egui::Context, s: &Session, actions: &mut Vec<Action>) 
                         ui.label(RichText::new(if t.upload { "↑ 发送" } else { "↓ 下载" }).strong());
                         ui.label(&t.name);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if !matches!(t.state, TransferState::Running) && ui.small_button("✕").clicked() {
+                            if matches!(t.state, TransferState::Running) {
+                                if ui.small_button("取消").on_hover_text("停止这次传输，删除没传完的文件").clicked() {
+                                    actions.push(Action::CancelTransfer(t.id));
+                                }
+                            } else if ui.small_button("✕").clicked() {
                                 actions.push(Action::DismissTransfer(t.id));
                             }
                         });

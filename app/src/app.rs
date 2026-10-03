@@ -793,6 +793,11 @@ impl App {
                         s.dismiss_transfer(id);
                     }
                 }
+                Action::CancelTransfer(id) => {
+                    if let Some(s) = &mut self.session {
+                        s.cancel_transfer(id);
+                    }
+                }
                 Action::OpenFolder(p) => {
                     let _ = std::process::Command::new("explorer").arg(p).spawn();
                 }
