@@ -16,10 +16,16 @@
 //!   installed again every 200 ms, and at once when a key gets past it.
 //! * Session windows are told apart by their window class (and our process),
 //!   not only by the handles registered here.
+//! * Windows does not call low-level keyboard hooks — anyone's — while the
+//!   foreground window belongs to a process that registered raw keyboard
+//!   input, with any flags (reproduced on Windows 11: hook called for keys
+//!   to other programs, never for our window). winit registers keyboards
+//!   together with mice, and a RIDEV_NOHOTKEYS registration was made while
+//!   capturing: the real reason the hook never saw a session window's keys
+//!   and Alt+Tab acted locally. Raw keyboard input is therefore removed
+//!   ([`drop_raw_keyboard`]); raw mouse input stays (relative mouse).
 //! * Should keys still reach the window (the hook gone anyway), they are
-//!   forwarded from window events. To keep shell hotkeys such as Win+D / Win+E
-//!   from acting locally, raw keyboard input is registered with
-//!   `RIDEV_NOHOTKEYS` while grabbed.
+//!   forwarded from window events.
 //!
 //! Hotkeys are Ctrl+Alt+Shift+<key>.
 
@@ -144,18 +150,20 @@ pub fn set_active(on: bool) {
     ACTIVE.store(on, Ordering::SeqCst);
 }
 
-/// Suppress application-defined hotkeys (Win+D, Win+E, …) for our process.
-pub fn set_no_hotkeys(hwnd: HWND, on: bool) {
-    use windows::Win32::UI::Input::{RegisterRawInputDevices, RAWINPUTDEVICE, RIDEV_NOHOTKEYS, RAWINPUTDEVICE_FLAGS};
+/// No raw keyboard input for this process, so that the hook is called for
+/// keys to our windows (see the module doc). Mice stay registered.
+pub fn drop_raw_keyboard() {
+    use windows::Win32::UI::Input::{RegisterRawInputDevices, RAWINPUTDEVICE, RIDEV_REMOVE};
     let dev = RAWINPUTDEVICE {
         usUsagePage: 0x01, // generic desktop
         usUsage: 0x06,     // keyboard
-        dwFlags: if on { RIDEV_NOHOTKEYS } else { RAWINPUTDEVICE_FLAGS(0) },
-        hwndTarget: hwnd,
+        dwFlags: RIDEV_REMOVE,
+        hwndTarget: HWND::default(),
     };
+    // SAFETY: one plain registration record.
     unsafe {
         if let Err(e) = RegisterRawInputDevices(&[dev], std::mem::size_of::<RAWINPUTDEVICE>() as u32) {
-            tracing::debug!("RegisterRawInputDevices(no_hotkeys={on}): {e}");
+            tracing::warn!("raw keyboard input not removed: {e}");
         }
     }
 }
@@ -407,6 +415,18 @@ mod tests {
             pump(300);
             set_session(Some(tx));
             set_grab(true);
+            if std::env::var("NYA_HOOK_RAW").is_ok() {
+                // As winit does: then the hook is not called for our window ...
+                use windows::Win32::UI::Input::{RegisterRawInputDevices, RAWINPUTDEVICE, RIDEV_DEVNOTIFY};
+                let dev = RAWINPUTDEVICE { usUsagePage: 1, usUsage: 6, dwFlags: RIDEV_DEVNOTIFY, hwndTarget: GetForegroundWindow() };
+                RegisterRawInputDevices(&[dev], std::mem::size_of::<RAWINPUTDEVICE>() as u32).unwrap();
+                eprintln!("XX raw keyboard input registered");
+                if std::env::var("NYA_HOOK_DROP").is_ok() {
+                    // ... unless it is removed again.
+                    drop_raw_keyboard();
+                    eprintln!("XX raw keyboard input removed");
+                }
+            }
             let calls0 = hook_call_count();
             SendInput(&[key(VK_F24, false), key(VK_F24, true)], std::mem::size_of::<INPUT>() as i32);
             pump(500);

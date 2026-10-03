@@ -546,7 +546,6 @@ impl App {
             s.mic_auto = d.mic;
         }
         self.set_grab(d.grab_keyboard);
-        self.update_no_hotkeys();
         self.update_title();
     }
 
@@ -566,7 +565,6 @@ impl App {
         if let Some((kind, text)) = message {
             self.notice(kind, text);
         }
-        self.update_no_hotkeys();
         self.update_title();
         self.request_redraw();
     }
@@ -591,13 +589,6 @@ impl App {
                 let _ = w.set_cursor_grab(CursorGrabMode::None);
                 w.set_cursor_visible(s.cursor_visible);
             }
-        }
-    }
-
-    /// While focused and grabbed, keep shell hotkeys (Win+D, …) from acting locally.
-    fn update_no_hotkeys(&self) {
-        if let Some(h) = self.window.as_ref().and_then(|w| hwnd(w)) {
-            input::set_no_hotkeys(h, self.focused && input::grabbed() && self.session.is_some());
         }
     }
 
@@ -673,7 +664,6 @@ impl App {
                 s.release_all();
             }
         }
-        self.update_no_hotkeys();
         self.update_title();
     }
 
@@ -1107,6 +1097,9 @@ impl ApplicationHandler<UiEvent> for App {
             return;
         }
         self.create_web();
+        // winit registered keyboards for raw input with the mice: that keeps
+        // the keyboard hook from being called for our windows (input.rs).
+        input::drop_raw_keyboard();
         let ui = self.ui_tx.clone();
         std::thread::spawn(move || ui.send(UiEvent::DecodeSummary(crate::diag::decode_summary())));
         if self.cfg.check_updates {
@@ -1167,7 +1160,10 @@ impl ApplicationHandler<UiEvent> for App {
                         input::reinstall_hook();
                     }
                 }
-                self.update_no_hotkeys();
+                if *f {
+                    // Whatever registered raw keyboard input since: the hook needs it gone.
+                    input::drop_raw_keyboard();
+                }
                 if let Some(g) = self.session.as_ref().and_then(|s| s.gamepads.as_ref()) {
                     g.set_active(*f);
                 }
