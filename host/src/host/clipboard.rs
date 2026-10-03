@@ -148,7 +148,17 @@ pub fn thread(rx: Receiver<ClipCmd>, sink: Sink) {
         let ours = virtual_files.is_ours();
         let files = !ours && clipboard::has_files();
         if !retry {
-            let what = if ours { "the client's files" } else if files { "files" } else if clipboard::has_text() { "text" } else { "other" };
+            let what = if ours {
+                "the client's files"
+            } else if files {
+                "files"
+            } else if clipboard::only_ole_object() {
+                "an OLE data object"
+            } else if clipboard::has_text() {
+                "text"
+            } else {
+                "other"
+            };
             tracing::info!("clipboard changed ({seq}): copied by {}, {what}", clipboard::owner_description());
             if what == "other" || what == "files" {
                 tracing::info!("clipboard formats: {}", clipboard::format_names());
@@ -178,6 +188,24 @@ pub fn thread(rx: Receiver<ClipCmd>, sink: Sink) {
                     file_retries = 0;
                     tracing::warn!("copied files not offered: the clipboard gave no file list ({})", std::io::Error::last_os_error());
                 }
+            }
+        } else if clipboard::only_ole_object() {
+            // Explorer copies: this process (SYSTEM) sees only the OLE marker;
+            // the content is read from the copying program's data object.
+            match clipboard::read_ole_clipboard() {
+                Ok(clipboard::OleContent::Files(files)) => {
+                    let paths: Vec<String> = files.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+                    tracing::info!("copied files (read through OLE): {} item(s), offered to the client", paths.len());
+                    sink.send(Ev::ClipboardFiles(ClipboardFiles { paths }));
+                }
+                Ok(clipboard::OleContent::Text(text)) => {
+                    if text.len() <= MAX_TEXT && last_text.as_deref() != Some(text.as_str()) {
+                        last_text = Some(text.clone());
+                        sink.send(Ev::Clipboard(pb::ClipboardText { text }));
+                    }
+                }
+                Ok(clipboard::OleContent::Other(formats)) => tracing::info!("copied something else (formats: {formats})"),
+                Err(e) => tracing::warn!("reading the copy through OLE: {e:#}"),
             }
         } else if clipboard::has_text() {
             if let Ok(Some(text)) = clipboard::get_text() {
