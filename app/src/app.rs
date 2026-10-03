@@ -1051,7 +1051,7 @@ impl App {
                     }
                 }
             }
-            WindowEvent::KeyboardInput { event, .. } => {
+            WindowEvent::KeyboardInput { event, is_synthetic, .. } => {
                 if let Some(s) = &mut self.session {
                     s.winit_keys += 1;
                 }
@@ -1063,7 +1063,9 @@ impl App {
                 // anything arriving here still has to go to the host (the hook is
                 // not running, or missed the key).
                 if input::grabbed() && self.focused {
-                    input::key_missed_hook();
+                    if !is_synthetic {
+                        input::key_missed_hook();
+                    }
                     use winit::platform::scancode::PhysicalKeyExtScancode;
                     if let (Some(sc), Some(s)) = (event.physical_key.to_scancode(), &self.session) {
                         let (scancode, extended) = (sc & 0xff, sc & 0xff00 == 0xe000);

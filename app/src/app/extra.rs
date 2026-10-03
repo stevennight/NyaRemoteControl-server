@@ -73,7 +73,8 @@ impl App {
         }
         let Some(dev) = self.renderer.as_ref().map(|r| r.dev.clone()) else { return };
         let title = format!("{} · {} — NyaRemoteControl", s.label, s.display_title(display_id));
-        let attrs = Window::default_attributes().with_title(title).with_inner_size(LogicalSize::new(960.0, 600.0)).with_min_inner_size(LogicalSize::new(320.0, 200.0));
+        use winit::platform::windows::WindowAttributesExtWindows;
+        let attrs = Window::default_attributes().with_class_name(input::SESSION_CLASS).with_title(title).with_inner_size(LogicalSize::new(960.0, 600.0)).with_min_inner_size(LogicalSize::new(320.0, 200.0));
         let window = match el.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => return tracing::warn!("extra window: {e}"),
@@ -268,13 +269,15 @@ impl App {
                     }
                 }
             }
-            WindowEvent::KeyboardInput { event, .. } => {
+            WindowEvent::KeyboardInput { event, is_synthetic, .. } => {
                 // Same keys as the main window (hotkeys, keys the hook didn't take).
                 if let Some(h) = self.hotkey_from_key(event) {
                     return self.hotkey(h);
                 }
                 if input::grabbed() {
-                    input::key_missed_hook();
+                    if !is_synthetic {
+                        input::key_missed_hook();
+                    }
                     use winit::platform::scancode::PhysicalKeyExtScancode;
                     if let (Some(sc), Some(s)) = (event.physical_key.to_scancode(), &self.session) {
                         let (scancode, extended) = (sc & 0xff, sc & 0xff00 == 0xe000);

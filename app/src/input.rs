@@ -7,11 +7,15 @@
 //!   answer within LowLevelHooksTimeout — which the UI thread (decoding,
 //!   presenting, connecting) missed, notably in cloud desktops, after which
 //!   Alt+Tab acted locally.
-//! * Windows calls the most recently installed low-level hook first. Another
-//!   program's hook ahead of ours (seen: keys reached the window, our hook
-//!   was never called for them, Alt+Tab acted locally) gets ours put back in
-//!   front: the hook is installed again whenever a session window gains the
-//!   focus, and when a key reaches the window past it.
+//! * Windows calls the most recently installed low-level hook first, and a
+//!   hook that returns without CallNextHookEx hides every hook behind it
+//!   (seen on a control PC: keys reached the window, our hook was never
+//!   called for them, Alt+Tab acted locally; installing ours again once did
+//!   not help, the other program keeps putting its own first). So while a
+//!   session window has the focus and the keyboard is captured, the hook is
+//!   installed again every 200 ms, and at once when a key gets past it.
+//! * Session windows are told apart by their window class (and our process),
+//!   not only by the handles registered here.
 //! * Should keys still reach the window (the hook gone anyway), they are
 //!   forwarded from window events. To keep shell hotkeys such as Win+D / Win+E
 //!   from acting locally, raw keyboard input is registered with
@@ -29,8 +33,8 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL};
 use windows::Win32::UI::Input::KeyboardAndMouse::{MapVirtualKeyW, MAPVK_VK_TO_VSC_EX};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetForegroundWindow, GetMessageW, PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HC_ACTION,
-    KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_UP, MSG, WH_KEYBOARD_LL, WM_APP,
+    CallNextHookEx, GetForegroundWindow, GetMessageW, PostThreadMessageW, SetTimer, SetWindowsHookExW, UnhookWindowsHookEx,
+    HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLKHF_UP, MSG, WH_KEYBOARD_LL, WM_APP, WM_TIMER,
 };
 
 use crate::events::{Hotkey, NetCmd, Ui, UiEvent};
@@ -49,6 +53,11 @@ static STATE: OnceLock<HookState> = OnceLock::new();
 static HOOK_KEYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static HOOK_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Hook calls while a session window of ours had the focus.
+static OWN_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// Window class of session windows (main and extra), see [`is_session_window`].
+pub const SESSION_CLASS: &str = "NyaRemoteControl.Session";
 /// The hook thread (0 = not running).
 static HOOK_TID: AtomicU32 = AtomicU32::new(0);
 /// Times the hook was put first again.
@@ -58,9 +67,42 @@ static MISSED: AtomicU64 = AtomicU64::new(0);
 /// Thread message: install the hook again (first in the chain).
 const WM_REINSTALL: u32 = WM_APP + 1;
 
-/// (times the hook was put first again, keys that went past it)
-pub fn hook_repairs() -> (u64, u64) {
-    (REINSTALLS.load(Ordering::Relaxed), MISSED.load(Ordering::Relaxed))
+/// (times the hook was put first again, keys that went past it, hook calls
+/// while a session window had the focus)
+pub fn hook_repairs() -> (u64, u64, u64) {
+    (REINSTALLS.load(Ordering::Relaxed), MISSED.load(Ordering::Relaxed), OWN_CALLS.load(Ordering::Relaxed))
+}
+
+/// Is `fg` one of our session windows? The handles registered here, or a
+/// window of this process with the session window class.
+fn is_session_window(s: &HookState, fg: isize) -> bool {
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetWindowThreadProcessId};
+    if fg == 0 {
+        return false;
+    }
+    if fg == s.hwnd.load(Ordering::Relaxed) || s.extra.try_lock().is_ok_and(|v| v.contains(&fg)) {
+        return true;
+    }
+    let h = HWND(fg as *mut _);
+    let mut pid = 0u32;
+    // SAFETY: plain queries on a window handle.
+    unsafe {
+        GetWindowThreadProcessId(h, Some(&mut pid));
+        if pid != GetCurrentProcessId() {
+            return false;
+        }
+        let mut name = [0u16; 64];
+        let n = GetClassNameW(h, &mut name) as usize;
+        String::from_utf16_lossy(&name[..n.min(name.len())]) == SESSION_CLASS
+    }
+}
+
+/// A session window has the focus and its keys go to the host.
+fn capturing(s: &HookState) -> bool {
+    // SAFETY: no arguments.
+    let fg = unsafe { GetForegroundWindow() }.0 as isize;
+    ACTIVE.load(Ordering::Relaxed) && s.grab.load(Ordering::Relaxed) && is_session_window(s, fg)
 }
 
 /// Put the hook first in the chain again (at most twice a second).
@@ -140,9 +182,13 @@ fn state() -> &'static HookState {
 
 /// Install the hook once per process, on its own thread.
 pub fn install(hwnd: HWND, ui: Ui) {
+    *state().ui.lock().unwrap() = Some(ui);
+    start_hook(hwnd);
+}
+
+fn start_hook(hwnd: HWND) {
     let s = state();
     s.hwnd.store(hwnd.0 as isize, Ordering::SeqCst);
-    *s.ui.lock().unwrap() = Some(ui);
     let spawned = std::thread::Builder::new().name("keyboard hook".into()).spawn(|| unsafe {
         // Keys wait for the hook: answer them before anything else.
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
@@ -155,10 +201,12 @@ pub fn install(hwnd: HWND, ui: Ui) {
             }
         };
         HOOK_TID.store(GetCurrentThreadId(), Ordering::SeqCst);
+        // Keep the hook first while keys are captured (see the module doc).
+        let _ = SetTimer(None, 0, 200, None);
         // The hook is called from this loop; it lives as long as the process.
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            if msg.message == WM_REINSTALL {
+            if msg.message == WM_REINSTALL || (msg.message == WM_TIMER && capturing(state())) {
                 // The new one first, then the old one off: never without a hook.
                 match SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook), module, 0) {
                     Ok(h) => {
@@ -238,7 +286,21 @@ unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
         let s = state();
         let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
         let fg = GetForegroundWindow().0 as isize;
-        let ours = fg == s.hwnd.load(Ordering::Relaxed) || s.extra.try_lock().is_ok_and(|v| v.contains(&fg));
+        let ours = is_session_window(s, fg);
+        if ours {
+            let n = OWN_CALLS.fetch_add(1, Ordering::Relaxed);
+            if n < 3 {
+                tracing::info!(
+                    "keyboard hook: vk={:#x} flags={:#x}{} for session window {fg:#x} (main {:#x}), session {}, grab {}",
+                    kb.vkCode,
+                    kb.flags.0,
+                    if kb.flags.0 & LLKHF_INJECTED.0 != 0 { " (injected)" } else { "" },
+                    s.hwnd.load(Ordering::Relaxed),
+                    ACTIVE.load(Ordering::Relaxed),
+                    s.grab.load(Ordering::Relaxed)
+                );
+            }
+        }
         // Injected keys are processed too: in cloud desktops / remote sessions
         // every keystroke arrives injected. We never inject locally, so no loop.
         if ours && ACTIVE.load(Ordering::Relaxed) {
@@ -287,4 +349,79 @@ unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
 /// Forget modifier state (focus changes).
 pub fn reset_modifiers() {
     state().mods.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::core::w;
+    use windows::Win32::Foundation::HINSTANCE;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VK_F24, VK_MENU, VIRTUAL_KEY};
+    use windows::Win32::UI::WindowsAndMessaging::*;
+
+    fn key(vk: VIRTUAL_KEY, up: bool) -> INPUT {
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: vk, dwFlags: if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) }, ..Default::default() } },
+        }
+    }
+
+    fn pump(ms: u64) {
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+        while std::time::Instant::now() < until {
+            unsafe {
+                let mut m = MSG::default();
+                while PeekMessageW(&mut m, None, 0, 0, PM_REMOVE).as_bool() {
+                    let _ = TranslateMessage(&m);
+                    DispatchMessageW(&m);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// EXPERIMENT: does the hook take keys for our foreground window? Uses
+    /// the desktop (a window comes to the front; F24 is injected).
+    #[test]
+    #[ignore]
+    fn hook_takes_keys_for_our_window() {
+        unsafe {
+            let hwnd = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("nya hook test"),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                100, 100, 300, 200,
+                None, None, HINSTANCE::default(), None,
+            )
+            .unwrap();
+            pump(200);
+            // Injected input lets this process take the foreground.
+            SendInput(&[key(VK_MENU, false), key(VK_MENU, true)], std::mem::size_of::<INPUT>() as i32);
+            let fg_ok = SetForegroundWindow(hwnd).as_bool();
+            pump(300);
+            let fg = GetForegroundWindow();
+            eprintln!("XX window {:?} foreground {:?} (SetForegroundWindow {fg_ok})", hwnd.0, fg.0);
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            start_hook(if std::env::var("NYA_HOOK_FG").is_ok() { GetForegroundWindow() } else { hwnd });
+            pump(300);
+            set_session(Some(tx));
+            set_grab(true);
+            let calls0 = hook_call_count();
+            SendInput(&[key(VK_F24, false), key(VK_F24, true)], std::mem::size_of::<INPUT>() as i32);
+            pump(500);
+            let mut got = 0;
+            while rx.try_recv().is_ok() {
+                got += 1;
+            }
+            eprintln!(
+                "XX hook calls +{} / taken {} / forwarded {got} / foreground now {:?}",
+                hook_call_count() - calls0,
+                hook_key_count(),
+                GetForegroundWindow().0
+            );
+            set_session(None);
+            let _ = DestroyWindow(hwnd);
+        }
+    }
 }
