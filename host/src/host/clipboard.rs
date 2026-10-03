@@ -108,6 +108,9 @@ pub fn thread(rx: Receiver<ClipCmd>, sink: Sink) {
                 None
             }
             Ok(ClipCmd::Enable(on)) => {
+                if on != enabled {
+                    tracing::info!("clipboard sync {}", if on { "on" } else { "off" });
+                }
                 enabled = on;
                 last_seq = clipboard::sequence_number();
                 if !on {
@@ -142,13 +145,23 @@ pub fn thread(rx: Receiver<ClipCmd>, sink: Sink) {
         }
         last_seq = seq;
 
-        if virtual_files.is_ours() {
+        let ours = virtual_files.is_ours();
+        let files = !ours && clipboard::has_files();
+        if !retry {
+            tracing::info!(
+                "clipboard changed ({seq}): owner process {}, {}",
+                clipboard::owner_process().map_or("-".into(), |p| p.to_string()),
+                if ours { "the client's files" } else if files { "files" } else if clipboard::has_text() { "text" } else { "other" }
+            );
+        }
+        if ours {
             // The client's own files (not yet fetched): nothing to offer back.
-        } else if clipboard::has_files() {
+        } else if files {
             match clipboard::get_files() {
                 Ok(Some(files)) => {
                     file_retries = 0;
                     let paths: Vec<String> = files.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+                    tracing::info!("copied files: {} item(s), offered to the client", paths.len());
                     // Every copy is a new offer (the clipboard changed), even of the same files.
                     if !paths.is_empty() {
                         sink.send(Ev::ClipboardFiles(ClipboardFiles { paths }));
@@ -161,7 +174,10 @@ pub fn thread(rx: Receiver<ClipCmd>, sink: Sink) {
                         tracing::warn!("copied files not offered: {e:#}");
                     }
                 }
-                Ok(None) => file_retries = 0,
+                Ok(None) => {
+                    file_retries = 0;
+                    tracing::warn!("copied files not offered: the clipboard gave no file list ({})", std::io::Error::last_os_error());
+                }
             }
         } else if clipboard::has_text() {
             if let Ok(Some(text)) = clipboard::get_text() {

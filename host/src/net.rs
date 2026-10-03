@@ -656,7 +656,10 @@ async fn run_session(
                         let count = paths.len();
                         let items = tokio::task::spawn_blocking(move || user_items(&paths, clip_files_on)).await.unwrap_or_default();
                         match offers.offer_items(items) {
-                            Some(o) => { let _ = ctl_tx.send(ctl(Msg::FileOffer(o))).await; }
+                            Some(o) => {
+                                tracing::info!("host copied {} item(s) (offer {:016x})", o.files.len(), o.transfer_id);
+                                let _ = ctl_tx.send(ctl(Msg::FileOffer(o))).await;
+                            }
                             None => tracing::info!("nothing to offer from {count} copied item(s)"),
                         }
                     }
