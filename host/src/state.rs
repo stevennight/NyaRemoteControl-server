@@ -39,6 +39,8 @@ pub struct State {
     pub updates: crate::update::Updates,
     /// Finished print jobs, for the operating client's session (FEATURE_PRINT).
     pub prints: tokio::sync::broadcast::Sender<PathBuf>,
+    /// File channels (TCP) the sessions wait for (FEATURE_TCP_FILES).
+    pub file_channels: Arc<nya_transport::filechan::Expected>,
 }
 
 impl State {
@@ -59,6 +61,7 @@ impl State {
             rebind: Notify::new(),
             updates: Default::default(),
             prints: tokio::sync::broadcast::channel(16).0,
+            file_channels: Default::default(),
         })
     }
 

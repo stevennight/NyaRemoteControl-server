@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use nya_proto::pb;
-use nya_transport::files;
-use nya_transport::quinn::{Connection, RecvStream};
+use nya_transport::files::{self, FileLink};
+use nya_transport::quinn::RecvStream;
 
 use crate::events::{TransferUpdate, Ui, UiEvent};
 
@@ -55,7 +55,7 @@ pub fn new_id() -> u64 {
 }
 
 /// Upload files; the host confirms with a FileResult when the batch is saved.
-pub async fn upload(conn: Connection, paths: Vec<PathBuf>, ui: Ui) {
+pub async fn upload(link: FileLink, paths: Vec<PathBuf>, ui: Ui) {
     let files: Vec<(PathBuf, u64)> = paths
         .into_iter()
         .filter_map(|p| match std::fs::metadata(&p) {
@@ -85,7 +85,7 @@ pub async fn upload(conn: Connection, paths: Vec<PathBuf>, ui: Ui) {
             count,
             path: String::new(),
         };
-        if let Err(e) = files::send_file(&conn, h, p, |n| prog.add(n)).await {
+        if let Err(e) = link.send_file(h, p, None, |n| prog.add(n)).await {
             prog.finish(Err(format!("发送 {} 失败：{e:#}", p.display())), None);
             return;
         }
@@ -95,7 +95,7 @@ pub async fn upload(conn: Connection, paths: Vec<PathBuf>, ui: Ui) {
     ui.send(UiEvent::Transfer(prog.update));
 }
 
-pub async fn send_image(conn: Connection, dib: Vec<u8>) {
+pub async fn send_image(link: FileLink, dib: Vec<u8>) {
     let h = pb::FileHeader {
         transfer_id: new_id(),
         name: "clipboard.dib".into(),
@@ -105,7 +105,7 @@ pub async fn send_image(conn: Connection, dib: Vec<u8>) {
         count: 1,
         path: String::new(),
     };
-    if let Err(e) = files::send_bytes(&conn, h, &dib).await {
+    if let Err(e) = link.send_bytes(h, &dib).await {
         tracing::debug!("clipboard image: {e:#}");
     }
 }
@@ -176,7 +176,7 @@ impl Default for ClipFiles {
 /// Send files the host asked for because they are being pasted there.
 /// A failure is reported to the host through `fail`.
 pub async fn send_clipboard_files(
-    conn: Connection,
+    link: FileLink,
     id: u64,
     items: Vec<files::Item>,
     ui: Ui,
@@ -185,7 +185,7 @@ pub async fn send_clipboard_files(
     let total = items.iter().map(|i| i.size).sum();
     let count = items.iter().filter(|i| !i.is_dir).count();
     let mut prog = Progress::new(ui, id, true, total);
-    let r = nya_transport::clipfiles::send_items(&conn, id, &items, pb::FilePurpose::Clipboard, |name, n| {
+    let r = nya_transport::clipfiles::send_items_with(&link, id, &items, pb::FilePurpose::Clipboard, None, |name, n| {
         if prog.update.name != name {
             prog.update.name = name.to_owned();
         }
@@ -222,22 +222,34 @@ pub async fn receive(
         Ok(h) => h,
         Err(e) => return tracing::warn!("file header: {e:#}"),
     };
+    receive_body(h, &mut r, ui, downloads, clip, (files_on, images_on, clip_on, print_on)).await
+}
+
+/// A file from the host (QUIC FILE stream or the TCP file channel).
+/// Returning without reading it refuses it.
+pub async fn receive_body<R: tokio::io::AsyncRead + Unpin>(
+    h: pb::FileHeader,
+    r: &mut R,
+    ui: Ui,
+    downloads: Arc<Downloads>,
+    clip: Arc<ClipFiles>,
+    (files_on, images_on, clip_on, print_on): (bool, bool, bool, bool),
+) {
     match pb::FilePurpose::try_from(h.purpose).unwrap_or(pb::FilePurpose::Unspecified) {
-        pb::FilePurpose::ClipboardImage if images_on => match files::receive_to_vec(&mut r, &h, files::MAX_IMAGE_BYTES).await {
+        pb::FilePurpose::ClipboardImage if images_on => match files::receive_to_vec(r, &h, files::MAX_IMAGE_BYTES).await {
             Ok(dib) => ui.send(UiEvent::ClipboardImage(dib)),
             Err(e) => tracing::debug!("clipboard image: {e:#}"),
         },
         pb::FilePurpose::Clipboard if clip_on => {
             let id = h.transfer_id;
             let Some(root) = clip.incoming.root(id) else {
-                let _ = r.stop(0u32.into());
                 return;
             };
             let total = clip.progress.lock().unwrap().get(&id).map_or(0, |p| p.0);
             let mut prog = Progress::new(ui.clone(), id, false, total);
             prog.update.name = if h.path.is_empty() { h.name.clone() } else { h.path.clone() };
             // Several files arrive at once: one count for the whole batch.
-            let res = files::receive_to_tree(&mut r, &h, &root, |n| {
+            let res = files::receive_to_tree(r, &h, &root, |n| {
                 let done = clip.progress.lock().unwrap().get_mut(&id).map_or(0, |p| {
                     p.1 += n;
                     p.1
@@ -257,7 +269,7 @@ pub async fn receive(
         }
         pb::FilePurpose::Print if print_on => {
             let dir = nya_win::shell::receive_dir(None).unwrap_or_else(|| std::env::temp_dir().join("NyaRemoteControl")).join("打印");
-            match files::receive_to_dir(&mut r, &h, &dir, |_| {}).await {
+            match files::receive_to_dir(r, &h, &dir, |_| {}).await {
                 Ok(p) => {
                     tracing::info!("print job from the host: {}", p.display());
                     ui.send(UiEvent::PrintJob(p));
@@ -271,7 +283,7 @@ pub async fn receive(
             let mut prog = Progress::new(ui.clone(), h.transfer_id, false, 0);
             prog.update.name = h.name.clone();
             prog.update.done = already;
-            let res = files::receive_to_dir(&mut r, &h, &dir, |n| prog.add(n)).await;
+            let res = files::receive_to_dir(r, &h, &dir, |n| prog.add(n)).await;
             match res {
                 Ok(p) => {
                     let done = {
@@ -298,8 +310,6 @@ pub async fn receive(
                 }
             }
         }
-        _ => {
-            let _ = r.stop(0u32.into());
-        }
+        _ => {}
     }
 }

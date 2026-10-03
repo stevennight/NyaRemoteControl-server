@@ -53,12 +53,19 @@ async fn serve_all(dir: PathBuf, port: Option<u16>, mode: HostMode) -> Result<()
 
     match mode {
         HostMode::InProcess => {
-            println!("被控端已启动（开发模式），UDP 端口 {}", cfg.port);
+            println!("被控端已启动（开发模式），UDP 和 TCP 端口 {}", cfg.port);
             println!("配对码：{}", auth.key().to_code());
             println!("证书指纹：{}", identity.fingerprint());
             tokio::spawn(run_in_process(state.clone(), cmd_rx));
         }
         HostMode::Helper { session_changed } => {
+            // Rules of older versions allowed UDP only; files need TCP too.
+            let port = cfg.port;
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = crate::install::firewall_allow(port) {
+                    tracing::warn!("firewall rules: {e:#}");
+                }
+            });
             tokio::spawn(helper_manager(state.clone(), cmd_rx, session_changed));
             tokio::spawn(crate::print::watch(state.clone()));
         }
@@ -93,8 +100,22 @@ async fn listen(state: Arc<State>, identity: Identity) -> Result<()> {
             }
         };
         state.set_listening(Ok(endpoint.local_addr().map(|a| a.to_string()).unwrap_or_default()));
+        // File transfers: TCP on the same port (FEATURE_TCP_FILES). Without
+        // it they stay on QUIC, so a failure here is only a warning.
+        let files_tcp = {
+            let (state, identity, port) = (state.clone(), identity.clone(), cfg.port);
+            let ip = cfg.bind.parse::<IpAddr>().ok();
+            async move {
+                let Some(ip) = ip else { return std::future::pending().await };
+                if let Err(e) = nya_transport::filechan::listen(SocketAddr::new(ip, port), &identity, state.file_channels.clone()).await {
+                    tracing::warn!("file channel: cannot listen on TCP {port}: {e:#} (files go over QUIC)");
+                }
+                std::future::pending::<()>().await
+            }
+        };
         tokio::select! {
             r = net::serve_endpoint(endpoint.clone(), state.clone()) => return r,
+            _ = files_tcp => {}
             _ = state.rebind.notified() => {
                 tracing::info!("listen address changed; re-binding");
                 endpoint.close(0u32.into(), "被控端的监听地址已更改".as_bytes());

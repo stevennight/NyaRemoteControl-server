@@ -292,7 +292,7 @@ Section "桌面快捷方式" SecDesktop
 SectionEnd
 
 Section /o "允许远程控制本机（安装后台服务）" SecService
-  DetailPrint "安装并启动服务（防火墙放行 UDP 端口、远程 Ctrl+Alt+Del 策略）…"
+  DetailPrint "安装并启动服务（防火墙放行 UDP 和 TCP 端口、远程 Ctrl+Alt+Del 策略）…"
   nsExec::ExecToLog '"$INSTDIR\${CLI_EXE}" install'
   Pop $0
   ${If} $0 != 0

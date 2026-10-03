@@ -13,7 +13,6 @@ use std::time::Duration;
 
 use nya_proto::pb;
 use nya_server_core::components;
-use nya_transport::quinn::Connection;
 
 use crate::state::State;
 
@@ -76,7 +75,7 @@ pub async fn watch(state: Arc<State>) {
 }
 
 /// Send one print job to the client, then delete it.
-pub async fn send(conn: Connection, path: PathBuf) {
+pub async fn send(link: nya_transport::files::FileLink, path: PathBuf) {
     let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "print.pdf".into());
     let h = pb::FileHeader {
@@ -88,7 +87,7 @@ pub async fn send(conn: Connection, path: PathBuf) {
         count: 1,
         path: String::new(),
     };
-    match nya_transport::files::send_file(&conn, h, &path, |_| {}).await {
+    match link.send_file(h, &path, None, |_| {}).await {
         Ok(()) => {
             tracing::info!("print job {name} sent to the client ({size} bytes)");
             let _ = std::fs::remove_file(&path);

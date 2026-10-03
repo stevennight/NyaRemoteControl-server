@@ -228,7 +228,7 @@ fn status() -> Result<()> {
     if s.listen.is_empty() {
         println!("监听：!! {}", s.listen_error);
     } else {
-        println!("监听：UDP {}", s.listen);
+        println!("监听：UDP/TCP {}", s.listen);
     }
     println!("证书指纹：{}", s.fingerprint);
     let host = s.host.unwrap_or_default();

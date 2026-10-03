@@ -253,15 +253,22 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
     let images_on = neg.has(Feature::ClipboardImage);
     // Copy on one side, paste on the other (folders too), both directions.
     let clip_on = files_on && neg.has(Feature::ClipboardFiles);
+    let file_flags = (files_on, images_on, clip_on, neg.has(Feature::Print));
+    let downloads = Arc::new(crate::transfer::Downloads::default());
     let uni = tokio::spawn(accept_uni(
         conn.clone(),
         sinks.video.clone(),
         sinks.ui.clone(),
         sinks.stats.clone(),
         sinks.clip.clone(),
-        (files_on, images_on, clip_on, neg.has(Feature::Print)),
+        downloads.clone(),
+        file_flags,
         neg.has(Feature::MultiStream),
     ));
+    // Where files go: the TCP file channel once the host offered it and it
+    // is up (FEATURE_TCP_FILES), FILE streams on this connection until then.
+    let files_link = nya_transport::files::FileLink::new(conn.clone());
+    let mut file_channel_task: Option<tokio::task::JoinHandle<()>> = None;
     // Control messages from spawned tasks (failed clipboard sends).
     let (internal_tx, mut internal_rx) = mpsc::unbounded_channel::<pb::ControlMsg>();
     let usb_on = neg.has(Feature::UsbRedirect);
@@ -333,7 +340,7 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
                         match items {
                             Some(items) => {
                                 tracing::info!("host is pasting our files (offer {:016x})", req.transfer_id);
-                                tokio::spawn(crate::transfer::send_clipboard_files(conn.clone(), req.transfer_id, items, sinks.ui.clone(), internal_tx.clone()));
+                                tokio::spawn(crate::transfer::send_clipboard_files(files_link.clone(), req.transfer_id, items, sinks.ui.clone(), internal_tx.clone()));
                             }
                             None => {
                                 let r = pb::FileResult { transfer_id: req.transfer_id, ok: false, message: "这批文件已过期，请在客户端重新复制".into(), saved_to: String::new() };
@@ -351,6 +358,28 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
                     }
                     Some(Msg::UsbStatus(u)) => sinks.ui.send(UiEvent::UsbStatus(u)),
                     Some(Msg::FolderMountStatus(s)) => sinks.ui.send(UiEvent::FolderMount(s)),
+                    Some(Msg::FileChannel(fc)) if neg.has(Feature::TcpFiles) => {
+                        // Same address and port as QUIC (a port forward needs both).
+                        let addr = conn.remote_address();
+                        let (identity, pinned, link) = (p.identity.clone(), p.pinned, files_link.clone());
+                        let (ui, downloads, clip) = (sinks.ui.clone(), downloads.clone(), sinks.clip.clone());
+                        if let Some(t) = file_channel_task.take() {
+                            t.abort();
+                        }
+                        file_channel_task = Some(tokio::spawn(async move {
+                            let on_file: nya_transport::filechan::OnFile = Arc::new(move |h, mut r| {
+                                let (ui, downloads, clip) = (ui.clone(), downloads.clone(), clip.clone());
+                                tokio::spawn(async move { crate::transfer::receive_body(h, &mut r, ui, downloads, clip, file_flags).await });
+                            });
+                            match nya_transport::filechan::connect(addr, &identity, pinned, &fc.token, on_file).await {
+                                Ok(ch) => {
+                                    tracing::info!("files go over the TCP file channel ({addr})");
+                                    link.set_tcp(Some(ch));
+                                }
+                                Err(e) => tracing::warn!("file channel (TCP {addr}): {e:#}; files go over QUIC"),
+                            }
+                        }));
+                    }
                     Some(Msg::GamepadRumble(r)) => sinks.ui.send(UiEvent::GamepadRumble(r)),
                     Some(Msg::Bye(b)) => break End::Fatal(format!("被控端断开：{}", b.reason)),
                     Some(other) => tracing::debug!("ignoring {other:?}"),
@@ -374,7 +403,7 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
                 }
                 Some(NetCmd::SendFiles(paths)) => {
                     if files_on {
-                        tokio::spawn(crate::transfer::upload(conn.clone(), paths, sinks.ui.clone()));
+                        tokio::spawn(crate::transfer::upload(files_link.clone(), paths, sinks.ui.clone()));
                     } else {
                         sinks.ui.send(UiEvent::FileResult(pb::FileResult {
                             ok: false,
@@ -390,7 +419,7 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
                 }
                 Some(NetCmd::SendImage(dib)) => {
                     if images_on {
-                        tokio::spawn(crate::transfer::send_image(conn.clone(), dib));
+                        tokio::spawn(crate::transfer::send_image(files_link.clone(), dib));
                     }
                 }
                 Some(NetCmd::OfferFiles(paths)) => {
@@ -442,6 +471,12 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
     uni.abort();
     bidi.abort();
     dgram.abort();
+    if let Some(t) = file_channel_task {
+        t.abort();
+    }
+    if let Some(ch) = files_link.tcp() {
+        ch.close().await;
+    }
     // The host starts over after a reconnect: pastes in progress can't finish.
     sinks.clip.fail_all("与被控端的连接断开了");
     end
@@ -453,10 +488,10 @@ async fn accept_uni(
     ui: Ui,
     stats: Arc<Shared>,
     clip: Arc<crate::transfer::ClipFiles>,
+    downloads: Arc<crate::transfer::Downloads>,
     flags: (bool, bool, bool, bool),
     multi: bool,
 ) {
-    let downloads = Arc::new(crate::transfer::Downloads::default());
     while let Ok(mut r) = conn.accept_uni().await {
         let (video, ui, stats, downloads, clip) = (video.clone(), ui.clone(), stats.clone(), downloads.clone(), clip.clone());
         tokio::spawn(async move {

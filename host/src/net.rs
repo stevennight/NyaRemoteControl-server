@@ -349,19 +349,46 @@ async fn run_session(
     // Copy on one side, paste on the other (folders too), both directions.
     let clip_files_on = files_on && neg.has(Feature::ClipboardFiles);
     let incoming = nya_transport::clipfiles::Incoming::default();
-    let input_task = tokio::spawn(client_streams(
-        conn.clone(),
-        hub.clone(),
-        FileCtx {
-            ctl_tx: ctl_tx.clone(),
-            files_on,
-            images_on,
-            clip_files_on,
-            incoming: incoming.clone(),
-            batches: Default::default(),
-            controlling: controlling.clone(),
-        },
-    ));
+    let file_ctx = Arc::new(FileCtx {
+        ctl_tx: ctl_tx.clone(),
+        files_on,
+        images_on,
+        clip_files_on,
+        incoming: incoming.clone(),
+        batches: Default::default(),
+        controlling: controlling.clone(),
+    });
+    let input_task = tokio::spawn(client_streams(conn.clone(), hub.clone(), file_ctx.clone()));
+    // Where files go: the TCP file channel once the client has opened it
+    // (FEATURE_TCP_FILES), FILE streams on this connection until then.
+    let link = nya_transport::files::FileLink::new(conn.clone());
+    let file_channel_task = match (neg.has(Feature::TcpFiles), peer_fingerprint(conn)) {
+        (true, Some(client)) => {
+            let place = state.file_channels.expect(client);
+            let _ = ctl_tx.send(ctl(Msg::FileChannel(pb::FileChannel { token: place.token.clone() }))).await;
+            let (link, hub, ctx) = (link.clone(), hub.clone(), file_ctx.clone());
+            Some(tokio::spawn(async move {
+                let on_file: nya_transport::filechan::OnFile = Arc::new(move |h, mut r| {
+                    let (hub, ctx) = (hub.clone(), ctx.clone());
+                    tokio::spawn(async move {
+                        if ctx.controlling.load(Ordering::Relaxed) {
+                            if let Err(e) = receive_file_body(h, &mut r, hub, ctx).await {
+                                tracing::warn!("file (TCP): {e:#}");
+                            }
+                        }
+                    });
+                });
+                match place.accept(Duration::from_secs(20), on_file).await {
+                    Ok(ch) => {
+                        tracing::info!("files go over the TCP file channel");
+                        link.set_tcp(Some(ch));
+                    }
+                    Err(e) => tracing::warn!("{e:#}; files go over QUIC"),
+                }
+            }))
+        }
+        _ => None,
+    };
     // Files copied on the host and offered to the client.
     let mut offers = nya_transport::clipfiles::Outgoing::default();
     // Where the client's files are fetched to when they are pasted here.
@@ -518,7 +545,7 @@ async fn run_session(
                         };
                         match offers.items(req.transfer_id) {
                             Some(items) => {
-                                tokio::spawn(send_offered(conn.clone(), req.transfer_id, items, purpose, ctl_tx.clone()));
+                                tokio::spawn(send_offered(link.clone(), req.transfer_id, items, purpose, ctl_tx.clone()));
                             }
                             None => {
                                 let _ = ctl_tx.try_send(ctl(Msg::FileResult(pb::FileResult {
@@ -679,7 +706,7 @@ async fn run_session(
                         }
                     }
                     Some(Ev::ClipboardImage(img)) if images_on => {
-                        let conn = conn.clone();
+                        let link = link.clone();
                         tokio::spawn(async move {
                             let h = pb::FileHeader {
                                 transfer_id: rand::random(),
@@ -690,7 +717,7 @@ async fn run_session(
                                 count: 1,
                                 path: String::new(),
                             };
-                            if let Err(e) = nya_transport::files::send_bytes(&conn, h, &img.dib).await {
+                            if let Err(e) = link.send_bytes(h, &img.dib).await {
                                 tracing::debug!("clipboard image: {e:#}");
                             }
                         });
@@ -729,7 +756,7 @@ async fn run_session(
                 // The operating client prints what the host prints.
                 if let Ok(path) = p {
                     if print_on && controlling.load(Ordering::Relaxed) {
-                        tokio::spawn(crate::print::send(conn.clone(), path));
+                        tokio::spawn(crate::print::send(link.clone(), path));
                     }
                 }
             }
@@ -758,6 +785,12 @@ async fn run_session(
         announce_drive(hub, &point, false);
     }
 
+    if let Some(t) = file_channel_task {
+        t.abort();
+    }
+    if let Some(ch) = link.tcp() {
+        ch.close().await;
+    }
     drop(ctl_tx);
     video_task.abort();
     mic_task.abort();
@@ -931,7 +964,7 @@ fn user_opener() -> nya_transport::files::Opener {
 
 /// Send files the client asked for (from a FileOffer).
 async fn send_offered(
-    conn: Connection,
+    link: nya_transport::files::FileLink,
     id: u64,
     items: Vec<nya_transport::files::Item>,
     purpose: pb::FilePurpose,
@@ -939,7 +972,7 @@ async fn send_offered(
 ) {
     let files = items.iter().filter(|i| !i.is_dir).count();
     let open = user_opener();
-    if let Err(e) = nya_transport::clipfiles::send_items_with(&conn, id, &items, purpose, Some(&open), |_, _| {}).await {
+    if let Err(e) = nya_transport::clipfiles::send_items_with(&link, id, &items, purpose, Some(&open), |_, _| {}).await {
         tracing::warn!("sending offer {id:016x}: {e:#}");
         let _ = ctl_tx
             .send(ctl(Msg::FileResult(pb::FileResult {
@@ -977,12 +1010,18 @@ struct FileCtx {
 
 /// A FILE stream from the client: save an upload, or apply a clipboard image.
 async fn receive_file(mut r: RecvStream, hub: Arc<Hub>, ctx: Arc<FileCtx>) -> Result<()> {
+    let h = nya_transport::files::read_header(&mut r).await?;
+    receive_file_body(h, &mut r, hub, ctx).await
+}
+
+/// A file from the client (QUIC FILE stream or the TCP file channel).
+/// Returning without reading it refuses it.
+async fn receive_file_body<R: tokio::io::AsyncRead + Unpin>(h: pb::FileHeader, r: &mut R, hub: Arc<Hub>, ctx: Arc<FileCtx>) -> Result<()> {
     use nya_transport::files;
-    let h = files::read_header(&mut r).await?;
     match pb::FilePurpose::try_from(h.purpose).unwrap_or(pb::FilePurpose::Unspecified) {
         pb::FilePurpose::Save if ctx.files_on => {
             let dir = tokio::task::spawn_blocking(crate::winutil::receive_dir).await?;
-            let result = files::receive_to_dir(&mut r, &h, &dir, |_| {}).await;
+            let result = files::receive_to_dir(r, &h, &dir, |_| {}).await;
             let done_batch = {
                 let mut b = ctx.batches.lock().unwrap();
                 if let Ok(p) = &result {
@@ -1019,10 +1058,9 @@ async fn receive_file(mut r: RecvStream, hub: Arc<Hub>, ctx: Arc<FileCtx>) -> Re
         }
         pb::FilePurpose::Clipboard if ctx.clip_files_on => {
             let Some(root) = ctx.incoming.root(h.transfer_id) else {
-                let _ = r.stop(0u32.into());
                 return Ok(());
             };
-            let result = files::receive_to_tree(&mut r, &h, &root, |_| {}).await;
+            let result = files::receive_to_tree(r, &h, &root, |_| {}).await;
             let r = result.map(|_| ()).map_err(|e| format!("接收 {} 失败：{e:#}", if h.path.is_empty() { &h.name } else { &h.path }));
             if let Some(done) = ctx.incoming.file_done(h.transfer_id, r) {
                 match &done {
@@ -1033,19 +1071,16 @@ async fn receive_file(mut r: RecvStream, hub: Arc<Hub>, ctx: Arc<FileCtx>) -> Re
             }
         }
         pb::FilePurpose::ClipboardImage if ctx.images_on => {
-            let dib = files::receive_to_vec(&mut r, &h, files::MAX_IMAGE_BYTES).await?;
+            let dib = files::receive_to_vec(r, &h, files::MAX_IMAGE_BYTES).await?;
             hub.send(Cmd::ClipboardImage(crate::ipc_pb::ClipboardImage { dib }));
         }
-        _ => {
-            let _ = r.stop(0u32.into());
-        }
+        _ => {}
     }
     Ok(())
 }
 
 /// Accept client uni streams: input events and file transfers.
-async fn client_streams(conn: Connection, hub: Arc<Hub>, ctx: FileCtx) -> Result<()> {
-    let ctx = Arc::new(ctx);
+async fn client_streams(conn: Connection, hub: Arc<Hub>, ctx: Arc<FileCtx>) -> Result<()> {
     loop {
         let mut r = conn.accept_uni().await?;
         let hub = hub.clone();
@@ -1706,6 +1741,73 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    /// FEATURE_TCP_FILES: the session hands the client a token, the client
+    /// opens the TCP file channel on the same port, and the pasted files
+    /// travel over it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clipboard_files_over_tcp_file_channel() {
+        let dir = std::env::temp_dir().join(format!("nya-tcp-files-{}", nya_proto::now_us()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let server_id = server_identity();
+        let server_fp = server_id.fingerprint();
+        let auth = Arc::new(AuthStore::open(&dir).unwrap());
+        let key = auth.key();
+        let (hub, cmd_rx) = Hub::new();
+        let (done_tx, mut done_rx) = mpsc::unbounded_channel();
+        tokio::spawn(pasting_host(hub.clone(), cmd_rx, done_tx));
+        let ep = nya_transport::endpoint::server_endpoint("127.0.0.1:0".parse().unwrap(), &server_id).unwrap();
+        let addr = ep.local_addr().unwrap();
+        let state = State::new(cpb::Mode::Standalone, dir.clone(), Default::default(), server_fp.to_string(), auth, hub);
+        let (sid, expected) = (server_id.clone(), state.file_channels.clone());
+        tokio::spawn(async move { nya_transport::filechan::listen(addr, &sid, expected).await.unwrap() });
+        tokio::spawn(serve_endpoint(ep, state));
+        let client_id = Identity::generate().unwrap();
+        let (mut c, _) = connect(addr, &client_id, server_fp).await;
+        assert!(pair(&mut c, &client_id, server_fp, &key).await.ok);
+        c.conn.close(0u32.into(), b"");
+        let (mut c, w) = connect(addr, &client_id, server_fp).await;
+        assert!(w.features.contains(&(Feature::TcpFiles as u32)));
+
+        // The host offers the file channel; the client opens it.
+        let token = loop {
+            let m: pb::ControlMsg = timeout(Duration::from_secs(5), expect_msg(&mut c.recv, MAX_MESSAGE_LEN)).await.unwrap().unwrap();
+            if let Some(Msg::FileChannel(f)) = m.msg {
+                break f.token;
+            }
+        };
+        let on_file: nya_transport::filechan::OnFile = Arc::new(|_, _| {});
+        let ch = nya_transport::filechan::connect(c.conn.remote_address(), &client_id, server_fp, &token, on_file).await.unwrap();
+        let link = nya_transport::files::FileLink::new(c.conn.clone());
+        link.set_tcp(Some(ch));
+
+        let src = dir.join("src");
+        std::fs::create_dir_all(src.join("docs")).unwrap();
+        std::fs::write(src.join("docs").join("a.txt"), b"over tcp").unwrap();
+        let big: Vec<u8> = (0..2_000_000u32).map(|i| (i % 253) as u8).collect();
+        std::fs::write(src.join("big.bin"), &big).unwrap();
+        let mut outgoing = nya_transport::clipfiles::Outgoing::default();
+        let offer = outgoing.offer(&[src.join("docs"), src.join("big.bin")], true).unwrap();
+        let id = offer.transfer_id;
+        write_msg(&mut c.send, &ctl(Msg::FileOffer(offer))).await.unwrap();
+        loop {
+            let m: pb::ControlMsg = timeout(Duration::from_secs(5), expect_msg(&mut c.recv, MAX_MESSAGE_LEN)).await.unwrap().unwrap();
+            if matches!(m.msg, Some(Msg::FileRequest(ref r)) if r.transfer_id == id) {
+                break;
+            }
+        }
+        assert!(link.tcp().is_some(), "sent over the TCP file channel");
+        let items = outgoing.items(id).unwrap();
+        nya_transport::clipfiles::send_items_with(&link, id, &items, pb::FilePurpose::Clipboard, None, |_, _| {}).await.unwrap();
+
+        let done = timeout(Duration::from_secs(10), done_rx.recv()).await.unwrap().unwrap();
+        assert_eq!(done.error, "");
+        let paths: Vec<std::path::PathBuf> = done.paths.iter().map(std::path::PathBuf::from).collect();
+        assert_eq!(std::fs::read(paths[0].join("a.txt")).unwrap(), b"over tcp");
+        assert_eq!(std::fs::read(&paths[1]).unwrap(), big);
+        let _ = std::fs::remove_dir_all(paths[0].parent().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Client copies a folder and a file; the host pastes: the service asks

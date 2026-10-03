@@ -121,7 +121,7 @@ pub fn install(port: Option<u16>) -> Result<String> {
         format!("已安装并启动服务 {SERVICE_NAME}"),
         format!("  程序：{}", exe.display()),
         format!("  数据：{}", dir.display()),
-        format!("  端口：UDP {}（已添加防火墙规则）", cfg.port),
+        format!("  端口：UDP 和 TCP {}（已添加防火墙规则）", cfg.port),
         format!("  配对码：{}", key.to_code()),
         format!("  证书指纹：{}", identity.fingerprint()),
     ];
@@ -195,24 +195,28 @@ pub fn uninstall(purge: bool) -> Result<String> {
     Ok(out.join("\n"))
 }
 
-/// (Re)create the inbound UDP rule for the service executable.
+/// (Re)create the inbound rules for the service executable: UDP (QUIC) and
+/// TCP (the file channel, FEATURE_TCP_FILES), both named after the service.
 fn firewall_allow_program(port: u16, exe: &std::path::Path) -> Result<()> {
     let _ = run("netsh", &["advfirewall", "firewall", "delete", "rule", &format!("name={SERVICE_NAME}")]);
-    run(
-        "netsh",
-        &[
-            "advfirewall",
-            "firewall",
-            "add",
-            "rule",
-            &format!("name={SERVICE_NAME}"),
-            "dir=in",
-            "action=allow",
-            "protocol=UDP",
-            &format!("localport={port}"),
-            &format!("program={}", exe.display()),
-        ],
-    )
+    for protocol in ["UDP", "TCP"] {
+        run(
+            "netsh",
+            &[
+                "advfirewall",
+                "firewall",
+                "add",
+                "rule",
+                &format!("name={SERVICE_NAME}"),
+                "dir=in",
+                "action=allow",
+                &format!("protocol={protocol}"),
+                &format!("localport={port}"),
+                &format!("program={}", exe.display()),
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 /// Called by the running service (SYSTEM) when the port changes.
