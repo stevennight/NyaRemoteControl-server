@@ -148,11 +148,11 @@ pub fn thread(rx: Receiver<ClipCmd>, sink: Sink) {
         let ours = virtual_files.is_ours();
         let files = !ours && clipboard::has_files();
         if !retry {
-            tracing::info!(
-                "clipboard changed ({seq}): owner process {}, {}",
-                clipboard::owner_process().map_or("-".into(), |p| p.to_string()),
-                if ours { "the client's files" } else if files { "files" } else if clipboard::has_text() { "text" } else { "other" }
-            );
+            let what = if ours { "the client's files" } else if files { "files" } else if clipboard::has_text() { "text" } else { "other" };
+            tracing::info!("clipboard changed ({seq}): copied by {}, {what}", clipboard::owner_description());
+            if what == "other" || what == "files" {
+                tracing::info!("clipboard formats: {}", clipboard::format_names());
+            }
         }
         if ours {
             // The client's own files (not yet fetched): nothing to offer back.
