@@ -659,6 +659,8 @@ impl Pipeline {
             bitrate_note: String::new(),
             fec_percent: 0, // filled in by the network side
             slot: self.slot,
+            path_loss_pct: 0.0, // filled in by the network side
+            path_rtt_ms: 0.0,
         }));
         self.stats.since = Some(Instant::now());
     }

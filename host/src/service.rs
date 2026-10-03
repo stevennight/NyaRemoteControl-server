@@ -100,25 +100,48 @@ async fn listen(state: Arc<State>, identity: Identity) -> Result<()> {
             }
         };
         state.set_listening(Ok(endpoint.local_addr().map(|a| a.to_string()).unwrap_or_default()));
-        // File transfers: TCP on the same port (FEATURE_TCP_FILES). Without
-        // it they stay on QUIC, so a failure here is only a warning.
-        let files_tcp = {
-            let (state, identity, port) = (state.clone(), identity.clone(), cfg.port);
-            let ip = cfg.bind.parse::<IpAddr>().ok();
+        // TCP on the same port: the file channel (FEATURE_TCP_FILES) and whole
+        // sessions over TCP (QUIC over TCP, a second QUIC endpoint served like
+        // the UDP one). Without TCP everything still works over UDP, so a
+        // failure here is only a warning.
+        let tcp_addr = cfg.bind.parse::<IpAddr>().ok().map(|ip| SocketAddr::new(ip, cfg.port));
+        let tunnel = tcp_addr.map(nya_transport::tcptunnel::TunnelSocket::new);
+        let tunnel_ep = tunnel.clone().and_then(|t| match nya_transport::tcptunnel::server_endpoint(t, &identity) {
+            Ok(ep) => Some(ep),
+            Err(e) => {
+                tracing::warn!("sessions over TCP unavailable: {e:#}");
+                None
+            }
+        });
+        let tcp = {
+            let (state, identity, tunnel) = (state.clone(), identity.clone(), tunnel.clone());
             async move {
-                let Some(ip) = ip else { return std::future::pending().await };
-                if let Err(e) = nya_transport::filechan::listen(SocketAddr::new(ip, port), &identity, state.file_channels.clone()).await {
-                    tracing::warn!("file channel: cannot listen on TCP {port}: {e:#} (files go over QUIC)");
+                let Some(addr) = tcp_addr else { return std::future::pending().await };
+                if let Err(e) = nya_transport::filechan::listen(addr, &identity, state.file_channels.clone(), tunnel).await {
+                    tracing::warn!("cannot listen on TCP {addr}: {e:#} (sessions and files over UDP only)");
                 }
                 std::future::pending::<()>().await
             }
         };
+        let over_tcp = {
+            let (ep, state) = (tunnel_ep.clone(), state.clone());
+            async move {
+                match ep {
+                    Some(ep) => net::serve_endpoint(ep, state).await,
+                    None => std::future::pending().await,
+                }
+            }
+        };
         tokio::select! {
             r = net::serve_endpoint(endpoint.clone(), state.clone()) => return r,
-            _ = files_tcp => {}
+            r = over_tcp => return r,
+            _ = tcp => {}
             _ = state.rebind.notified() => {
                 tracing::info!("listen address changed; re-binding");
                 endpoint.close(0u32.into(), "被控端的监听地址已更改".as_bytes());
+                if let Some(ep) = &tunnel_ep {
+                    ep.close(0u32.into(), "被控端的监听地址已更改".as_bytes());
+                }
                 let _ = tokio::time::timeout(Duration::from_secs(3), endpoint.wait_idle()).await;
             }
         }

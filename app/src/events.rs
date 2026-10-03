@@ -19,6 +19,8 @@ pub enum NetCmd {
     ClipboardPaste(u64, crate::transfer::PasteReply),
     /// Stop a transfer (both sides), dropping what was received of it.
     CancelTransfer(u64),
+    /// Connection mode changed ("auto" | "udp" | "tcp"): reconnect if needed.
+    SetTransport(crate::net::Transport),
     /// Encoded MIC datagram.
     Mic(Vec<u8>),
     Quit,
@@ -76,6 +78,8 @@ pub enum UiEvent {
     /// A new decoded frame is ready in the frame store of this slot.
     Frame(u32),
     Reconnecting(String),
+    /// The session's connection: over TCP (QUIC over TCP) or UDP.
+    Transport { tcp: bool },
     Disconnected(String),
     Hotkey(Hotkey),
     ConnectDone(ConnectDone),

@@ -403,6 +403,8 @@ async fn run_session(
     };
 
     let mut replay = Replay::default();
+    // QUIC packets sent / lost at the last ServerStats (ServerStats.path_loss_pct).
+    let mut path_seen = (0u64, 0u64);
     let folders_on = neg.has(Feature::FolderMount);
     let print_on = neg.has(Feature::Print);
     let mut prints = state.prints.subscribe();
@@ -682,6 +684,12 @@ async fn run_session(
                     Some(Ev::DisplayChanged(d)) => { let _ = ctl_tx.send(ctl(Msg::DisplayChanged(d))).await; }
                     Some(Ev::Stats(mut s)) => {
                         s.fec_percent = if dgram.on.load(Ordering::Relaxed) { dgram.fec.load(Ordering::Relaxed) } else { 0 };
+                        // Loss and round trip of the connection since the last report.
+                        let path = conn.stats().path;
+                        let (sent, lost) = (path.sent_packets - path_seen.0, path.lost_packets - path_seen.1);
+                        path_seen = (path.sent_packets, path.lost_packets);
+                        s.path_loss_pct = if sent > 0 { lost as f32 * 100.0 / sent as f32 } else { 0.0 };
+                        s.path_rtt_ms = path.rtt.as_secs_f32() * 1000.0;
                         s.bitrate_note = match &abr {
                             Some(a) => a.summary(std::time::Instant::now()),
                             None => "固定码率".into(),
@@ -1209,6 +1217,18 @@ mod tests {
 
     async fn connect(addr: SocketAddr, id: &Identity, pin: Fingerprint) -> (Client, pb::Welcome) {
         let ep = nya_transport::endpoint::client_endpoint(addr).unwrap();
+        let conn = nya_transport::endpoint::connect(&ep, addr, id, Some(pin)).await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        let hello = negotiate::hello(&LocalVersion::current(), "test", "0");
+        write_msg(&mut send, &hello).await.unwrap();
+        let reply: pb::HelloReply = expect_msg(&mut recv, MAX_MESSAGE_LEN).await.unwrap();
+        let Some(pb::hello_reply::Reply::Welcome(w)) = reply.reply else { panic!("rejected") };
+        (Client { _ep: ep, conn, send, recv }, w)
+    }
+
+    /// [`connect`] over TCP (QUIC over TCP).
+    async fn connect_tcp(addr: SocketAddr, id: &Identity, pin: Fingerprint) -> (Client, pb::Welcome) {
+        let ep = nya_transport::tcptunnel::client_endpoint(addr).await.unwrap();
         let conn = nya_transport::endpoint::connect(&ep, addr, id, Some(pin)).await.unwrap();
         let (mut send, mut recv) = conn.open_bi().await.unwrap();
         let hello = negotiate::hello(&LocalVersion::current(), "test", "0");
@@ -1757,6 +1777,45 @@ mod tests {
         }
     }
 
+    /// A whole session over TCP (QUIC over TCP): the host's TCP listener
+    /// hands it to the second endpoint, which serves it like a UDP one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_over_tcp() {
+        let dir = std::env::temp_dir().join(format!("nya-over-tcp-{}", nya_proto::now_us()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let server_id = server_identity();
+        let server_fp = server_id.fingerprint();
+        let auth = Arc::new(AuthStore::open(&dir).unwrap());
+        let key = auth.key();
+        let (hub, cmd_rx) = Hub::new();
+        tokio::spawn(big_frame_host(hub.clone(), cmd_rx));
+        let state = State::new(cpb::Mode::Standalone, dir.clone(), Default::default(), server_fp.to_string(), auth, hub);
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let tunnel = nya_transport::tcptunnel::TunnelSocket::new(addr);
+        let ep = nya_transport::tcptunnel::server_endpoint(tunnel.clone(), &server_id).unwrap();
+        let (sid, expected) = (server_id.clone(), state.file_channels.clone());
+        tokio::spawn(async move { nya_transport::filechan::listen(addr, &sid, expected, Some(tunnel)).await.unwrap() });
+        tokio::spawn(serve_endpoint(ep, state));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let client_id = Identity::generate().unwrap();
+        let (mut c, _) = connect_tcp(addr, &client_id, server_fp).await;
+        assert!(pair(&mut c, &client_id, server_fp, &key).await.ok, "pairing over TCP");
+        c.conn.close(0u32.into(), b"");
+        let (mut c, w) = connect_tcp(addr, &client_id, server_fp).await;
+        assert!(w.features.contains(&(Feature::TcpFiles as u32)));
+        write_msg(&mut c.send, &ctl(Msg::Ping(pb::Ping { t_us: 42 }))).await.unwrap();
+        loop {
+            let m: pb::ControlMsg = timeout(Duration::from_secs(5), expect_msg(&mut c.recv, MAX_MESSAGE_LEN)).await.unwrap().unwrap();
+            if let Some(Msg::Pong(p)) = m.msg {
+                assert_eq!(p.t_us, 42);
+                break;
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The client cancels files the host is pasting: the paste fails at
     /// once and what had arrived is removed.
     #[tokio::test(flavor = "multi_thread")]
@@ -1826,7 +1885,7 @@ mod tests {
         let addr = ep.local_addr().unwrap();
         let state = State::new(cpb::Mode::Standalone, dir.clone(), Default::default(), server_fp.to_string(), auth, hub);
         let (sid, expected) = (server_id.clone(), state.file_channels.clone());
-        tokio::spawn(async move { nya_transport::filechan::listen(addr, &sid, expected).await.unwrap() });
+        tokio::spawn(async move { nya_transport::filechan::listen(addr, &sid, expected, None).await.unwrap() });
         tokio::spawn(serve_endpoint(ep, state));
         let client_id = Identity::generate().unwrap();
         let (mut c, _) = connect(addr, &client_id, server_fp).await;

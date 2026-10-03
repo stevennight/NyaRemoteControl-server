@@ -86,6 +86,9 @@ pub struct Defaults {
     pub print_mode: String,
     /// HDR10 video when the host desktop and this window's monitor are HDR.
     pub hdr: bool,
+    /// How the session travels: "auto" (UDP; TCP when UDP does not connect
+    /// or loses too much) | "udp" | "tcp" (QUIC over TCP).
+    pub transport: String,
 }
 
 /// One folder shared with the host.
@@ -154,6 +157,7 @@ impl Default for Defaults {
             shared_folders: Vec::new(),
             print_mode: "print".into(),
             hdr: true,
+            transport: "auto".into(),
         }
     }
 }

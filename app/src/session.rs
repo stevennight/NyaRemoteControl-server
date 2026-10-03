@@ -122,6 +122,9 @@ pub struct Session {
     pub relative: bool,
     pub game: bool,
     pub show_stats: bool,
+    /// Connection mode (setting) and what the connection uses now.
+    pub transport: crate::net::Transport,
+    pub via_tcp: Option<bool>,
     pub summary: Summary,
     last_tick: Instant,
     status_log: Instant,
@@ -222,6 +225,8 @@ impl Session {
             relative: false,
             game,
             show_stats: false,
+            transport: crate::net::Transport::Auto,
+            via_tcp: None,
             summary: Summary::default(),
             last_tick: Instant::now(),
             status_log: Instant::now(),
@@ -749,6 +754,19 @@ impl Session {
             lines.push(format!("── 主窗口 · {title} ──"));
         }
         stream_lines(&mut lines, self.stream.as_ref(), self.server_stats.as_ref(), &self.summary, true);
+        if let Some(tcp) = self.via_tcp {
+            let path = self
+                .server_stats
+                .as_ref()
+                .map(|st| format!("，丢包 {:.1}%，往返 {:.0} ms", st.path_loss_pct, st.path_rtt_ms))
+                .unwrap_or_default();
+            let mode = match self.transport {
+                crate::net::Transport::Auto => "自动",
+                crate::net::Transport::Udp => "仅 UDP",
+                crate::net::Transport::Tcp => "仅 TCP",
+            };
+            lines.push(format!("连接：{}（{mode}）{path}", if tcp { "TCP" } else { "UDP" }));
+        }
         for v in self.views.values() {
             lines.push(String::new());
             lines.push(format!("── 窗口 · {} ──", self.display_title(v.display_id)));

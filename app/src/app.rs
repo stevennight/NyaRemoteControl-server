@@ -413,6 +413,7 @@ impl App {
         self.attempt += 1;
         let attempt = self.attempt;
         let (id, name, ui, address) = (self.identity.clone(), self.client_name(), self.ui_tx.clone(), p.address.clone());
+        let transport = net::Transport::parse(&self.cfg.settings_for(&p.address).transport);
         let ui2 = ui.clone();
         let prompt: PairPrompt = Arc::new(move || {
             let (tx, rx) = std::sync::mpsc::channel();
@@ -422,7 +423,7 @@ impl App {
         let task = self.rt.spawn(async move {
             let res = async {
                 let addr = nya_transport::endpoint::resolve(&address, nya_proto::DEFAULT_PORT)?;
-                net::connect(addr, &id, pinned, &name, Some(prompt)).await
+                net::connect(addr, &id, pinned, &name, Some(prompt), transport, false).await
             }
             .await;
             let (result, pin_mismatch) = match res {
@@ -530,6 +531,9 @@ impl App {
             start: start_request(&d, vd, d.hdr && self.renderer.as_ref().is_some_and(|r| r.display_hdr())),
             extra: Default::default(),
             shares: std::sync::Arc::new(d.shares()),
+            transport: net::Transport::parse(&d.transport),
+            prefer_tcp_until: None,
+            tcp_hold: net::FIRST_TCP_HOLD,
         };
         let opts = SessionOptions { hw_decode: d.hw_decode, audio: d.audio, clipboard: d.clipboard };
         let mut session = Session::start(&self.rt, *link, params, &dev, &opts, self.ui_tx.for_conn(self.conn_id), label);
@@ -544,6 +548,7 @@ impl App {
         }
         if let Some(s) = &mut self.session {
             s.mic_auto = d.mic;
+            s.transport = net::Transport::parse(&d.transport);
         }
         self.set_grab(d.grab_keyboard);
         self.update_title();
@@ -598,6 +603,9 @@ impl App {
             None => "NyaRemoteControl".to_string(),
             Some(s) => {
                 let mut t = format!("{} — NyaRemoteControl", s.label);
+                if s.via_tcp == Some(true) {
+                    t += " · TCP";
+                }
                 if let Some(st) = &s.stream {
                     let c = st.config.clone().unwrap_or_default();
                     t += &format!(" — {}x{}@{} {} {} kbps", c.width, c.height, s.summary.fps, st.encoder_name, s.summary.kbps);
@@ -769,6 +777,13 @@ impl App {
                         s.set_bitrate_policy(p);
                     }
                     self.remember(|d| d.bitrate_policy = crate::ui::policy_key(p).into());
+                }
+                Action::SetTransport(t) => {
+                    if let Some(s) = &mut self.session {
+                        s.transport = t;
+                        let _ = s.net_tx.send(crate::events::NetCmd::SetTransport(t));
+                    }
+                    self.remember(|d| d.transport = t.key().into());
                 }
                 Action::Disconnect => self.end_session(Some((Kind::Info, "已断开连接".into()))),
                 Action::PickFiles => {
@@ -1417,6 +1432,7 @@ impl ApplicationHandler<UiEvent> for App {
                         }
                     }
                     UiEvent::ServerStats(st) => s.server_stats = Some(st),
+                    UiEvent::Transport { tcp } => s.via_tcp = Some(tcp),
                     UiEvent::Clipboard(t) => s.clipboard_from_host(t),
                     UiEvent::Reconnecting(msg) => {
                         s.status = format!("连接中断，正在重连…（{msg}）");

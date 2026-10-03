@@ -33,6 +33,101 @@ pub struct Link {
     pub neg: Negotiated,
     pub welcome: pb::Welcome,
     pub server_fp: Fingerprint,
+    /// QUIC over TCP (else UDP).
+    pub via_tcp: bool,
+}
+
+/// How a session travels (setting `transport`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    /// UDP; TCP when UDP does not connect or loses too much, back to UDP
+    /// when it works again (see [`supervise`]).
+    Auto,
+    Udp,
+    /// QUIC over TCP (nya_transport::tcptunnel).
+    Tcp,
+}
+
+impl Transport {
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "udp" => Self::Udp,
+            "tcp" => Self::Tcp,
+            _ => Self::Auto,
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Udp => "udp",
+            Self::Tcp => "tcp",
+        }
+    }
+}
+
+/// Auto: how long the preferred transport may try alone before the other one starts too.
+const HEAD_START: Duration = Duration::from_millis(2500);
+/// Auto: host-reported loss on UDP that counts as bad, and for how long it
+/// has to last before the session moves to TCP.
+const BAD_LOSS_PCT: f32 = 10.0;
+const BAD_FOR: Duration = Duration::from_secs(20);
+/// Auto, on TCP: how often UDP is tried again.
+const UDP_PROBE_EVERY: Duration = Duration::from_secs(300);
+/// Auto: after moving to TCP for loss, stay this long (doubling each time, up to an hour).
+pub const FIRST_TCP_HOLD: Duration = Duration::from_secs(600);
+
+type Opened = (Endpoint, Connection, bool);
+
+async fn open_one(addr: SocketAddr, id: Identity, pinned: Option<Fingerprint>, tcp: bool) -> Result<Opened> {
+    let endpoint = if tcp {
+        nya_transport::tcptunnel::client_endpoint(addr).await?
+    } else {
+        nya_transport::endpoint::client_endpoint(addr)?
+    };
+    let conn = timeout(Duration::from_secs(8), nya_transport::endpoint::connect(&endpoint, addr, &id, pinned))
+        .await
+        .map_err(|_| anyhow!("{} 连接超时", if tcp { "TCP" } else { "UDP" }))??;
+    Ok((endpoint, conn, tcp))
+}
+
+/// The QUIC connection: over UDP, over TCP, or (auto) the preferred one with
+/// a head start and then both at once — the first that connects is used.
+async fn open(addr: SocketAddr, id: &Identity, pinned: Option<Fingerprint>, mode: Transport, prefer_tcp: bool) -> Result<Opened> {
+    let first_tcp = match mode {
+        Transport::Udp => return open_one(addr, id.clone(), pinned, false).await,
+        Transport::Tcp => return open_one(addr, id.clone(), pinned, true).await,
+        Transport::Auto => prefer_tcp,
+    };
+    let a = open_one(addr, id.clone(), pinned, first_tcp);
+    tokio::pin!(a);
+    let mut err_a = None;
+    tokio::select! {
+        r = &mut a => match r {
+            Ok(x) => return Ok(x),
+            Err(e) => err_a = Some(e),
+        },
+        _ = tokio::time::sleep(HEAD_START) => {}
+    }
+    let b = open_one(addr, id.clone(), pinned, !first_tcp);
+    tokio::pin!(b);
+    let mut err_b = None;
+    loop {
+        tokio::select! {
+            r = &mut a, if err_a.is_none() => match r {
+                Ok(x) => return Ok(x),
+                Err(e) => err_a = Some(e),
+            },
+            r = &mut b, if err_b.is_none() => match r {
+                Ok(x) => return Ok(x),
+                Err(e) => err_b = Some(e),
+            },
+        }
+        if let (Some(ea), Some(eb)) = (&err_a, &err_b) {
+            let (udp, tcp) = if first_tcp { (eb, ea) } else { (ea, eb) };
+            bail!("UDP：{udp:#}；TCP：{tcp:#}（检查组网是否连通、被控端是否运行、防火墙和端口转发的 UDP / TCP 端口）");
+        }
+    }
 }
 
 fn ctl(m: Msg) -> pb::ControlMsg {
@@ -46,11 +141,11 @@ pub async fn connect(
     pinned: Option<Fingerprint>,
     client_name: &str,
     prompt: Option<PairPrompt>,
+    mode: Transport,
+    prefer_tcp: bool,
 ) -> Result<Link> {
-    let endpoint = nya_transport::endpoint::client_endpoint(addr)?;
-    let conn = timeout(Duration::from_secs(8), nya_transport::endpoint::connect(&endpoint, addr, id, pinned))
-        .await
-        .map_err(|_| anyhow!("连接 {addr} 超时（检查组网是否连通、被控端是否运行、防火墙 UDP 端口）"))??;
+    let (endpoint, conn, via_tcp) = open(addr, id, pinned, mode, prefer_tcp).await.with_context(|| format!("连接 {addr} 失败"))?;
+    tracing::info!("connected to {addr} over {}", if via_tcp { "TCP" } else { "UDP" });
     let server_fp = peer_fingerprint(&conn).ok_or_else(|| anyhow!("被控端没有证书"))?;
     let (mut send, mut recv) = conn.open_bi().await?;
 
@@ -94,7 +189,7 @@ pub async fn connect(
     } else if pinned.is_none() {
         tracing::warn!("被控端已认识本机但本机没有保存它的指纹；将信任并保存 {server_fp}");
     }
-    Ok(Link { endpoint, conn, send, recv, neg, welcome, server_fp })
+    Ok(Link { endpoint, conn, send, recv, neg, welcome, server_fp, via_tcp })
 }
 
 /// Everything needed to (re)start the session.
@@ -138,6 +233,12 @@ pub struct Params {
     pub extra: std::collections::BTreeMap<u32, pb::StartStream>,
     /// Folders shown on the host as a drive (FEATURE_FOLDER_MOUNT).
     pub shares: Arc<nya_transport::folders::Shares>,
+    /// Connection mode (setting `transport`).
+    pub transport: Transport,
+    /// Auto: try TCP first until then (moved to TCP for loss).
+    pub prefer_tcp_until: Option<Instant>,
+    /// Auto: how long the next move to TCP for loss lasts.
+    pub tcp_hold: Duration,
 }
 
 pub struct Sinks {
@@ -152,16 +253,30 @@ enum End {
     UserQuit,
     Fatal(String),
     Lost(String),
+    /// Reconnect over TCP (`true`) or UDP, for this reason.
+    Switch(bool, String),
 }
 
 /// Run the session; reconnect for up to two minutes when the link drops.
 pub async fn supervise(first: Link, mut p: Params, mut cmds: mpsc::UnboundedReceiver<NetCmd>, sinks: Sinks) {
     let mut link = Some(first);
     let mut lost_since: Option<Instant> = None;
+    // The next connection's transport when switching (else the setting).
+    let mut next: Option<Transport> = None;
     loop {
         let l = match link.take() {
             Some(l) => l,
-            None => match connect(p.addr, &p.identity, Some(p.pinned), &p.name, None).await {
+            None => match connect(
+                p.addr,
+                &p.identity,
+                Some(p.pinned),
+                &p.name,
+                None,
+                next.take().unwrap_or(p.transport),
+                p.prefer_tcp_until.is_some_and(|t| Instant::now() < t),
+            )
+            .await
+            {
                 Ok(l) => l,
                 Err(e) => {
                     let since = *lost_since.get_or_insert_with(Instant::now);
@@ -199,6 +314,17 @@ pub async fn supervise(first: Link, mut p: Params, mut cmds: mpsc::UnboundedRece
                 tracing::warn!("connection lost: {msg}");
                 sinks.ui.send(UiEvent::Reconnecting(msg));
             }
+            End::Switch(tcp, why) => {
+                tracing::info!("switching to {}: {why}", if tcp { "TCP" } else { "UDP" });
+                if tcp && p.transport == Transport::Auto {
+                    p.prefer_tcp_until = Some(Instant::now() + p.tcp_hold);
+                    p.tcp_hold = (p.tcp_hold * 2).min(Duration::from_secs(3600));
+                } else if !tcp {
+                    p.prefer_tcp_until = None;
+                }
+                next = Some(if tcp { Transport::Tcp } else { Transport::Udp });
+                sinks.ui.send(UiEvent::Reconnecting(format!("{why}，正在改用 {}", if tcp { "TCP" } else { "UDP" })));
+            }
         }
     }
 }
@@ -225,8 +351,14 @@ fn track(p: &mut Params, m: &pb::ControlMsg) {
 }
 
 async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetCmd>, sinks: &Sinks) -> End {
-    let Link { endpoint: _endpoint, conn, mut send, mut recv, neg, .. } = link;
+    let Link { endpoint: _endpoint, conn, mut send, mut recv, neg, via_tcp, .. } = link;
     sinks.ui.send(UiEvent::Connected);
+    sinks.ui.send(UiEvent::Transport { tcp: via_tcp });
+    // Auto: since when the host has reported bad loss on UDP.
+    let mut bad_since: Option<Instant> = None;
+    // Auto, on TCP: try UDP again now and then.
+    let mut udp_probe = tokio::time::interval_at(tokio::time::Instant::now() + UDP_PROBE_EVERY, UDP_PROBE_EVERY);
+    let mut probe: Option<tokio::task::JoinHandle<bool>> = None;
 
     let setup = async {
         write_msg(&mut send, &ctl(Msg::ClientCaps(p.caps.clone()))).await?;
@@ -327,7 +459,19 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
                     Some(Msg::StreamStarted(s)) => sinks.ui.send(UiEvent::StreamStarted(s)),
                     Some(Msg::StreamError(e)) => sinks.ui.send(UiEvent::StreamError(e.slot, e.message)),
                     Some(Msg::DisplayChanged(d)) => tracing::info!("host displays changed: {} displays", d.displays.len()),
-                    Some(Msg::ServerStats(s)) => sinks.ui.send(UiEvent::ServerStats(s)),
+                    Some(Msg::ServerStats(s)) => {
+                        if p.transport == Transport::Auto && !via_tcp && s.slot == 0 {
+                            if s.path_loss_pct >= BAD_LOSS_PCT {
+                                let since = *bad_since.get_or_insert_with(Instant::now);
+                                if since.elapsed() >= BAD_FOR {
+                                    break End::Switch(true, format!("UDP 丢包严重（{:.0}%）", s.path_loss_pct));
+                                }
+                            } else {
+                                bad_since = None;
+                            }
+                        }
+                        sinks.ui.send(UiEvent::ServerStats(s));
+                    }
                     Some(Msg::ClipboardText(c)) if clipboard => sinks.ui.send(UiEvent::Clipboard(c.text)),
                     Some(Msg::Pong(p)) => sinks.stats.on_pong(p.t_us, p.server_t_us),
                     Some(Msg::FileOffer(o)) if clip_on => {
@@ -427,6 +571,14 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
                         tokio::spawn(crate::transfer::send_image(files_link.clone(), dib));
                     }
                 }
+                Some(NetCmd::SetTransport(t)) => {
+                    p.transport = t;
+                    match t {
+                        Transport::Tcp if !via_tcp => break End::Switch(true, "已选择 TCP".into()),
+                        Transport::Udp if via_tcp => break End::Switch(false, "已选择 UDP".into()),
+                        _ => {}
+                    }
+                }
                 Some(NetCmd::CancelTransfer(id)) => {
                     tracing::info!("transfer {id:016x} cancelled here");
                     cancel_transfer(&files_link, &sinks.clip, id, "已取消");
@@ -469,6 +621,29 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
                     break End::UserQuit;
                 }
             },
+            _ = udp_probe.tick(), if p.transport == Transport::Auto && via_tcp && probe.is_none()
+                && p.prefer_tcp_until.is_none_or(|t| Instant::now() >= t) => {
+                let (addr, id, pinned) = (p.addr, p.identity.clone(), p.pinned);
+                probe = Some(tokio::spawn(async move {
+                    match open_one(addr, id, Some(pinned), false).await {
+                        Ok((ep, conn, _)) => {
+                            conn.close(0u32.into(), b"probe");
+                            ep.wait_idle().await;
+                            true
+                        }
+                        Err(e) => {
+                            tracing::info!("UDP still not usable: {e:#}");
+                            false
+                        }
+                    }
+                }));
+            }
+            Some(udp_ok) = async { match probe.as_mut() { Some(h) => h.await.ok(), None => std::future::pending().await } } => {
+                probe = None;
+                if udp_ok {
+                    break End::Switch(false, "UDP 已恢复".into());
+                }
+            }
             Some(m) = internal_rx.recv() => {
                 if let Err(e) = write_msg(&mut send, &m).await {
                     break End::Lost(format!("control: {e}"));
@@ -623,5 +798,50 @@ async fn read_datagrams(
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A host reachable over TCP only (UDP blocked): auto connects over TCP
+    /// after UDP's head start; UDP only does not connect.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn auto_falls_back_to_tcp() {
+        use tokio::io::AsyncReadExt;
+        let (host_id, client_id) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let socket = nya_transport::tcptunnel::TunnelSocket::new(addr);
+        let server = nya_transport::tcptunnel::server_endpoint(socket.clone(), &host_id).unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut tcp, peer)) = listener.accept().await {
+                let mut pre = [0u8; 8];
+                if tcp.read_exact(&mut pre).await.is_ok() {
+                    socket.add(tcp, peer);
+                }
+            }
+        });
+        tokio::spawn(async move {
+            while let Some(i) = server.accept().await {
+                tokio::spawn(async move {
+                    if let Ok(c) = i.await {
+                        c.closed().await;
+                    }
+                });
+            }
+        });
+        let pin = Some(host_id.fingerprint());
+        let start = Instant::now();
+        let (_ep, conn, tcp) = open(addr, &client_id, pin, Transport::Auto, false).await.unwrap();
+        assert!(tcp, "over TCP");
+        assert!(start.elapsed() >= HEAD_START, "UDP had its head start");
+        conn.close(0u32.into(), b"");
+        // Preferring TCP (moved there for loss): connects at once.
+        let start = Instant::now();
+        let (_ep, _conn, tcp) = open(addr, &client_id, pin, Transport::Auto, true).await.unwrap();
+        assert!(tcp && start.elapsed() < HEAD_START);
+        assert!(open(addr, &client_id, pin, Transport::Udp, false).await.is_err(), "no UDP there");
     }
 }

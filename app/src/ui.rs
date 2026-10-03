@@ -34,6 +34,7 @@ pub enum Action {
     DismissOffer(u64),
     DismissTransfer(u64),
     CancelTransfer(u64),
+    SetTransport(crate::net::Transport),
     OpenFolder(std::path::PathBuf),
 }
 
@@ -288,6 +289,27 @@ fn mode_menu(ui: &mut egui::Ui, s: &Session, actions: &mut Vec<Action>) {
                 .small()
                 .color(DIM),
         );
+    }
+    ui.separator();
+    let now = match s.via_tcp {
+        Some(true) => "（现在：TCP）",
+        Some(false) => "（现在：UDP）",
+        None => "",
+    };
+    ui.label(RichText::new(format!("连接方式{now}")).small().color(DIM));
+    use crate::net::Transport;
+    let modes = [
+        (Transport::Auto, "自动", "优先 UDP；UDP 连不上或丢包严重时改用 TCP，UDP 恢复后再换回来"),
+        (Transport::Udp, "仅 UDP", "画面延迟最低；网络限制 UDP 时可能连不上或卡顿"),
+        (Transport::Tcp, "仅 TCP", "UDP 不通或很差时用；网络差时延迟比 UDP 高"),
+    ];
+    for (t, name, tip) in modes {
+        if ui.selectable_label(s.transport == t, name).on_hover_text(tip).clicked() {
+            if s.transport != t {
+                actions.push(Action::SetTransport(t));
+            }
+            ui.close_menu();
+        }
     }
 }
 
