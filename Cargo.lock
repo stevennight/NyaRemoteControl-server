@@ -2211,7 +2211,7 @@ dependencies = [
 
 [[package]]
 name = "nya-app"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2269,7 +2269,7 @@ dependencies = [
 
 [[package]]
 name = "nya-server"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "cc",
@@ -2293,7 +2293,7 @@ dependencies = [
 
 [[package]]
 name = "nya-server-cli"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2306,7 +2306,7 @@ dependencies = [
 
 [[package]]
 name = "nya-server-core"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "nya-proto",
