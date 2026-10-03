@@ -30,7 +30,12 @@ impl Progress {
     }
 
     fn add(&mut self, n: u64) {
-        self.update.done += n;
+        self.set(self.update.done + n);
+    }
+
+    /// Bytes done so far (of the whole batch).
+    fn set(&mut self, done: u64) {
+        self.update.done = done;
         if self.last.elapsed() >= Duration::from_millis(100) {
             self.last = Instant::now();
             self.ui.send(UiEvent::Transfer(self.update.clone()));
@@ -136,6 +141,13 @@ impl ClipFiles {
         self.progress.lock().unwrap().insert(o.transfer_id, (total, 0));
     }
 
+    /// A paste asks for `id` (again): its progress starts over.
+    pub fn restart(&self, id: u64) {
+        if let Some(p) = self.progress.lock().unwrap().get_mut(&id) {
+            p.1 = 0;
+        }
+    }
+
     pub fn wait(&self, id: u64, reply: PasteReply) {
         self.waiters.lock().unwrap().entry(id).or_default().push(reply);
     }
@@ -221,14 +233,19 @@ pub async fn receive(
                 let _ = r.stop(0u32.into());
                 return;
             };
-            let (total, already) = clip.progress.lock().unwrap().get(&id).copied().unwrap_or((0, 0));
+            let total = clip.progress.lock().unwrap().get(&id).map_or(0, |p| p.0);
             let mut prog = Progress::new(ui.clone(), id, false, total);
             prog.update.name = if h.path.is_empty() { h.name.clone() } else { h.path.clone() };
-            prog.update.done = already;
-            let res = files::receive_to_tree(&mut r, &h, &root, |n| prog.add(n)).await;
-            if let Some(p) = clip.progress.lock().unwrap().get_mut(&id) {
-                p.1 += h.size;
-            }
+            // Several files arrive at once: one count for the whole batch.
+            let res = files::receive_to_tree(&mut r, &h, &root, |n| {
+                let done = clip.progress.lock().unwrap().get_mut(&id).map_or(0, |p| {
+                    p.1 += n;
+                    p.1
+                });
+                prog.set(done);
+            })
+            .await;
+            prog.update.done = clip.progress.lock().unwrap().get(&id).map_or(0, |p| p.1);
             let res = res.map(|_| ()).map_err(|e| format!("接收 {} 失败：{e:#}", prog.update.name));
             if let Some(done) = clip.incoming.file_done(id, res) {
                 match &done {

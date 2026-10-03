@@ -409,6 +409,7 @@ async fn run(link: Link, p: &mut Params, cmds: &mut mpsc::UnboundedReceiver<NetC
                     match sinks.clip.incoming.paste(id) {
                         Paste::Ready(p) => { let _ = reply.send(Ok(p)); }
                         Paste::Request => {
+                            sinks.clip.restart(id);
                             sinks.clip.wait(id, reply);
                             let req = pb::FileRequest { transfer_id: id, purpose: pb::FilePurpose::Clipboard as i32 };
                             if let Err(e) = write_msg(&mut send, &ctl(Msg::FileRequest(req))).await {

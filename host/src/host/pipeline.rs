@@ -116,7 +116,6 @@ pub struct Pipeline {
     /// Consecutive access-lost errors without an image; switches API after 5.
     lost_streak: u32,
     legacy_dup: bool,
-    snapshot_done: bool,
 }
 
 /// Capture counters, logged every 5 s while the stream isn't producing frames.
@@ -344,7 +343,6 @@ impl Pipeline {
             diag: CaptureCounters::default(),
             lost_streak: 0,
             legacy_dup: false,
-            snapshot_done: false,
         })
     }
 
@@ -398,46 +396,6 @@ impl Pipeline {
         }
         let dc = self.desktop.as_ref().unwrap();
         unsafe { self.capture.context.CopyResource(&dc.tex, img) };
-        if !self.snapshot_done {
-            self.snapshot_done = true;
-            if let Err(e) = self.snapshot() {
-                tracing::warn!("capture snapshot: {e:#}");
-            }
-        }
-        Ok(())
-    }
-
-    /// Save the first captured image of the stream and log its statistics,
-    /// to tell capture problems apart from encode/decode problems.
-    fn snapshot(&self) -> Result<()> {
-        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB};
-        let dc = self.desktop.as_ref().unwrap();
-        let (w, h) = (dc.desc.Width, dc.desc.Height);
-        if dc.desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM && dc.desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB {
-            tracing::info!("first capture: {w}x{h} format {:?} (not BGRA, no snapshot)", dc.desc.Format);
-            return Ok(());
-        }
-        let mut rb = Readback::new(&self.capture, dc.desc.Format, w, h)?;
-        let mut px = Vec::new();
-        rb.read(&dc.tex, &mut px)?;
-        let (mut sum, mut lo, mut hi) = ([0u64; 3], 255u8, 0u8);
-        for p in px.chunks_exact(4) {
-            sum[0] += p[2] as u64;
-            sum[1] += p[1] as u64;
-            sum[2] += p[0] as u64;
-            let l = ((p[2] as u32 * 3 + p[1] as u32 * 6 + p[0] as u32) / 10) as u8;
-            lo = lo.min(l);
-            hi = hi.max(l);
-        }
-        let n = (w as u64 * h as u64).max(1);
-        let path = crate::paths::service_dir().join("logs").join(format!("capture-{}.bmp", self.started.display_id));
-        let saved = write_bmp(&path, w, h, &px).map(|_| path.display().to_string()).unwrap_or_else(|e| format!("not saved: {e}"));
-        tracing::info!(
-            "first capture: {w}x{h}, mean RGB ({}, {}, {}), luma {lo}..{hi}, snapshot {saved}",
-            sum[0] / n,
-            sum[1] / n,
-            sum[2] / n
-        );
         Ok(())
     }
 
@@ -704,24 +662,6 @@ impl Pipeline {
         }));
         self.stats.since = Some(Instant::now());
     }
-}
-
-/// 32-bit top-down BMP.
-fn write_bmp(path: &std::path::Path, w: u32, h: u32, bgra: &[u8]) -> std::io::Result<()> {
-    let size = 54 + bgra.len() as u32;
-    let mut f = Vec::with_capacity(size as usize);
-    f.extend_from_slice(b"BM");
-    f.extend_from_slice(&size.to_le_bytes());
-    f.extend_from_slice(&0u32.to_le_bytes());
-    f.extend_from_slice(&54u32.to_le_bytes());
-    f.extend_from_slice(&40u32.to_le_bytes());
-    f.extend_from_slice(&(w as i32).to_le_bytes());
-    f.extend_from_slice(&(-(h as i32)).to_le_bytes());
-    f.extend_from_slice(&1u16.to_le_bytes());
-    f.extend_from_slice(&32u16.to_le_bytes());
-    f.extend_from_slice(&[0u8; 24]);
-    f.extend_from_slice(bgra);
-    std::fs::write(path, f)
 }
 
 /// BGRA → NV12, BT.709 limited range (software-encoder fallback only).
