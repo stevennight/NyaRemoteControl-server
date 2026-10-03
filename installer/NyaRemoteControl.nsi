@@ -164,7 +164,7 @@ Function ${UN}EnsureAppClosed
     Pop $0
     Return
   ${EndIf}
-  !insertmacro AskToClose "${APP_EXE}" "${APP_NAME} 正在运行（可能有远程连接）。"
+  !insertmacro AskToClose "${APP_EXE}" "${APP_NAME} 正在运行（可能有远程连接；也可能在屏幕右下角的托盘里，右键图标选“退出”）。"
   !insertmacro AskToClose "${OLD_CLIENT_EXE}" "旧版 NyaRemoteControl 客户端正在运行（可能有远程连接）。"
   !insertmacro AskToClose "${CLI_EXE}" "旧版被控端管理程序（${CLI_EXE}）正在运行。"
 FunctionEnd
@@ -404,4 +404,6 @@ Section "Uninstall"
   !insertmacro DeleteShortcuts
   RMDir /r "$INSTDIR"
   DeleteRegKey HKLM "${UNINST_KEY}"
+  ; Start with Windows (set by the program for the user who turned it on).
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${APP_NAME}"
 SectionEnd

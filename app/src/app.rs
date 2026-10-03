@@ -70,6 +70,10 @@ pub struct App {
     window: Option<Arc<Window>>,
     /// The launcher window (devices, settings), a web page.
     launcher: Option<Arc<Window>>,
+    /// The tray icon (closing the launcher keeps the program there).
+    tray: Option<crate::tray::Tray>,
+    /// Started with Windows (`--tray`): the launcher stays hidden until asked for.
+    start_in_tray: bool,
     /// The launcher is created hidden and shown once its page is up (no
     /// blank window while WebView2 starts), at the latest at this time.
     launcher_reveal: Option<Instant>,
@@ -203,8 +207,10 @@ impl App {
         identity: Identity,
         auto_connect: Option<(String, Option<String>, crate::config::Overrides)>,
         start_page: Option<String>,
+        start_in_tray: bool,
     ) -> Self {
         Self {
+            start_in_tray,
             host: host::HostPanel::new(ui_tx.clone()),
             start_page,
             rt,
@@ -223,6 +229,7 @@ impl App {
             window: None,
             launcher: None,
             launcher_reveal: None,
+            tray: None,
             renderer: None,
             gui: None,
             adapter_luid: 0,
@@ -1124,6 +1131,10 @@ impl ApplicationHandler<UiEvent> for App {
         };
         self.launcher = Some(launcher);
         self.launcher_reveal = Some(Instant::now() + Duration::from_secs(4));
+        self.tray = crate::tray::create(self.ui_tx.clone());
+        if self.start_in_tray && self.tray.is_some() {
+            self.launcher_reveal = None;
+        }
         // The first (idle) session window, ready for a connection.
         if let Err(e) = self.new_conn(el) {
             crate::fatal(&format!("{e:#}"));
@@ -1286,6 +1297,12 @@ impl ApplicationHandler<UiEvent> for App {
             UiEvent::Cursor(m) => return self.on_cursor(el, m),
             UiEvent::ConnectDone(d) => self.on_connect_done(d),
             UiEvent::Web(c) => self.on_web_call(c),
+            UiEvent::Tray(crate::tray::TrayAction::Open) => self.bring_launcher_back(),
+            UiEvent::Tray(crate::tray::TrayAction::Quit) => {
+                tracing::info!("quit from the tray");
+                self.cancel_connect();
+                self.exit = true;
+            }
             UiEvent::DecodeSummary(s) => {
                 self.decode_summary = s;
                 self.push_state();

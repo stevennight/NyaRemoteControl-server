@@ -64,6 +64,8 @@ pub struct ConnectDone {
 
 /// Events delivered to the winit event loop.
 pub enum UiEvent {
+    /// The tray icon (or another start of the program) asks for something.
+    Tray(crate::tray::TrayAction),
     Connected,
     SessionInfo(pb::SessionInfo),
     /// Who operates the host (several clients connected).

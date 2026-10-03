@@ -95,6 +95,12 @@ impl App {
                     w.resize(size);
                 }
             }
+            WindowEvent::CloseRequested if self.cfg.close_to_tray && self.tray.is_some() => {
+                // Into the tray: sessions and this computer's host keep running.
+                if let Some(l) = &self.launcher {
+                    l.set_visible(false);
+                }
+            }
             WindowEvent::CloseRequested if self.any_session() => {
                 // The session goes on in its own window; keep the launcher reachable.
                 if let Some(l) = &self.launcher {
@@ -133,6 +139,8 @@ impl App {
             "computer": self.client_name(),
             "client_name": self.cfg.client_name,
             "check_updates": self.cfg.check_updates,
+            "close_to_tray": self.cfg.close_to_tray,
+            "autostart": crate::tray::autostart::enabled(),
             "update": self.updates.info,
             "computer_name": std::env::var("COMPUTERNAME").unwrap_or_default(),
             "decode": self.decode_summary,
@@ -169,6 +177,21 @@ impl App {
     fn save_cfg(&self) -> Result<Value, String> {
         self.cfg.save(&self.data_dir).map_err(|e| format!("保存失败：{e:#}"))?;
         Ok(self.web_state())
+    }
+
+    /// The launcher back on screen (from the tray, or the program started again).
+    pub(super) fn bring_launcher_back(&mut self) {
+        if self.launcher_reveal.is_some() {
+            return self.reveal_launcher();
+        }
+        if let Some(l) = &self.launcher {
+            if let Some(w) = &self.web {
+                w.resize(l.inner_size());
+            }
+            l.set_visible(true);
+            l.set_minimized(false);
+            l.focus_window();
+        }
     }
 
     /// Show the launcher (created hidden) once its page is up.
@@ -338,6 +361,15 @@ impl App {
                 Ok(Value::Null)
             }
             "update_apply" => self.install_update().map(|()| Value::Null),
+            "set_autostart" => (|| {
+                let on = c.args.get("on").and_then(Value::as_bool).unwrap_or(false);
+                crate::tray::autostart::set(on).map_err(|e| format!("{e:#}"))?;
+                Ok(self.web_state())
+            })(),
+            "set_close_to_tray" => (|| {
+                self.cfg.close_to_tray = c.args.get("on").and_then(Value::as_bool).unwrap_or(true);
+                self.save_cfg()
+            })(),
             "set_check_updates" => (|| {
                 self.cfg.check_updates = c.args.get("on").and_then(Value::as_bool).unwrap_or(true);
                 if self.cfg.check_updates && self.updates.info.state == "idle" {

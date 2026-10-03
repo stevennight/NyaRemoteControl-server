@@ -23,6 +23,7 @@ mod render;
 mod session;
 mod stats;
 mod transfer;
+mod tray;
 mod ui;
 mod usb;
 mod video;
@@ -51,6 +52,9 @@ struct Cli {
     /// Page the window opens on (host = 本机).
     #[arg(long, global = true, hide = true)]
     page: Option<String>,
+    /// Start in the tray, without the window (starting with Windows).
+    #[arg(long, hide = true)]
+    tray: bool,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -175,12 +179,26 @@ fn real_main() -> Result<()> {
         }
         None => None,
     };
+    // One program per user session: started again, it shows the running one.
+    let instance = if auto_connect.is_none() {
+        match tray::claim() {
+            Some(i) => Some(i),
+            None => return Ok(()),
+        }
+    } else {
+        None
+    };
 
     let identity = Identity::load_or_create(&dir)?;
     let rt = tokio::runtime::Runtime::new()?;
     let event_loop = EventLoop::<UiEvent>::with_user_event().build().map_err(|e| anyhow!("{e}"))?;
     let ui = Ui::new(event_loop.create_proxy());
-    let mut app = app::App::new(rt.handle().clone(), ui, dir, cfg, identity, auto_connect, cli.page);
+    if let Some(i) = instance {
+        i.listen(ui.clone());
+    }
+    // A start-with-Windows entry follows the program (updates, moves).
+    tray::autostart::refresh();
+    let mut app = app::App::new(rt.handle().clone(), ui, dir, cfg, identity, auto_connect, cli.page, cli.tray);
     event_loop.run_app(&mut app).map_err(|e| anyhow!("{e}"))?;
     // Let the Bye go out.
     rt.shutdown_timeout(std::time::Duration::from_millis(300));

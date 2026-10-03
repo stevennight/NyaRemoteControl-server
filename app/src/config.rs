@@ -216,6 +216,9 @@ pub struct ClientConfig {
     /// Look for a new version when starting (installing is the user's choice).
     #[serde(default = "yes")]
     pub check_updates: bool,
+    /// Closing the launcher keeps the program in the tray (else it quits).
+    #[serde(default = "yes")]
+    pub close_to_tray: bool,
     #[serde(default)]
     pub defaults: Defaults,
     #[serde(default)]
@@ -228,6 +231,7 @@ impl Default for ClientConfig {
             version: CONFIG_VERSION,
             client_name: String::new(),
             check_updates: true,
+            close_to_tray: true,
             defaults: Defaults::default(),
             hosts: Vec::new(),
         }
