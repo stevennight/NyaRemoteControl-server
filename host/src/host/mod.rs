@@ -4,7 +4,7 @@
 //! the dispatcher routes [`HostCommand`]s to them.
 
 mod audio;
-mod clipboard;
+pub mod clipboard;
 mod cursor;
 mod drives;
 mod gamepad;

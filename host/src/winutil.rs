@@ -102,6 +102,61 @@ pub fn spawn_in_session(session: u32, cmdline: &str, job: Option<&Handle>) -> Re
     }
 }
 
+/// Run `nya-server-svc.exe <args>` as the user logged on at the console (in
+/// their session, on their desktop) and return what it prints, waiting at
+/// most `timeout`. Needs SYSTEM (the helper or the service).
+pub fn run_as_console_user(args: &str, timeout: std::time::Duration) -> Result<String> {
+    use std::io::Read;
+    use std::os::windows::io::FromRawHandle;
+    use windows::Win32::Foundation::{SetHandleInformation, HANDLE_FLAGS, HANDLE_FLAG_INHERIT};
+    use windows::Win32::System::Pipes::CreatePipe;
+    use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject, STARTF_USESTDHANDLES};
+    let token = console_user_token().context("no user logged on at the console")?;
+    let exe = std::env::current_exe()?;
+    unsafe {
+        let sa = SECURITY_ATTRIBUTES { nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32, bInheritHandle: true.into(), ..Default::default() };
+        let (mut read, mut write) = (HANDLE::default(), HANDLE::default());
+        CreatePipe(&mut read, &mut write, Some(&sa), 0).context("CreatePipe")?;
+        // Only the write end goes to the child.
+        let _ = SetHandleInformation(read, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0));
+        let reader = std::fs::File::from_raw_handle(read.0);
+        let write = Handle(write);
+        let mut desktop: Vec<u16> = "winsta0\\default\0".encode_utf16().collect();
+        let si = STARTUPINFOW {
+            cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+            lpDesktop: PWSTR(desktop.as_mut_ptr()),
+            dwFlags: STARTF_USESTDHANDLES,
+            hStdOutput: write.0,
+            hStdError: write.0,
+            ..Default::default()
+        };
+        let mut cmd: Vec<u16> = format!("\"{}\" {args}", exe.display()).encode_utf16().chain(std::iter::once(0)).collect();
+        let mut pi = PROCESS_INFORMATION::default();
+        CreateProcessAsUserW(token.0, None, PWSTR(cmd.as_mut_ptr()), None, None, true, CREATE_NO_WINDOW, None, None, &si, &mut pi)
+            .context("CreateProcessAsUserW")?;
+        let _thread = Handle(pi.hThread);
+        let process = Handle(pi.hProcess);
+        drop(write); // EOF once the child exits
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            let mut reader = reader;
+            let _ = reader.read_to_end(&mut out);
+            let _ = tx.send(out);
+        });
+        match rx.recv_timeout(timeout) {
+            Ok(out) => {
+                let _ = WaitForSingleObject(process.0, 1000);
+                Ok(String::from_utf8_lossy(&out).into_owned())
+            }
+            Err(_) => {
+                let _ = TerminateProcess(process.0, 1);
+                bail!("no answer in {timeout:?}")
+            }
+        }
+    }
+}
+
 /// Ctrl+Alt+Del. Requires running as a service (or SYSTEM) and the
 /// `SoftwareSASGeneration` policy, which `install` sets.
 pub fn send_sas() -> Result<()> {

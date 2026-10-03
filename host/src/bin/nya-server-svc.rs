@@ -55,6 +55,9 @@ enum Cmd {
         #[arg(long)]
         pipe: String,
     },
+    /// （内部）由 helper 以登录用户身份启动：读出剪贴板内容
+    #[command(hide = true)]
+    ClipRead,
     /// （内部）由服务启动：用 WinFsp 把客户端的共享文件夹挂成盘符
     #[command(hide = true)]
     Folders {
@@ -68,7 +71,7 @@ enum Cmd {
 fn main() {
     // The mount process talks to the service over stdin / stdout (pipes):
     // no console to attach.
-    if std::env::args().nth(1).as_deref() != Some("folders") {
+    if !matches!(std::env::args().nth(1).as_deref(), Some("folders") | Some("clip-read")) {
         nya_server::attach_parent_console();
     }
     if let Err(e) = real_main(Cli::parse()) {
@@ -94,6 +97,10 @@ fn real_main(cli: Cli) -> Result<()> {
             nya_win::dpi::set_per_monitor_aware();
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(ipc::run_helper(&pipe))
+        }
+        Cmd::ClipRead => {
+            nya_server::host::clipboard::clip_read_main();
+            Ok(())
         }
         Cmd::Folders { point, label } => {
             let _log = logging::init(&paths::service_dir(), "folders", false);

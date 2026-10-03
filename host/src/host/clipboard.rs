@@ -46,6 +46,44 @@ fn hash(b: &[u8]) -> u64 {
     h.finish()
 }
 
+/// `nya-server-svc.exe clip-read`, run as the logged-on user by the helper
+/// (see [`read_as_user`]): prints `files` and one path per line, `text` and
+/// the text, or `other` and what is there.
+pub fn clip_read_main() {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let content = match clipboard::get_files() {
+        Ok(Some(files)) if !files.is_empty() => Ok(clipboard::OleContent::Files(files)),
+        _ => match clipboard::get_text() {
+            Ok(Some(text)) => Ok(clipboard::OleContent::Text(text)),
+            _ => clipboard::read_ole_clipboard(),
+        },
+    };
+    let _ = match content {
+        Ok(clipboard::OleContent::Files(files)) => {
+            let list: Vec<String> = files.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+            write!(out, "files\n{}", list.join("\n"))
+        }
+        Ok(clipboard::OleContent::Text(text)) => write!(out, "text\n{text}"),
+        Ok(clipboard::OleContent::Other(formats)) => write!(out, "other\nformats: {formats}; {}", clipboard::format_names()),
+        Err(e) => write!(out, "other\n{e:#}"),
+    };
+    let _ = out.flush();
+}
+
+/// The clipboard as the logged-on user sees it (a short-lived process in
+/// their name): this helper runs as SYSTEM and, after an Explorer copy, sees
+/// only "DataObject" on the clipboard.
+fn read_as_user() -> anyhow::Result<clipboard::OleContent> {
+    let out = crate::winutil::run_as_console_user("clip-read", Duration::from_secs(8))?;
+    let (kind, rest) = out.split_once('\n').unwrap_or((out.as_str(), ""));
+    Ok(match kind.trim() {
+        "files" => clipboard::OleContent::Files(rest.lines().map(str::trim).filter(|l| !l.is_empty()).map(PathBuf::from).collect()),
+        "text" => clipboard::OleContent::Text(rest.to_owned()),
+        _ => clipboard::OleContent::Other(if rest.is_empty() { out.clone() } else { rest.to_owned() }),
+    })
+}
+
 pub fn thread(rx: Receiver<ClipCmd>, sink: Sink) {
     let mut enabled = false;
     let mut last_seq = clipboard::sequence_number();
@@ -152,8 +190,6 @@ pub fn thread(rx: Receiver<ClipCmd>, sink: Sink) {
                 "the client's files"
             } else if files {
                 "files"
-            } else if clipboard::only_ole_object() {
-                "an OLE data object"
             } else if clipboard::has_text() {
                 "text"
             } else {
@@ -189,24 +225,6 @@ pub fn thread(rx: Receiver<ClipCmd>, sink: Sink) {
                     tracing::warn!("copied files not offered: the clipboard gave no file list ({})", std::io::Error::last_os_error());
                 }
             }
-        } else if clipboard::only_ole_object() {
-            // Explorer copies: this process (SYSTEM) sees only the OLE marker;
-            // the content is read from the copying program's data object.
-            match clipboard::read_ole_clipboard() {
-                Ok(clipboard::OleContent::Files(files)) => {
-                    let paths: Vec<String> = files.iter().map(|p| p.to_string_lossy().into_owned()).collect();
-                    tracing::info!("copied files (read through OLE): {} item(s), offered to the client", paths.len());
-                    sink.send(Ev::ClipboardFiles(ClipboardFiles { paths }));
-                }
-                Ok(clipboard::OleContent::Text(text)) => {
-                    if text.len() <= MAX_TEXT && last_text.as_deref() != Some(text.as_str()) {
-                        last_text = Some(text.clone());
-                        sink.send(Ev::Clipboard(pb::ClipboardText { text }));
-                    }
-                }
-                Ok(clipboard::OleContent::Other(formats)) => tracing::info!("copied something else (formats: {formats})"),
-                Err(e) => tracing::warn!("reading the copy through OLE: {e:#}"),
-            }
         } else if clipboard::has_text() {
             if let Ok(Some(text)) = clipboard::get_text() {
                 if text.len() <= MAX_TEXT && last_text.as_deref() != Some(text.as_str()) {
@@ -221,6 +239,38 @@ pub fn thread(rx: Receiver<ClipCmd>, sink: Sink) {
                     last_image = Some(h);
                     sink.send(Ev::ClipboardImage(ClipboardImage { dib }));
                 }
+            }
+        } else if !retry {
+            // Explorer copies: this process (SYSTEM) sees only "DataObject"
+            // on the Win32 clipboard, none of the formats behind it. Read the
+            // copying program's data object; else ask a process of the user.
+            let mut how = "through OLE";
+            let mut content = clipboard::read_ole_clipboard();
+            if !matches!(content, Ok(clipboard::OleContent::Files(_)) | Ok(clipboard::OleContent::Text(_))) {
+                match &content {
+                    Ok(clipboard::OleContent::Other(f)) => tracing::info!("through OLE: nothing usable (formats: {f})"),
+                    Err(e) => tracing::info!("through OLE: {e:#}"),
+                    _ => {}
+                }
+                how = "as the logged-on user";
+                content = read_as_user();
+            }
+            match content {
+                Ok(clipboard::OleContent::Files(files)) if !files.is_empty() => {
+                    let paths: Vec<String> = files.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+                    tracing::info!("copied files (read {how}): {} item(s), offered to the client", paths.len());
+                    sink.send(Ev::ClipboardFiles(ClipboardFiles { paths }));
+                }
+                Ok(clipboard::OleContent::Files(_)) => tracing::info!("copied files (read {how}): none listed"),
+                Ok(clipboard::OleContent::Text(text)) => {
+                    tracing::info!("copied text (read {how})");
+                    if text.len() <= MAX_TEXT && last_text.as_deref() != Some(text.as_str()) {
+                        last_text = Some(text.clone());
+                        sink.send(Ev::Clipboard(pb::ClipboardText { text }));
+                    }
+                }
+                Ok(clipboard::OleContent::Other(what)) => tracing::info!("copied something else (read {how}): {what}"),
+                Err(e) => tracing::warn!("reading the copy {how}: {e:#}"),
             }
         }
     }
